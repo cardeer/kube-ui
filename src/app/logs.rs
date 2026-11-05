@@ -51,7 +51,112 @@ struct Source {
 
 struct ViewLine {
     src: usize,
+    /// `line.text` has ANSI escapes removed; their colours live in `spans`.
     line: LogLine,
+    spans: Vec<Span>,
+}
+
+/// A run of `line.text` (byte range) with the colour an ANSI SGR code gave it.
+#[derive(Debug, PartialEq)]
+struct Span {
+    range: std::ops::Range<usize>,
+    color: Option<Color32>,
+}
+
+impl ViewLine {
+    fn new(src: usize, mut line: LogLine) -> Self {
+        let (text, spans) = parse_ansi(&line.text);
+        line.text = text;
+        Self { src, line, spans }
+    }
+}
+
+/// Strips ANSI escape sequences (and stray control bytes) from `raw`, returning the plain
+/// text plus coloured spans for SGR foreground colours. Returns no spans for plain lines.
+fn parse_ansi(raw: &str) -> (String, Vec<Span>) {
+    if !raw.bytes().any(|b| b < 0x20 && b != b'\t') {
+        return (raw.to_owned(), Vec::new());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut spans: Vec<Span> = Vec::new();
+    let mut color: Option<vt100::Color> = None;
+    let mut bold = false;
+    let mut start = 0;
+    let mut chars = raw.chars().peekable();
+    let close = |spans: &mut Vec<Span>, out: &str, start: usize, color: Option<vt100::Color>, bold: bool| {
+        if out.len() > start {
+            let c = color.map(|c| super::shell::term_color(c, true, bold)).or(bold.then_some(theme::TEXT));
+            spans.push(Span { range: start..out.len(), color: c });
+        }
+    };
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut fin = None;
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            fin = Some(c);
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    if fin != Some('m') {
+                        continue;
+                    }
+                    close(&mut spans, &out, start, color, bold);
+                    start = out.len();
+                    let nums: Vec<u16> = params.split([';', ':']).map(|p| p.parse().unwrap_or(0)).collect();
+                    let mut i = 0;
+                    while i < nums.len() {
+                        match nums[i] {
+                            0 => (color, bold) = (None, false),
+                            1 => bold = true,
+                            22 => bold = false,
+                            n @ 30..=37 => color = Some(vt100::Color::Idx((n - 30) as u8)),
+                            n @ 90..=97 => color = Some(vt100::Color::Idx((n - 90 + 8) as u8)),
+                            39 => color = None,
+                            38 | 48 => {
+                                let fg = nums[i] == 38;
+                                let c = match nums.get(i + 1) {
+                                    Some(5) => {
+                                        let c = nums.get(i + 2).map(|&n| vt100::Color::Idx(n as u8));
+                                        i += 2;
+                                        c
+                                    }
+                                    Some(2) => {
+                                        let g = |k| nums.get(i + k).copied().unwrap_or(0) as u8;
+                                        let c = Some(vt100::Color::Rgb(g(2), g(3), g(4)));
+                                        i += 4;
+                                        c
+                                    }
+                                    _ => None,
+                                };
+                                if fg {
+                                    color = c;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if ch == '\t' || !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    close(&mut spans, &out, start, color, bold);
+    if spans.iter().all(|s| s.color.is_none()) {
+        spans.clear();
+    }
+    (out, spans)
 }
 
 pub(super) struct LogView {
@@ -270,7 +375,7 @@ impl LogView {
                     Err(e) => self.error = Some(e),
                 }
             }
-            Msg::LogLine { src, line, .. } => self.insert(ViewLine { src, line }),
+            Msg::LogLine { src, line, .. } => self.insert(ViewLine::new(src, line)),
             Msg::LogEnded { src, error, .. } => {
                 if let Some(s) = self.sources.get_mut(src) {
                     s.streaming = false;
@@ -286,7 +391,7 @@ impl LogView {
                             if self.lines.len() >= MAX_LOG_LINES {
                                 break;
                             }
-                            let vl = ViewLine { src, line };
+                            let vl = ViewLine::new(src, line);
                             shown += self.visible(&vl) as usize;
                             self.insert(vl);
                             self.older_found = true;
@@ -561,7 +666,13 @@ impl LogView {
                 if self.timestamps && !vl.line.ts.is_empty() {
                     job.append(&format!("{} ", vl.line.ts), 0.0, fmt(weak_color));
                 }
-                job.append(&vl.line.text, 0.0, fmt(color));
+                if vl.spans.is_empty() {
+                    job.append(&vl.line.text, 0.0, fmt(color));
+                } else {
+                    for s in &vl.spans {
+                        job.append(&vl.line.text[s.range.clone()], 0.0, fmt(s.color.unwrap_or(color)));
+                    }
+                }
                 ui.add(egui::Label::new(job).extend());
             }
         });
@@ -579,5 +690,30 @@ impl LogView {
             ui.weak("Waiting for log lines…");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_and_colours_ansi() {
+        let (text, spans) = parse_ansi("--> GET / \u{1b}[32m200\u{1b}[0m 5ms");
+        assert_eq!(text, "--> GET / 200 5ms");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(&text[spans[1].range.clone()], "200");
+        assert_eq!(spans[1].color, Some(theme::OK));
+        assert_eq!(spans[2].color, None);
+    }
+
+    #[test]
+    fn plain_lines_have_no_spans() {
+        let (text, spans) = parse_ansi("hello\tworld");
+        assert_eq!(text, "hello\tworld");
+        assert!(spans.is_empty());
+        let (text, spans) = parse_ansi("\u{1b}[2Kcleared\u{1b}[1A");
+        assert_eq!(text, "cleared");
+        assert!(spans.is_empty());
     }
 }

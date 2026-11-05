@@ -433,7 +433,7 @@ fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec
 }
 
 /// xterm colours mapped onto the app palette. Default background is transparent (the well).
-fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color32 {
+pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color32 {
     const ANSI: [Color32; 16] = [
         Color32::from_rgb(0x2e, 0x34, 0x41), // black
         theme::BAD,
