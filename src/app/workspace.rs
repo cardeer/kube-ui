@@ -543,7 +543,7 @@ impl Workspace {
     // Rendering: lists
     // -----------------------------------------------------------------------
 
-    fn ui_filter_bar(&mut self, ui: &mut egui::Ui, title: &str) {
+    fn ui_filter_bar(&mut self, ui: &mut egui::Ui, title: &str, create_kind: &mut Option<Kind>) {
         // "512", or "8 of 512" while a filter narrows the list.
         let (shown, total) = match self.tab {
             Tab::Pods => (self.pods.items.iter().filter(|p| self.matches(&p.name, &p.namespace)).count(), count(&self.pods)),
@@ -566,6 +566,18 @@ impl Workspace {
             theme::search_field(ui, filter, "Filter by name or namespace", 300.0);
             if !filter.is_empty() && theme::icon_button(ui, icon::X, "Clear filter").clicked() {
                 filter.clear();
+            }
+            if let Some(kind) = self.tab.kinds().first().copied().filter(|_| self.tab.is_list()) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let create = theme::primary_button(format!("{} Create", icon::PLUS));
+                    if ui
+                        .add_enabled(matches!(self.conn, Conn::Ready(_)), create)
+                        .on_hover_text(format!("New {} from a template", kind.label()))
+                        .clicked()
+                    {
+                        *create_kind = Some(kind);
+                    }
+                });
             }
         });
         ui.add_space(10.0);
@@ -640,7 +652,11 @@ impl Workspace {
     }
 
     pub(super) fn ui_pods(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        self.ui_filter_bar(ui, "Pods");
+        let mut create_kind = None;
+        self.ui_filter_bar(ui, "Pods", &mut create_kind);
+        if let Some(kind) = create_kind {
+            actions.push(Action::Create(kind));
+        }
         if !self.list_preamble(ui, &self.pods) {
             return;
         }
@@ -735,7 +751,11 @@ impl Workspace {
     }
 
     pub(super) fn ui_services(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        self.ui_filter_bar(ui, "Services");
+        let mut create_kind = None;
+        self.ui_filter_bar(ui, "Services", &mut create_kind);
+        if let Some(kind) = create_kind {
+            actions.push(Action::Create(kind));
+        }
         if !self.list_preamble(ui, &self.services) {
             return;
         }
@@ -814,7 +834,11 @@ impl Workspace {
     }
 
     pub(super) fn ui_deployments(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        self.ui_filter_bar(ui, "Deployments");
+        let mut create_kind = None;
+        self.ui_filter_bar(ui, "Deployments", &mut create_kind);
+        if let Some(kind) = create_kind {
+            actions.push(Action::Create(kind));
+        }
         if !self.list_preamble(ui, &self.deployments) {
             return;
         }
@@ -887,7 +911,11 @@ impl Workspace {
 
     /// Daemon sets, stateful sets, replica sets, replication controllers, jobs, cron jobs.
     pub(super) fn ui_workloads(&mut self, ui: &mut egui::Ui, kind: Kind, actions: &mut Vec<Action>) {
-        self.ui_filter_bar(ui, kind.plural());
+        let mut create_kind = None;
+        self.ui_filter_bar(ui, kind.plural(), &mut create_kind);
+        if let Some(kind) = create_kind {
+            actions.push(Action::Create(kind));
+        }
         let state = self.workload(kind);
         if !self.list_preamble(ui, state) {
             return;
@@ -1385,6 +1413,26 @@ impl Workspace {
                     target: LogTarget::Owner(p.owner.clone()),
                 });
             }
+            let running = p.status == "Running";
+            let shell = egui::Button::new(format!("{} Shell", icon::TERMINAL_WINDOW));
+            let regular: Vec<&String> = p.containers.iter().filter(|c| !c.init).map(|c| &c.name).collect();
+            if regular.len() > 1 && running {
+                ui.menu_button(format!("{} Shell", icon::TERMINAL_WINDOW), |ui| {
+                    for c in &regular {
+                        if ui.button(c.as_str()).clicked() {
+                            actions.push(Action::Shell(p.clone(), Some((*c).clone())));
+                            ui.close();
+                        }
+                    }
+                });
+            } else if ui
+                .add_enabled(running, shell)
+                .on_hover_text("Open a shell in the container")
+                .on_disabled_hover_text("The pod isn't running")
+                .clicked()
+            {
+                actions.push(Action::Shell(p.clone(), None));
+            }
             if ui.button(format!("{} Port forward", icon::ARROWS_LEFT_RIGHT)).clicked() {
                 actions.push(Action::ForwardPod(p.clone(), None));
             }
@@ -1481,6 +1529,10 @@ impl Workspace {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button(format!("{} Logs", icon::SCROLL)).clicked() {
                                 actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone())));
+                            }
+                            let can_shell = !c.init && p.status == "Running";
+                            if ui.add_enabled(can_shell, egui::Button::new(format!("{} Shell", icon::TERMINAL_WINDOW)).small()).clicked() {
+                                actions.push(Action::Shell(p.clone(), Some(c.name.clone())));
                             }
                         });
                     }

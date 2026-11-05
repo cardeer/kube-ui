@@ -1,5 +1,6 @@
 mod code_editor;
 mod logs;
+mod shell;
 mod theme;
 mod workspace;
 
@@ -32,6 +33,7 @@ use crate::{
     settings::{LogPanelMode, SavedForward, SavedSort, SavedWorkspace, Settings},
 };
 use logs::{LogTarget, LogView};
+use shell::ShellView;
 use workspace::Workspace;
 
 /// How often the open drawer's details are re-fetched while live updates are on.
@@ -103,9 +105,13 @@ enum Msg {
     Yaml { title: String, result: Result<String, String> },
     /// An edited YAML was saved (or refused).
     YamlApplied { title: String, result: Result<(), String> },
+    /// A new object was created from the editor: (kind, namespace, name).
+    YamlCreated { title: String, result: Result<(Kind, String, String), String> },
     PfListening { id: u64, port: u16 },
     PfFailed { id: u64, error: String },
     Toast { text: String, error: bool },
+    ShellOutput { id: u64, data: Vec<u8> },
+    ShellExited { id: u64, error: Option<String> },
 }
 
 impl Msg {
@@ -115,6 +121,13 @@ impl Msg {
             | Msg::Listed { ws, .. }
             | Msg::Details { ws, .. }
             | Msg::Secret { ws, .. } => Some(*ws),
+            _ => None,
+        }
+    }
+
+    fn shell(&self) -> Option<u64> {
+        match self {
+            Msg::ShellOutput { id, .. } | Msg::ShellExited { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -297,6 +310,8 @@ struct YamlView {
     parse_error: Option<(usize, String)>,
     /// Editing just began: focus the editor with the cursor at the top.
     edit_started: bool,
+    /// A new object (Apply creates it) rather than an existing one.
+    create: bool,
 }
 
 #[derive(PartialEq)]
@@ -341,6 +356,8 @@ enum Action {
     RevealSecret(String, String),
     HideSecret(String, String),
     OpenLogs(PodRow, Option<String>),
+    /// Open a shell in a pod's container (`None` = the default container).
+    Shell(PodRow, Option<String>),
     OpenGroupLogs { namespace: String, target: LogTarget },
     Yaml(Kind, String, String),
     ForwardPod(PodRow, Option<u16>),
@@ -349,6 +366,8 @@ enum Action {
     AskDelete(Kind, String, String),
     /// Open the YAML window in edit mode.
     EditYaml(Kind, String, String),
+    /// Open the editor on a template for a new object of this kind.
+    Create(Kind),
     /// Run a cron job now.
     Trigger(String, String),
     Suspend(Kind, String, String, bool),
@@ -376,6 +395,9 @@ pub struct App {
     active: usize,
 
     logs: Vec<LogView>,
+    /// Shell tabs; the dock shows log tabs first, then these.
+    shells: Vec<ShellView>,
+    /// Index into the dock's tabs: logs, then shells.
     active_log: usize,
     yaml: Option<YamlView>,
     forwards: Vec<Forward>,
@@ -407,6 +429,8 @@ struct DevScreenshot {
     edit: bool,
     /// `KUBE_UI_SCREENSHOT_SORT=<Column>[:desc]` sorts the page first.
     sort: Option<Sort>,
+    /// `KUBE_UI_SCREENSHOT_SHELL=<command>` opens a shell on the first running pod and types it.
+    shell: Option<String>,
 }
 
 impl App {
@@ -430,6 +454,7 @@ impl App {
             workspaces: Vec::new(),
             active: 0,
             logs: Vec::new(),
+            shells: Vec::new(),
             active_log: 0,
             yaml: None,
             forwards: Vec::new(),
@@ -447,6 +472,7 @@ impl App {
                 tab: std::env::var("KUBE_UI_SCREENSHOT_TAB").ok().and_then(|k| Tab::from_key(&k)),
                 select: std::env::var_os("KUBE_UI_SCREENSHOT_SELECT").is_some(),
                 edit: std::env::var_os("KUBE_UI_SCREENSHOT_EDIT").is_some(),
+                shell: std::env::var("KUBE_UI_SCREENSHOT_SHELL").ok(),
                 sort: std::env::var("KUBE_UI_SCREENSHOT_SORT").ok().map(|v| {
                     let (col, dir) = v.split_once(':').unwrap_or((&v, "asc"));
                     Sort { col: col.to_string(), asc: dir != "desc" }
@@ -608,6 +634,7 @@ impl App {
             if !loaded && !timed_out {
                 return;
             }
+            let running = ws.pods.items.iter().find(|p| p.status == "Running").cloned();
             let first = ws.first_row(tab);
             if select {
                 if let Some(sel) = first.clone() {
@@ -616,6 +643,14 @@ impl App {
             }
             if let Some(sel) = first.filter(|_| edit) {
                 self.apply(Action::EditYaml(sel.kind, sel.namespace, sel.name));
+            }
+            if std::env::var_os("KUBE_UI_SCREENSHOT_CREATE").is_some() {
+                if let Some(kind) = tab.kinds().first().copied() {
+                    self.apply(Action::Create(kind));
+                }
+            }
+            if let Some(pod) = running.filter(|_| self.screenshot.as_ref().is_some_and(|s| s.shell.is_some())) {
+                self.apply(Action::Shell(pod, None));
             }
             if let Some(shot) = self.screenshot.as_mut() {
                 shot.staged = Some(Instant::now());
@@ -640,6 +675,19 @@ impl App {
                 shot.staged = Some(Instant::now());
             }
             return;
+        }
+        // Type the shell command once the session is up, then give it time to print.
+        if let Some(cmd) = self.screenshot.as_ref().and_then(|s| s.shell.clone()) {
+            match self.shells.last_mut() {
+                Some(sh) if sh.status == shell::ShellStatus::Open => {
+                    sh.type_text(&format!("{cmd}\r"));
+                    if let Some(s) = self.screenshot.as_mut() {
+                        s.shell = None;
+                        s.staged = Some(Instant::now());
+                    }
+                }
+                _ => return,
+            }
         }
         let Some(shot) = self.screenshot.as_mut() else { return };
         if !shot.requested && shot.staged.is_some_and(|t| t.elapsed() > Duration::from_secs(3)) {
@@ -683,6 +731,12 @@ impl App {
                 }
                 continue;
             }
+            if let Some(id) = msg.shell() {
+                if let Some(s) = self.shells.iter_mut().find(|s| s.id == id) {
+                    s.handle(msg);
+                }
+                continue;
+            }
             if let Some(id) = msg.log_stream() {
                 let handle = self.rt.handle().clone();
                 let error = self
@@ -710,6 +764,25 @@ impl App {
                             y.edit_started = y.edit.is_some();
                         }
                         y.text = Some(result);
+                    }
+                }
+                Msg::YamlCreated { title, result } => {
+                    let mut created = None;
+                    if let Some(y) = self.yaml.as_mut().filter(|y| y.title == title) {
+                        y.saving = false;
+                        match result {
+                            Ok(c) => created = Some((y.ws, c)),
+                            Err(e) => y.save_error = Some(e),
+                        }
+                    }
+                    if let Some((ws, (kind, namespace, name))) = created {
+                        self.yaml = None;
+                        self.toast(format!("Created {} {name}", kind.label().to_lowercase()), false);
+                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws) {
+                            w.changed();
+                        }
+                        // Show it: its page, with the drawer open on it (it fills in as the watch sees it).
+                        self.apply(Action::OpenSelected(Selected { kind, namespace, name }));
                     }
                 }
                 Msg::YamlApplied { title, result } => {
@@ -781,6 +854,7 @@ impl App {
                     ws.hide_secret(ns, name);
                 }
             }
+            Action::Shell(pod, container) => self.open_shell(pod, container),
             Action::OpenLogs(pod, container) => {
                 let containers = pod.containers.iter().map(|c| c.name.clone()).collect();
                 self.open_logs(pod.namespace, LogTarget::Pod(pod.name), containers, container);
@@ -803,6 +877,7 @@ impl App {
                     self.confirm_delete = Some((id, kind, ns, name));
                 }
             }
+            Action::Create(kind) => self.open_create(kind),
             Action::EditYaml(kind, ns, name) => {
                 self.open_yaml(kind, ns, name);
                 if let Some(y) = self.yaml.as_mut() {
@@ -893,6 +968,31 @@ impl App {
         });
     }
 
+    /// The editor on a template for a new object, in the page's namespace.
+    fn open_create(&mut self, kind: Kind) {
+        let Some(ws) = self.ws() else { return };
+        if ws.client().is_none() {
+            return;
+        }
+        let ns = ws.selected_ns.first().cloned().unwrap_or_else(|| "default".into());
+        let text = kube_ops::template(kind, &ns);
+        self.yaml = Some(YamlView {
+            title: format!("New {}", kind.label()),
+            ws: ws.id,
+            kind,
+            namespace: ns,
+            name: String::new(),
+            text: Some(Ok(text.clone())),
+            edit: Some(text),
+            edit_on_load: false,
+            saving: false,
+            save_error: None,
+            parse_error: None,
+            edit_started: true,
+            create: true,
+        });
+    }
+
     fn open_yaml(&mut self, kind: Kind, ns: String, name: String) {
         let Some((ws, client)) = self.ws().and_then(|w| w.client().map(|c| (w.id, c))) else { return };
         let title = format!("{} {ns}/{name}", kind.label());
@@ -909,6 +1009,7 @@ impl App {
             save_error: None,
             parse_error: None,
             edit_started: false,
+            create: false,
         });
         let bus = self.bus.clone();
         self.rt.spawn(async move {
@@ -942,6 +1043,22 @@ impl App {
         view.start(id, self.rt.handle(), &self.bus);
         self.logs.push(view);
         self.active_log = self.logs.len() - 1;
+    }
+
+    /// Opens a shell tab into a pod's container. A container already open gets a second tab:
+    /// several shells into one container are normal.
+    fn open_shell(&mut self, pod: PodRow, container: Option<String>) {
+        let Some(ws) = self.ws() else { return };
+        let Some(client) = ws.client() else { return };
+        let context = ws.context.clone().unwrap_or_default();
+        // Default to the first regular container, as kubectl does.
+        let container = container.or_else(|| pod.containers.iter().find(|c| !c.init).map(|c| c.name.clone()));
+        let id = self.next_id();
+        let mut view = ShellView::new(id, context, client, pod.namespace, pod.name, container);
+        view.start(self.rt.handle(), &self.bus);
+        self.shells.push(view);
+        self.active_log = self.logs.len() + self.shells.len() - 1;
+        self.show_logs();
     }
 
     fn open_pf_dialog(&mut self, namespace: String, target: PfTarget, ports: Vec<u16>, remote: u16, local: u16) {
@@ -1499,10 +1616,13 @@ impl App {
     }
 
     fn ui_logs(&mut self, ctx: &egui::Context) {
-        if self.logs.is_empty() {
+        let total = self.logs.len() + self.shells.len();
+        if total == 0 {
             return;
         }
-        self.active_log = self.active_log.min(self.logs.len() - 1);
+        self.active_log = self.active_log.min(total - 1);
+        let n_logs = self.logs.len();
+        let mut reconnect = false;
         let mut select = None;
         let mut close = None;
         let mut close_all = false;
@@ -1537,11 +1657,15 @@ impl App {
                         .max_width(ui.available_width() - 110.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for (i, log) in self.logs.iter().enumerate() {
+                                let tabs = self
+                                    .logs
+                                    .iter()
+                                    .map(|l| (if l.is_group() { icon::STACK } else { icon::SCROLL }, l.title(), l.hover(), l.live()))
+                                    .chain(self.shells.iter().map(|s| (icon::TERMINAL_WINDOW, s.title(), s.hover(), s.live())));
+                                for (i, (glyph, title, hover, live)) in tabs.enumerate() {
                                     let selected = i == self.active_log;
-                                    let glyph = if log.is_group() { icon::STACK } else { icon::SCROLL };
-                                    let label = format!("{glyph}  {}", log.title());
-                                    let text = match (selected, log.live()) {
+                                    let label = format!("{glyph}  {title}");
+                                    let text = match (selected, live) {
                                         (true, _) => theme::semibold(label).color(theme::TEXT),
                                         (false, true) => RichText::new(label).color(theme::TEXT_MUTED),
                                         (false, false) => RichText::new(label).color(theme::TEXT_FAINT),
@@ -1557,7 +1681,7 @@ impl App {
                                             ui.horizontal(|ui| {
                                                 let title = ui
                                                     .add(egui::Label::new(text).sense(Sense::click()))
-                                                    .on_hover_text(format!("{}\nMiddle-click to close", log.hover()));
+                                                    .on_hover_text(format!("{hover}\nMiddle-click to close"));
                                                 let x = theme::icon_button(ui, icon::X, "Close");
                                                 (title, x)
                                             })
@@ -1573,7 +1697,7 @@ impl App {
                             });
                         });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::icon_button(ui, icon::X_CIRCLE, "Close all logs").clicked() {
+                        if theme::icon_button(ui, icon::X_CIRCLE, "Close all tabs").clicked() {
                             close_all = true;
                         }
                         let (glyph, hint, target) = match mode {
@@ -1594,8 +1718,12 @@ impl App {
                 });
                 if mode != LogPanelMode::Collapsed {
                     ui.separator();
-                    if let Some(log) = self.logs.get_mut(self.active_log) {
-                        event = Some(log.ui(ui, &mut load_older));
+                    if self.active_log < n_logs {
+                        if let Some(log) = self.logs.get_mut(self.active_log) {
+                            event = Some(log.ui(ui, &mut load_older));
+                        }
+                    } else if let Some(shell) = self.shells.get_mut(self.active_log - n_logs) {
+                        reconnect = shell.ui(ui);
                     }
                 }
             });
@@ -1627,7 +1755,7 @@ impl App {
         }
 
         let handle = self.rt.handle().clone();
-        if let Some(event) = event {
+        if let Some(event) = event.filter(|_| self.active_log < n_logs) {
             if event.restart {
                 let id = self.next_id();
                 if let Some(log) = self.logs.get_mut(self.active_log) {
@@ -1643,14 +1771,25 @@ impl App {
             self.active_log = i;
             self.show_logs();
         }
+        if reconnect {
+            if let Some(shell) = self.shells.get_mut(self.active_log - n_logs) {
+                shell.start(&handle, &self.bus);
+            }
+        }
         if let Some(i) = close {
-            self.logs.remove(i);
-            if self.active_log > i || self.active_log >= self.logs.len() {
+            if i < n_logs {
+                self.logs.remove(i);
+            } else {
+                self.shells.remove(i - n_logs);
+            }
+            let total = self.logs.len() + self.shells.len();
+            if self.active_log > i || self.active_log >= total {
                 self.active_log = self.active_log.saturating_sub(1);
             }
         }
         if close_all {
             self.logs.clear();
+            self.shells.clear();
         }
     }
 
@@ -1661,8 +1800,9 @@ impl App {
         if let Some(y) = self.yaml.as_mut() {
             let mut open = true;
             let editing = y.edit.is_some();
-            let dirty = matches!((&y.edit, &y.text), (Some(e), Some(Ok(t))) if e != t);
-            let title = if dirty { format!("{} (edited)", y.title) } else { y.title.clone() };
+            let dirty = y.create || matches!((&y.edit, &y.text), (Some(e), Some(Ok(t))) if e != t);
+            let mut close_window = false;
+            let title = if dirty && !y.create { format!("{} (edited)", y.title) } else { y.title.clone() };
             egui::Window::new(title)
                 .id(egui::Id::new("yaml-window"))
                 .open(&mut open)
@@ -1682,12 +1822,19 @@ impl App {
                     };
                     ui.horizontal(|ui| {
                         if editing {
-                            let apply = theme::primary_button(format!("{} Apply", icon::FLOPPY_DISK));
+                            let apply = if y.create {
+                                theme::primary_button(format!("{} Create", icon::PLUS))
+                            } else {
+                                theme::primary_button(format!("{} Apply", icon::FLOPPY_DISK))
+                            };
                             let can_apply = dirty && !y.saving && y.parse_error.is_none();
                             if ui.add_enabled(can_apply, apply).on_hover_text("Replace the object with this YAML (⌘S)").clicked() {
                                 save = Some(y.edit.clone().unwrap_or_default());
                             }
                             if ui.add_enabled(!y.saving, egui::Button::new("Cancel")).clicked() {
+                                if y.create {
+                                    close_window = true;
+                                }
                                 y.edit = None;
                                 y.save_error = None;
                                 y.parse_error = None;
@@ -1705,6 +1852,10 @@ impl App {
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if y.create {
+                                ui.weak(format!("Namespace defaults to {}", y.namespace));
+                                return;
+                            }
                             if ui.add_enabled(!y.saving, egui::Button::new(format!("{} Reload", icon::ARROW_CLOCKWISE)))
                                 .on_hover_text("Fetch the latest version (discards edits)")
                                 .clicked()
@@ -1752,7 +1903,7 @@ impl App {
                         save = Some(y.edit.clone().unwrap_or_default());
                     }
                 });
-            if !open {
+            if !open || close_window {
                 self.yaml = None;
             }
         }
@@ -1764,6 +1915,12 @@ impl App {
                 let client = self.workspaces.iter().find(|w| w.id == ws).and_then(Workspace::client);
                 let bus = self.bus.clone();
                 match client {
+                    Some(client) if y.create => {
+                        self.rt.spawn(async move {
+                            let result = kube_ops::create_yaml(client, ns, yaml).await.map_err(err_string);
+                            bus.send(Msg::YamlCreated { title, result });
+                        });
+                    }
                     Some(client) => {
                         self.rt.spawn(async move {
                             let result = kube_ops::apply_yaml(client, kind, ns, name, yaml).await.map_err(err_string);

@@ -783,6 +783,82 @@ pub async fn restart(client: Client, kind: Kind, ns: String, name: String) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// Shell (exec with a TTY)
+// ---------------------------------------------------------------------------
+
+/// Keystrokes and window changes from the terminal widget.
+pub enum ShellInput {
+    Data(Vec<u8>),
+    /// (cols, rows)
+    Resize(u16, u16),
+}
+
+/// Starts an interactive shell in a container, like `kubectl exec -it -- sh`, preferring
+/// bash when the image has it. Streams output to `on_output` until the shell exits;
+/// returns the exit problem, if any (`Ok(None)` is a clean exit).
+pub async fn run_shell(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    size: (u16, u16),
+    mut input: tokio::sync::mpsc::UnboundedReceiver<ShellInput>,
+    mut on_output: impl FnMut(Vec<u8>),
+) -> Result<Option<String>> {
+    use futures::SinkExt;
+    use kube::api::{AttachParams, TerminalSize};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let api: Api<Pod> = Api::namespaced(client, &ns);
+    let mut params = AttachParams::interactive_tty();
+    if let Some(c) = container {
+        params = params.container(c);
+    }
+    // TERM isn't set for exec sessions; without it bash and most tools fall back to dumb output.
+    let script = "export TERM=xterm-256color; if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi";
+    let mut proc = api.exec(&pod, ["/bin/sh", "-c", script], &params).await?;
+    let mut stdin = proc.stdin().ok_or_else(|| anyhow!("no stdin"))?;
+    let mut stdout = proc.stdout().ok_or_else(|| anyhow!("no stdout"))?;
+    let mut resize = proc.terminal_size();
+    let status = proc.take_status();
+    if let Some(r) = resize.as_mut() {
+        let _ = r.send(TerminalSize { width: size.0, height: size.1 }).await;
+    }
+
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            n = stdout.read(&mut buf) => match n {
+                Ok(0) | Err(_) => break,
+                Ok(n) => on_output(buf[..n].to_vec()),
+            },
+            msg = input.recv() => match msg {
+                Some(ShellInput::Data(bytes)) => {
+                    if stdin.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
+                }
+                Some(ShellInput::Resize(cols, rows)) => {
+                    if let Some(r) = resize.as_mut() {
+                        let _ = r.send(TerminalSize { width: cols, height: rows }).await;
+                    }
+                }
+                // The tab was closed.
+                None => return Ok(None),
+            },
+        }
+    }
+    let status = match status {
+        Some(s) => s.await,
+        None => None,
+    };
+    Ok(status.filter(|s| s.status.as_deref() == Some("Failure")).map(|s| {
+        s.message.unwrap_or_else(|| "the shell exited with an error".into())
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Changes that work across kinds
 // ---------------------------------------------------------------------------
 
@@ -858,6 +934,102 @@ pub async fn trigger_cronjob(client: Client, ns: String, name: String) -> Result
     };
     Api::<Job>::namespaced(client, &ns).create(&PostParams::default(), &job).await?;
     Ok(job_name)
+}
+
+async fn create_one<K>(client: Client, ns: &str, value: serde_json::Value) -> Result<String>
+where
+    K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug + serde::Serialize,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    let obj: K = serde_json::from_value(value).context("the YAML doesn't match its kind")?;
+    let created = Api::<K>::namespaced(client, ns).create(&PostParams::default(), &obj).await?;
+    Ok(created.name_any())
+}
+
+/// Creates an object from YAML, like `kubectl create -f`. The kind comes from the YAML;
+/// the namespace too, falling back to `default_ns`. Returns (kind, namespace, name).
+pub async fn create_yaml(client: Client, default_ns: String, yaml: String) -> Result<(Kind, String, String)> {
+    let mut value: serde_json::Value = serde_yaml::from_str(&yaml).context("invalid YAML")?;
+    let kind_name = value["kind"].as_str().unwrap_or_default().to_string();
+    let kind = Kind::from_label(&kind_name).ok_or_else(|| {
+        let known = Kind::ALL.map(Kind::label).join(", ");
+        anyhow!("kind {kind_name:?} isn't supported here (use one of: {known})")
+    })?;
+    let ns = value["metadata"]["namespace"].as_str().map(str::to_string).unwrap_or(default_ns);
+    if !value["metadata"].is_object() {
+        return Err(anyhow!("metadata is missing"));
+    }
+    value["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+    let name = match kind {
+        Kind::Pod => create_one::<Pod>(client, &ns, value).await?,
+        Kind::Service => create_one::<Service>(client, &ns, value).await?,
+        Kind::Deployment => create_one::<Deployment>(client, &ns, value).await?,
+        Kind::DaemonSet => create_one::<DaemonSet>(client, &ns, value).await?,
+        Kind::StatefulSet => create_one::<StatefulSet>(client, &ns, value).await?,
+        Kind::ReplicaSet => create_one::<ReplicaSet>(client, &ns, value).await?,
+        Kind::ReplicationController => create_one::<ReplicationController>(client, &ns, value).await?,
+        Kind::Job => create_one::<Job>(client, &ns, value).await?,
+        Kind::CronJob => create_one::<CronJob>(client, &ns, value).await?,
+    };
+    Ok((kind, ns, name))
+}
+
+/// A starting point for a new object of `kind` in `ns`, like Lens's create templates.
+pub fn template(kind: Kind, ns: &str) -> String {
+    let pod_spec = |indent: &str| {
+        [
+            "containers:",
+            "  - name: main",
+            "    image: nginx:alpine",
+            "    ports:",
+            "      - containerPort: 80",
+            "    resources:",
+            "      requests:",
+            "        cpu: 50m",
+            "        memory: 64Mi",
+            "      limits:",
+            "        memory: 128Mi",
+        ]
+        .iter()
+        .map(|l| format!("{indent}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    match kind {
+        Kind::Pod => format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-pod\n  namespace: {ns}\n  labels:\n    app: my-pod\nspec:\n{}\n  restartPolicy: Always\n",
+            pod_spec("  ")
+        ),
+        Kind::Deployment => format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n  namespace: {ns}\n  labels:\n    app: my-app\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: my-app\n  template:\n    metadata:\n      labels:\n        app: my-app\n    spec:\n{}\n",
+            pod_spec("      ")
+        ),
+        Kind::StatefulSet => format!(
+            "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: my-db\n  namespace: {ns}\nspec:\n  serviceName: my-db\n  replicas: 1\n  selector:\n    matchLabels:\n      app: my-db\n  template:\n    metadata:\n      labels:\n        app: my-db\n    spec:\n{}\n",
+            pod_spec("      ")
+        ),
+        Kind::DaemonSet => format!(
+            "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: my-agent\n  namespace: {ns}\nspec:\n  selector:\n    matchLabels:\n      app: my-agent\n  template:\n    metadata:\n      labels:\n        app: my-agent\n    spec:\n{}\n",
+            pod_spec("      ")
+        ),
+        Kind::ReplicaSet => format!(
+            "apiVersion: apps/v1\nkind: ReplicaSet\nmetadata:\n  name: my-rs\n  namespace: {ns}\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: my-rs\n  template:\n    metadata:\n      labels:\n        app: my-rs\n    spec:\n{}\n",
+            pod_spec("      ")
+        ),
+        Kind::ReplicationController => format!(
+            "apiVersion: v1\nkind: ReplicationController\nmetadata:\n  name: my-rc\n  namespace: {ns}\nspec:\n  replicas: 1\n  selector:\n    app: my-rc\n  template:\n    metadata:\n      labels:\n        app: my-rc\n    spec:\n{}\n",
+            pod_spec("      ")
+        ),
+        Kind::Service => format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: my-service\n  namespace: {ns}\nspec:\n  type: ClusterIP\n  selector:\n    app: my-app\n  ports:\n    - name: http\n      port: 80\n      targetPort: 80\n"
+        ),
+        Kind::Job => format!(
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: my-job\n  namespace: {ns}\nspec:\n  backoffLimit: 2\n  ttlSecondsAfterFinished: 3600\n  template:\n    spec:\n      restartPolicy: Never\n      containers:\n        - name: main\n          image: busybox:1.36\n          command: [\"sh\", \"-c\", \"echo hello && sleep 5\"]\n"
+        ),
+        Kind::CronJob => format!(
+            "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: my-cronjob\n  namespace: {ns}\nspec:\n  schedule: \"*/30 * * * *\"\n  concurrencyPolicy: Forbid\n  jobTemplate:\n    spec:\n      backoffLimit: 1\n      template:\n        spec:\n          restartPolicy: Never\n          containers:\n            - name: main\n              image: busybox:1.36\n              command: [\"sh\", \"-c\", \"date\"]\n"
+        ),
+    }
 }
 
 async fn replace_one<K>(client: Client, ns: &str, name: &str, value: serde_json::Value) -> Result<()>
@@ -943,6 +1115,22 @@ impl Kind {
             Kind::Job => "Jobs",
             Kind::CronJob => "Cron Jobs",
         }
+    }
+
+    pub const ALL: [Kind; 9] = [
+        Kind::Pod,
+        Kind::Service,
+        Kind::Deployment,
+        Kind::DaemonSet,
+        Kind::StatefulSet,
+        Kind::ReplicaSet,
+        Kind::ReplicationController,
+        Kind::Job,
+        Kind::CronJob,
+    ];
+
+    pub fn from_label(label: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.label() == label)
     }
 
     pub fn scalable(self) -> bool {
@@ -1471,5 +1659,32 @@ pub async fn watch_workloads(
         Kind::Job => watch_rows(client, namespaces, job_row, emit).await,
         Kind::CronJob => watch_rows(client, namespaces, cron_job_row, emit).await,
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every create template is valid YAML that deserializes into its kind.
+    #[test]
+    fn templates_parse() {
+        fn check<K: DeserializeOwned>(kind: Kind) {
+            let v: serde_json::Value = serde_yaml::from_str(&template(kind, "demo")).expect("yaml");
+            assert_eq!(v["kind"], kind.label());
+            assert_eq!(v["metadata"]["namespace"], "demo");
+            serde_json::from_value::<K>(v).unwrap_or_else(|e| panic!("{}: {e}", kind.label()));
+        }
+        check::<Pod>(Kind::Pod);
+        check::<Service>(Kind::Service);
+        check::<Deployment>(Kind::Deployment);
+        check::<DaemonSet>(Kind::DaemonSet);
+        check::<StatefulSet>(Kind::StatefulSet);
+        check::<ReplicaSet>(Kind::ReplicaSet);
+        check::<ReplicationController>(Kind::ReplicationController);
+        check::<Job>(Kind::Job);
+        check::<CronJob>(Kind::CronJob);
+        assert_eq!(Kind::from_label("CronJob"), Some(Kind::CronJob));
+        assert_eq!(Kind::from_label("Ingress"), None);
     }
 }
