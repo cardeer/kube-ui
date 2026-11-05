@@ -1,0 +1,132 @@
+{
+  "title": "Choose the visual world for Kube UI",
+  "question": "The roll assigned Airport Wayfinding. Keep it, take an alternate, or re-roll.",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Airport Wayfinding",
+      "kicker": "THE ROLL",
+      "lineage": "Aicher-school airport sign systems (Frankfurt, Munich, Schiphol)",
+      "thesis": "Every screen answers 'where am I and what changed' the way a concourse sign does.",
+      "palette": ["#16181b", "#22252a", "#f4f1ea", "#ffc72c", "#3fb27f", "#e5484d"],
+      "materials": ["graphite sign panels", "humanist sans", "pictograms on inset squares"],
+      "viewport": "Graphite shell; the active cluster tab, nav item, selected row and live log tab carry the one yellow band; pods table dense with tabular figures; drawer right, logs bottom.",
+      "risk": "Yellow must stay reserved for 'you are here'; spend it on decoration and the system collapses.",
+      "raised": [
+        {"from": "challenger-gate-board", "raise": "Change board: a row whose status, ready or restarts changed lights a held marker until you look at it, like a gate change that stays lit."},
+        {"from": "challenger-type-specimen", "raise": "Hierarchy by scale and weight alone: no cards or boxes to rank content."},
+        {"from": "challenger-botanical-folio", "raise": "One fixed lifecycle vocabulary (pending, creating, running, terminating, failed) drawn identically in tables, drawer, chips and tabs."},
+        {"from": "challenger-star-atlas", "raise": "Restarts on a fixed severity ramp: none, outlined amber, filled red at five or more."}
+      ],
+      "html": ".impeccable/mocks/decision/assigned.html"
+    },
+    {
+      "id": "model-pick",
+      "label": "Transit Line Map",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "metro line diagrams and line-coloured station signage (BTS, Tokyo Metro)",
+      "thesis": "Namespaces and pods are lines with their own colours, so a merged log reads like a line map.",
+      "palette": ["#f6f5f1", "#ffffff", "#1d1d1f", "#00a3e0", "#7ab648", "#f08300", "#9b59b6"],
+      "materials": ["line-colour roundels", "station dots", "clean sans"],
+      "viewport": "Light ground; cluster tabs as line badges; each namespace a coloured line down the table's edge; pods as station dots; log lines tagged with their pod's line colour.",
+      "risk": "Many namespaces at once exhaust distinguishable line colours; this is also a familiar dev-tool pastel look when set timidly.",
+      "html": ".impeccable/mocks/decision/model-pick.html"
+    },
+    {
+      "id": "challenger-gate-board",
+      "label": "Gate Board",
+      "verdict": "competitive",
+      "lineage": "boarding pass and live departure board",
+      "thesis": "Pods ranked like departures; a changed row moves, flashes its alert colour and holds it until noticed.",
+      "palette": ["#f2f2ee", "#ffffff", "#111111", "#ff5a1f", "#2f7d4f"],
+      "materials": ["high-contrast neutral panels", "tabular figures", "segmented pass layout"],
+      "viewport": "Light board; pods ordered by most recent change; drawer as a segmented pass with labelled fields.",
+      "case": "Wins product clarity for an all-day glanced screen; loses audience identification to signage.",
+      "risk": "Re-ranking rows by change fights the stable alphabetical order you rely on to find a pod.",
+      "hero": "https://impeccable.style/worlds/cards/vernacular-ephemera-boarding-pass-and-gate-board-hero.webp",
+      "html": ".impeccable/mocks/decision/challenger-gate-board.html"
+    },
+    {
+      "id": "challenger-terminal-yellow",
+      "label": "Terminal Yellow",
+      "verdict": "competitive",
+      "lineage": "Schiphol yellow wayfinding bands",
+      "thesis": "The whole shell is a yellow sign band; content hangs beneath it in black and white.",
+      "palette": ["#ffcc00", "#111111", "#ffffff", "#f5f5f2", "#d93025"],
+      "materials": ["saturated yellow panels", "black humanist sans", "white pictograms on black"],
+      "viewport": "Yellow top band with black cluster tabs and pickers; black nav rail with white pictograms; white content table.",
+      "case": "Same world as the roll, committed harder; loses on calm for a screen open all day.",
+      "risk": "A yellow band in view all day is loud on a second screen.",
+      "hero": "https://impeccable.style/worlds/cards/wayfinding-cartography-signage-terminal-yellow-wayfinding-hero.webp",
+      "html": ".impeccable/mocks/decision/challenger-terminal-yellow.html"
+    },
+    {
+      "id": "challenger-type-specimen",
+      "label": "Type Specimen",
+      "verdict": "declined",
+      "lineage": "interactive variable-font specimens",
+      "thesis": "Hierarchy by scale contrast on a strict baseline grid.",
+      "palette": ["#f7f6f2", "#111111", "#e4572e"],
+      "materials": ["paper", "ink"],
+      "viewport": "Giant specimen letter over a glyph grid.",
+      "case": "Fuses poorly: nothing in a pod list wants display type.",
+      "kept": "Hierarchy by scale and weight alone.",
+      "risk": "Display type fights dense data.",
+      "hero": "https://impeccable.style/worlds/cards/variable-font-specimen-hero.webp"
+    },
+    {
+      "id": "challenger-vertical-feed",
+      "label": "Vertical Feed",
+      "verdict": "declined",
+      "lineage": "full-bleed vertical video feeds",
+      "thesis": "One item owns the whole screen.",
+      "palette": ["#000000", "#ffffff"],
+      "materials": ["full-bleed media", "scrim"],
+      "viewport": "One item per screen with a right rail of actions.",
+      "case": "Fuses poorly: this job needs many rows at once.",
+      "kept": "Actions live on one rail beside the content, never inside it.",
+      "risk": "Destroys density.",
+      "hero": "https://impeccable.style/worlds/cards/pop-culture-shelf-vertical-video-feed-surface-hero.webp"
+    },
+    {
+      "id": "challenger-botanical-folio",
+      "label": "Botanical Folio",
+      "verdict": "declined",
+      "lineage": "botanical life-cycle plates",
+      "thesis": "One subject through fixed life stages at a fixed scale.",
+      "palette": ["#f3ecd9", "#4f7a3a", "#b3261e", "#6b6b6b"],
+      "materials": ["cream plates", "engraved italic"],
+      "viewport": "Five aligned plates of one plant.",
+      "case": "Fuses poorly: cream and italic serif read as a book, not a cluster tool.",
+      "kept": "One fixed lifecycle state vocabulary used everywhere.",
+      "risk": "Bookish costume.",
+      "hero": "https://impeccable.style/worlds/cards/editorial-sequence-montage-botanical-folio-season-hero.webp"
+    },
+    {
+      "id": "challenger-star-atlas",
+      "label": "Star Atlas",
+      "verdict": "declined",
+      "lineage": "celestial star charts",
+      "thesis": "Importance as mark size on a fixed magnitude ramp.",
+      "palette": ["#0d1b2a", "#f1f1e8", "#e0533a"],
+      "materials": ["navy chart ground", "chalk dots"],
+      "viewport": "A chart of ranked dots on a coordinate grid.",
+      "case": "Fuses poorly: a map metaphor has no place in tables of pods.",
+      "kept": "A fixed severity ramp for restarts.",
+      "risk": "Pretty but unreadable for row data.",
+      "hero": "https://impeccable.style/worlds/cards/notation-diagram-systems-star-atlas-hero.webp"
+    }
+  ],
+  "reroll": {"registers": ["safer", "bolder"]},
+  "canon": true,
+  "canonCard": {
+    "label": "The category standard",
+    "thesis": "A dark developer tool in the Lens / Linear manner, executed impeccably.",
+    "palette": ["#0f1115", "#171a21", "#e6e8ee", "#5b8cff"],
+    "materials": ["neutral greys", "one blue accent", "Inter-style sans"],
+    "viewport": "The arrangement you have now, rebuilt with full craft and custom controls.",
+    "risk": "Indistinguishable from every other dev tool by design.",
+    "html": ".impeccable/mocks/decision/canon.html"
+  },
+  "steer": true
+}

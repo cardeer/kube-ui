@@ -1,0 +1,554 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-04T03:26:22+00:00",
+  "title": "Design System: Kube UI",
+  "extensions": {
+    "colorMeta": {
+      "chrome": {
+        "role": "neutral",
+        "displayName": "Chrome Black",
+        "canonical": "oklch(18.2% 0.009 264)",
+        "tonalRamp": [
+          "#090b0f",
+          "#222428",
+          "#3d4045",
+          "#5b5e63",
+          "#7b7d83",
+          "#9c9ea4",
+          "#c1c4ca",
+          "#ebeef5"
+        ]
+      },
+      "content": {
+        "role": "neutral",
+        "displayName": "Content Graphite",
+        "canonical": "oklch(20.5% 0.010 268)",
+        "tonalRamp": [
+          "#090b10",
+          "#222429",
+          "#3d4045",
+          "#5b5d64",
+          "#7a7d84",
+          "#9b9ea5",
+          "#c1c4cb",
+          "#ebeef6"
+        ]
+      },
+      "raised": {
+        "role": "neutral",
+        "displayName": "Raised Graphite",
+        "canonical": "oklch(23.5% 0.014 267)",
+        "tonalRamp": [
+          "#080b11",
+          "#21242b",
+          "#3c4048",
+          "#5a5e66",
+          "#797d86",
+          "#9a9ea8",
+          "#c0c4ce",
+          "#eaeef8"
+        ]
+      },
+      "well": {
+        "role": "neutral",
+        "displayName": "Well Black",
+        "canonical": "oklch(17.3% 0.009 264)",
+        "tonalRamp": [
+          "#090b0f",
+          "#222428",
+          "#3d4045",
+          "#5b5e63",
+          "#7a7d83",
+          "#9c9ea4",
+          "#c1c4ca",
+          "#ebeef5"
+        ]
+      },
+      "field": {
+        "role": "neutral",
+        "displayName": "Field",
+        "canonical": "oklch(25.6% 0.016 264)",
+        "tonalRamp": [
+          "#080b12",
+          "#20242c",
+          "#3b4049",
+          "#595e67",
+          "#787d87",
+          "#999fa9",
+          "#bfc4cf",
+          "#e9effa"
+        ]
+      },
+      "field-hover": {
+        "role": "neutral",
+        "displayName": "Field Hover",
+        "canonical": "oklch(29.3% 0.020 264)",
+        "tonalRamp": [
+          "#070b14",
+          "#1f242e",
+          "#3a404a",
+          "#585e69",
+          "#777d89",
+          "#989fab",
+          "#bec4d1",
+          "#e8effc"
+        ]
+      },
+      "field-active": {
+        "role": "neutral",
+        "displayName": "Field Active",
+        "canonical": "oklch(32.5% 0.025 266)",
+        "tonalRamp": [
+          "#070b16",
+          "#1e2430",
+          "#39404d",
+          "#575e6c",
+          "#767d8c",
+          "#979eae",
+          "#bcc4d5",
+          "#e7efff"
+        ]
+      },
+      "stripe": {
+        "role": "neutral",
+        "displayName": "Stripe",
+        "canonical": "oklch(22.6% 0.013 264)",
+        "tonalRamp": [
+          "#090b11",
+          "#21242a",
+          "#3c4047",
+          "#5a5e65",
+          "#797d85",
+          "#9a9ea6",
+          "#c0c4cc",
+          "#eaeff7"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "oklch(28.5% 0.018 266)",
+        "tonalRamp": [
+          "#080b13",
+          "#20242d",
+          "#3b4049",
+          "#595e68",
+          "#787d88",
+          "#999eaa",
+          "#bfc4d0",
+          "#e9eefb"
+        ]
+      },
+      "border-strong": {
+        "role": "neutral",
+        "displayName": "Strong Hairline",
+        "canonical": "oklch(34.8% 0.024 266)",
+        "tonalRamp": [
+          "#070b15",
+          "#1e2430",
+          "#3a404d",
+          "#575e6c",
+          "#767d8c",
+          "#979eae",
+          "#bdc4d4",
+          "#e7efff"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "oklch(93.1% 0.008 271)",
+        "tonalRamp": [
+          "#0a0b0f",
+          "#222428",
+          "#3e4044",
+          "#5c5d62",
+          "#7b7d82",
+          "#9c9ea4",
+          "#c2c4ca",
+          "#eceef4"
+        ]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "oklch(70.9% 0.025 267)",
+        "tonalRamp": [
+          "#070b16",
+          "#1f2430",
+          "#3a404d",
+          "#575e6c",
+          "#777d8c",
+          "#979eae",
+          "#bdc4d5",
+          "#e7eeff"
+        ]
+      },
+      "text-faint": {
+        "role": "neutral",
+        "displayName": "Faint Ink",
+        "canonical": "oklch(61.3% 0.029 266)",
+        "tonalRamp": [
+          "#060b17",
+          "#1e2432",
+          "#39404f",
+          "#565e6e",
+          "#757d8f",
+          "#969eb1",
+          "#bbc4d8",
+          "#e6efff"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Signal Blue",
+        "canonical": "oklch(65.8% 0.182 261)",
+        "tonalRamp": [
+          "#080057",
+          "#000379",
+          "#00329d",
+          "#1555c2",
+          "#3877e7",
+          "#599bff",
+          "#7dc2ff",
+          "#c0f0ff"
+        ]
+      },
+      "accent-hover": {
+        "role": "primary",
+        "displayName": "Lit Signal Blue",
+        "canonical": "oklch(70.7% 0.154 260)",
+        "tonalRamp": [
+          "#02004a",
+          "#00146c",
+          "#00388f",
+          "#2459b2",
+          "#447ad7",
+          "#649dfd",
+          "#89c4ff",
+          "#c0f0ff"
+        ]
+      },
+      "accent-bg": {
+        "role": "primary",
+        "displayName": "Selection Navy",
+        "canonical": "oklch(28.7% 0.053 264)",
+        "tonalRamp": [
+          "#020921",
+          "#17233e",
+          "#313f5c",
+          "#4e5e7c",
+          "#6d7d9d",
+          "#8e9fc0",
+          "#b3c5e7",
+          "#ddefff"
+        ]
+      },
+      "accent-text": {
+        "role": "primary",
+        "displayName": "Pale Signal",
+        "canonical": "oklch(90.2% 0.047 264)",
+        "tonalRamp": [
+          "#030a1f",
+          "#18233b",
+          "#333f59",
+          "#505e79",
+          "#6f7d9a",
+          "#909fbd",
+          "#b5c4e4",
+          "#dfefff"
+        ]
+      },
+      "state-ok": {
+        "role": "tertiary",
+        "displayName": "Running Green",
+        "canonical": "oklch(76.2% 0.154 159)",
+        "tonalRamp": [
+          "#001800",
+          "#003600",
+          "#00551e",
+          "#00763c",
+          "#00985b",
+          "#1cbb7b",
+          "#56e2a0",
+          "#a4ffd2"
+        ]
+      },
+      "state-warn": {
+        "role": "tertiary",
+        "displayName": "Pending Amber",
+        "canonical": "oklch(78.2% 0.158 72)",
+        "tonalRamp": [
+          "#2c0000",
+          "#4d0000",
+          "#6f2700",
+          "#914800",
+          "#b56900",
+          "#d98b00",
+          "#ffb137",
+          "#ffe291"
+        ]
+      },
+      "state-bad": {
+        "role": "tertiary",
+        "displayName": "Failing Red",
+        "canonical": "oklch(66.3% 0.193 22)",
+        "tonalRamp": [
+          "#3d0000",
+          "#640000",
+          "#8a0001",
+          "#b10225",
+          "#d83b45",
+          "#ff6265",
+          "#ff8a89",
+          "#ffceca"
+        ]
+      },
+      "state-idle": {
+        "role": "tertiary",
+        "displayName": "Idle Slate",
+        "canonical": "oklch(55.2% 0.026 267)",
+        "tonalRamp": [
+          "#060b16",
+          "#1e2431",
+          "#39404e",
+          "#575e6d",
+          "#767d8d",
+          "#979eaf",
+          "#bcc4d6",
+          "#e6efff"
+        ]
+      },
+      "danger-fill": {
+        "role": "tertiary",
+        "displayName": "Delete Red",
+        "canonical": "oklch(56.3% 0.179 23)",
+        "tonalRamp": [
+          "#3b0000",
+          "#600000",
+          "#860006",
+          "#ac1828",
+          "#d34448",
+          "#fa6868",
+          "#ff8f8c",
+          "#ffcec9"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Page Title",
+        "purpose": "Page titles with a muted count beside them."
+      },
+      "headline": {
+        "displayName": "Drawer Name",
+        "purpose": "Resource name at the top of the detail drawer."
+      },
+      "title": {
+        "displayName": "Semibold Step",
+        "purpose": "Selected nav items and tabs; primary and danger button labels."
+      },
+      "body": {
+        "displayName": "UI Body",
+        "purpose": "All interface text and field values."
+      },
+      "label": {
+        "displayName": "Column Label",
+        "purpose": "Sentence-case table headers and drawer section labels in Muted Ink."
+      },
+      "small": {
+        "displayName": "Small",
+        "purpose": "Badges, tags, hints and secondary lines."
+      },
+      "mono": {
+        "displayName": "Data Mono",
+        "purpose": "Every cluster-derived value: names, ages, IPs, detail values, YAML, logs."
+      }
+    },
+    "shadows": [
+      {
+        "name": "window",
+        "value": "0 10px 28px rgba(0,0,0,0.51)",
+        "purpose": "Dialogs and floating windows."
+      },
+      {
+        "name": "popup",
+        "value": "0 6px 18px rgba(0,0,0,0.47)",
+        "purpose": "Menus and combo-box popups."
+      },
+      {
+        "name": "card",
+        "value": "0 8px 22px rgba(0,0,0,0.55)",
+        "purpose": "Toasts."
+      }
+    ],
+    "motion": [],
+    "logSourcePalette": {
+      "purpose": "Fixed colours tagging each pod's lines in a merged multi-pod log; never used for state.",
+      "values": [
+        "#6ea5f0",
+        "#78c882",
+        "#e6aa5a",
+        "#c882e6",
+        "#5ac8c8",
+        "#eb7896",
+        "#bec864",
+        "#a096f0"
+      ]
+    },
+    "layout": {
+      "navWidth": "200px",
+      "drawerDefaultWidth": "460px",
+      "drawerMinWidth": "340px",
+      "logMinHeight": "160px",
+      "logCollapsedHeight": "40px",
+      "tableRow": "30px",
+      "tableHeader": "26px",
+      "navItem": "32px"
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one filled accent action in a group, e.g. the drawer's Logs.",
+      "html": "<button class=\"ds-btn-primary\">Logs</button>",
+      "css": ".ds-btn-primary { background: #4c8dff; color: #fff; border: 1px solid #669fff; border-radius: 4px; padding: 5px 10px; height: 26px; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; font-weight: 600; cursor: pointer; } .ds-btn-primary:focus-visible { outline: 1px solid #cfdfff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Every non-primary action: quiet field fill, hairline border.",
+      "html": "<button class=\"ds-btn\">Port forward</button>",
+      "css": ".ds-btn { background: #1f232b; color: #e6e8ee; border: 1px solid #262a33; border-radius: 4px; padding: 5px 10px; height: 26px; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; cursor: pointer; } .ds-btn:hover { background: #272c36; border-color: #343a47; } .ds-btn:active { background: #2e3441; border-color: #4c8dff; } .ds-btn:focus-visible { outline: 1px solid #cfdfff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Destructive confirmation only (Delete pod).",
+      "html": "<button class=\"ds-btn-danger\">Delete pod</button>",
+      "css": ".ds-btn-danger { background: #c93a40; color: #fff; border: 1px solid #f2555a; border-radius: 4px; padding: 5px 10px; height: 26px; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; font-weight: 600; cursor: pointer; } .ds-btn-danger:focus-visible { outline: 1px solid #cfdfff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "icon-button",
+      "description": "Frameless 24px glyph button that fills only on hover.",
+      "html": "<button class=\"ds-icon-btn\" title=\"Close\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\"><line x1=\"200\" y1=\"56\" x2=\"56\" y2=\"200\"/><line x1=\"200\" y1=\"200\" x2=\"56\" y2=\"56\"/></svg></button>",
+      "css": ".ds-icon-btn { width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #9aa1b1; border: 0; border-radius: 4px; cursor: pointer; } .ds-icon-btn:hover { background: #272c36; color: #e6e8ee; } .ds-icon-btn:focus-visible { outline: 1px solid #cfdfff; }"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "input-field",
+      "description": "List filter inset on the chrome ground with a leading magnifier.",
+      "html": "<label class=\"ds-search\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linecap=\"round\"><circle cx=\"112\" cy=\"112\" r=\"80\"/><line x1=\"168.57\" y1=\"168.57\" x2=\"224\" y2=\"224\"/></svg><input placeholder=\"Filter by name or namespace\"></label>",
+      "css": ".ds-search { display: inline-flex; align-items: center; gap: 6px; width: 300px; background: #101216; border: 1px solid #262a33; border-radius: 4px; padding: 5px 8px; color: #7c8496; } .ds-search:hover { border-color: #343a47; } .ds-search:focus-within { border-color: #cfdfff; } .ds-search input { flex: 1; background: transparent; border: 0; outline: 0; color: #e6e8ee; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; caret-color: #669fff; } .ds-search input::placeholder { color: #7c8496; }"
+    },
+    {
+      "name": "Checkbox",
+      "kind": "input",
+      "refersTo": null,
+      "description": "15px square, accent-filled with a check when on.",
+      "html": "<label class=\"ds-check\"><input type=\"checkbox\" checked><span class=\"ds-check-box\"></span>Auto-scroll</label>",
+      "css": ".ds-check { display: inline-flex; align-items: center; gap: 7px; color: #9aa1b1; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; cursor: pointer; } .ds-check input { position: absolute; opacity: 0; } .ds-check-box { width: 15px; height: 15px; border-radius: 3px; background: #1f232b; border: 1px solid #343a47; box-sizing: border-box; } .ds-check:hover .ds-check-box { background: #272c36; } .ds-check input:checked + .ds-check-box { background: #4c8dff; border-color: #4c8dff; background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cpolyline points='40 144 96 200 224 72' fill='none' stroke='white' stroke-width='24' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\"); background-size: 11px; background-position: center; background-repeat: no-repeat; } .ds-check:has(input:checked) { color: #e6e8ee; } .ds-check input:focus-visible + .ds-check-box { outline: 1px solid #cfdfff; outline-offset: 1px; }"
+    },
+    {
+      "name": "Nav Item",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "Left rail entry: glyph, label, count; Selection Navy when selected.",
+      "html": "<nav class=\"ds-nav\"><a class=\"ds-nav-item is-selected\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\" stroke-linejoin=\"round\"><path d=\"M224 177.3V78.7a8 8 0 0 0-4.1-7l-88-49.5a7.8 7.8 0 0 0-7.8 0l-88 49.5a8 8 0 0 0-4.1 7v98.6a8 8 0 0 0 4.1 7l88 49.5a7.8 7.8 0 0 0 7.8 0l88-49.5a8 8 0 0 0 4.1-7Z\"/><polyline points=\"32.7 76.9 128 128 223.3 76.9\"/><line x1=\"128\" y1=\"128\" x2=\"128\" y2=\"236\"/></svg><span>Pods</span><em>512</em></a><a class=\"ds-nav-item\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"16\"><circle cx=\"128\" cy=\"128\" r=\"40\"/><circle cx=\"128\" cy=\"128\" r=\"96\"/></svg><span>Settings</span></a></nav>",
+      "css": ".ds-nav { width: 200px; background: #101216; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; } .ds-nav-item { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px 0 12px; border-radius: 6px; color: #9aa1b1; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; cursor: pointer; } .ds-nav-item span { flex: 1; } .ds-nav-item em { font-style: normal; font-size: 12px; color: #7c8496; } .ds-nav-item:hover { background: #1f232b; color: #e6e8ee; } .ds-nav-item.is-selected { background: #1d2a45; color: #cfdfff; font-weight: 600; } .ds-nav-item.is-selected svg { color: #669fff; } .ds-nav-item.is-selected em { color: #cfdfff; }"
+    },
+    {
+      "name": "Underline Tabs",
+      "kind": "nav",
+      "refersTo": null,
+      "description": "Drawer section tabs: 2px accent underline on the active one.",
+      "html": "<div class=\"ds-tabs\"><a class=\"is-active\">Overview</a><a>Containers 2</a><a>Events 10</a></div>",
+      "css": ".ds-tabs { display: flex; gap: 18px; border-bottom: 1px solid #262a33; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; } .ds-tabs a { padding-bottom: 6px; color: #9aa1b1; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; } .ds-tabs a:hover { color: #e6e8ee; } .ds-tabs a.is-active { color: #e6e8ee; font-weight: 600; border-bottom-color: #4c8dff; }"
+    },
+    {
+      "name": "Restart Badge",
+      "kind": "chip",
+      "refersTo": "badge-tinted",
+      "description": "Severity ramp: tinted amber for 1-4 restarts, filled red for 5+.",
+      "html": "<span class=\"ds-badge ds-badge-warn\">3</span> <span class=\"ds-badge ds-badge-bad\">12</span>",
+      "css": ".ds-badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-family: Inter, system-ui, sans-serif; font-size: 11.5px; font-weight: 600; } .ds-badge-warn { color: #f5a524; background: rgba(245,165,36,0.16); } .ds-badge-bad { color: #fff; background: #f2555a; }"
+    },
+    {
+      "name": "Pod Table Row",
+      "kind": "custom",
+      "refersTo": "table-row",
+      "description": "Dense 30px striped row: mono name, state dot, muted mono secondary columns.",
+      "html": "<div class=\"ds-rows\"><div class=\"ds-row is-selected\"><span>admin-api-app-86d5f49b4b-pqv48</span><span class=\"ds-st\"><i style=\"background:#3ecf8e\"></i>Running</span><span class=\"ds-mut\">35m</span></div><div class=\"ds-row\"><span>admin-portal-green-app…bf95b-lqsqs</span><span class=\"ds-st\" style=\"color:#f2555a\"><i style=\"background:#f2555a\"></i>ImagePullBackOff</span><span class=\"ds-mut\">41d17h</span></div></div>",
+      "css": ".ds-rows { background: #15171c; width: 560px; } .ds-row { display: grid; grid-template-columns: 1fr 150px 70px; align-items: center; height: 30px; padding: 0 6px; color: #e6e8ee; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12.5px; cursor: pointer; } .ds-row:nth-child(even) { background: #191c22; } .ds-row:hover { background: #272c36; } .ds-row.is-selected { background: #1d2a45; } .ds-st { display: inline-flex; align-items: center; gap: 8px; font-family: Inter, system-ui, sans-serif; font-size: 13.5px; } .ds-st i { width: 8px; height: 8px; border-radius: 50%; } .ds-mut { color: #9aa1b1; }"
+    },
+    {
+      "name": "Toast",
+      "kind": "card",
+      "refersTo": "card-toast",
+      "description": "Floating confirmation card, bottom right, soft offset shadow.",
+      "html": "<div class=\"ds-toast\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 256 256\" fill=\"none\" stroke=\"#3ecf8e\" stroke-width=\"16\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"88 136 112 160 168 104\"/><circle cx=\"128\" cy=\"128\" r=\"96\"/></svg>Rollout restart requested</div>",
+      "css": ".ds-toast { display: inline-flex; gap: 8px; align-items: flex-start; max-width: 420px; background: #1b1e25; color: #e6e8ee; border: 1px solid #343a47; border-radius: 8px; padding: 10px 14px; box-shadow: 0 8px 22px rgba(0,0,0,0.55); font-family: Inter, system-ui, sans-serif; font-size: 13.5px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Night Shift Console",
+    "overview": "A dark Kubernetes desktop tool in the category standard, executed at Lens/OpenLens craft: conventions embraced, every control drawn for this app rather than borrowed from egui's stock set. The window is built from four cool near-black grounds stacked by luminance (well below content, content below raised, chrome framing the edges), separated by hairlines rather than boxes. Nothing is decorative; the screen is dense with rows and log lines and calm everywhere a problem is not.\n\nColour carries meaning, not mood. One blue accent marks where you are and what you will do (selection, focus, the single primary action). Green, amber and red appear only when they report state, so a failing pod reads from across the desk before any text is read. Inter sets the interface; JetBrains Mono sets everything that is data (resource names, ages, IPs, logs), which also gives tabular figures in every table.\n\nControls are quiet and made in-house: frameless icon buttons that fill only on hover, a hand-drawn checkbox and caret, underline tabs, small 4px radii. Floating layers (menus, dialogs, toasts) are the only things that lift, on soft offset shadows.",
+    "keyCharacteristics": [
+      "Four tonal grounds (chrome, content, raised, well) plus three field steps; depth by luminance, not boxes.",
+      "One blue accent, used only for selection, focus and the primary action.",
+      "State colours reserved for state; production clusters get no special treatment.",
+      "Inter for UI with a single semibold step; JetBrains Mono for every data value.",
+      "Dense 30px table rows, 26px controls, 4-6px radii.",
+      "Shadows only on floating layers."
+    ],
+    "rules": [
+      {
+        "name": "The One Blue Rule",
+        "body": "The accent marks selection, focus and the one primary action in a group. It never decorates, never colours a heading, and never appears twice as a filled button in the same group.",
+        "section": "colors"
+      },
+      {
+        "name": "The State Only Rule",
+        "body": "Green, amber and red mean running, pending and failing. They never brand a cluster, an environment or a section; production is drawn exactly like dev.",
+        "section": "colors"
+      },
+      {
+        "name": "The Data Is Mono Rule",
+        "body": "Any value that came from the cluster (names, ages, counts, addresses, logs) is set in JetBrains Mono; any word the app wrote is set in Inter.",
+        "section": "typography"
+      },
+      {
+        "name": "The Middle Ellipsis Rule",
+        "body": "Long resource names shorten from the middle and keep the tail (the ReplicaSet hash and pod suffix); the full name is on hover.",
+        "section": "typography"
+      },
+      {
+        "name": "The Docked Is Flat Rule",
+        "body": "Panels, rows, tabs and buttons never cast shadows. If it is docked into the window, depth comes from its ground colour.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** draw every control in the app's vocabulary: Phosphor glyphs, the custom caret and checkbox, frameless icon buttons with hover fills.",
+      "**Do** separate regions by ground colour (chrome #101216, content #15171c, raised #1b1e25, well #0e1014) and 1px hairlines.",
+      "**Do** keep one filled Signal Blue button per action group; everything else is Default or an icon button.",
+      "**Do** set every cluster-derived value in JetBrains Mono and every app-written word in Inter.",
+      "**Do** keep table rows at 30px and controls at 26px.",
+      "**Do** give every icon-only control a hover hint."
+    ],
+    "donts": [
+      "**Don't** use stock egui frames, the filled combo triangle, or egui's default grey; use the theme's frames and the Idle Slate or Muted Ink tokens.",
+      "**Don't** use green, amber or red for anything except state, and don't give production clusters a distinct colour or treatment.",
+      "**Don't** use radii above 10px, pill shapes or playful styling.",
+      "**Don't** put shadows on docked panels, rows, tabs or buttons.",
+      "**Don't** add uppercase eyebrow or kicker labels; section and column labels are sentence-case 12px semibold Muted Ink."
+    ]
+  }
+}
