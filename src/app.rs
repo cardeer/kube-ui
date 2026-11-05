@@ -1,4 +1,5 @@
 mod code_editor;
+mod filter;
 mod logs;
 mod shell;
 mod theme;
@@ -431,6 +432,8 @@ struct DevScreenshot {
     sort: Option<Sort>,
     /// `KUBE_UI_SCREENSHOT_SHELL=<command>` opens a shell on the first running pod and types it.
     shell: Option<String>,
+    /// `KUBE_UI_SCREENSHOT_LOG_REGEX=<pattern>` sets the log tab's filter in regex mode.
+    log_regex: Option<String>,
 }
 
 impl App {
@@ -473,6 +476,7 @@ impl App {
                 select: std::env::var_os("KUBE_UI_SCREENSHOT_SELECT").is_some(),
                 edit: std::env::var_os("KUBE_UI_SCREENSHOT_EDIT").is_some(),
                 shell: std::env::var("KUBE_UI_SCREENSHOT_SHELL").ok(),
+                log_regex: std::env::var("KUBE_UI_SCREENSHOT_LOG_REGEX").ok(),
                 sort: std::env::var("KUBE_UI_SCREENSHOT_SORT").ok().map(|v| {
                     let (col, dir) = v.split_once(':').unwrap_or((&v, "asc"));
                     Sort { col: col.to_string(), asc: dir != "desc" }
@@ -492,6 +496,7 @@ impl App {
                     namespace: None,
                     filters: BTreeMap::new(),
                     sorts: BTreeMap::new(),
+                    filter_regex: false,
                 });
             }
         }
@@ -500,6 +505,7 @@ impl App {
             let selection = s.selection();
             app.add_workspace(s.kubeconfig, s.context, selection);
             if let Some(ws) = app.workspaces.last_mut() {
+                ws.filter_regex = s.filter_regex;
                 ws.filters = s
                     .filters
                     .iter()
@@ -626,6 +632,11 @@ impl App {
             if let Some(sort) = sort {
                 ws.sorts.insert(tab, sort);
             }
+            // `KUBE_UI_SCREENSHOT_FILTER=<regex>` presets the page's filter in regex mode.
+            if let Ok(re) = std::env::var("KUBE_UI_SCREENSHOT_FILTER") {
+                ws.filters.insert(tab, re);
+                ws.filter_regex = true;
+            }
             if ws.tab != tab {
                 ws.set_tab(tab);
                 return;
@@ -670,6 +681,11 @@ impl App {
                     name: pod.name.clone(),
                 }));
                 self.apply(Action::OpenLogs(pod, None));
+                if let Some(re) = self.screenshot.as_ref().and_then(|s| s.log_regex.clone()) {
+                    if let Some(log) = self.logs.last_mut() {
+                        log.set_filter(re, true);
+                    }
+                }
             }
             if let Some(shot) = self.screenshot.as_mut() {
                 shot.staged = Some(Instant::now());

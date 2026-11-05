@@ -281,6 +281,27 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> Response {
     resp.on_hover_text(hint)
 }
 
+/// Small on/off text toggle (e.g. `.*` for regex), sized to sit beside an icon button.
+pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Response {
+    let font = FontId::monospace(13.0);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), TEXT);
+    let size = Vec2::new((galley.size().x + 12.0).max(24.0), 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let radius = CornerRadius::same(RADIUS_SMALL);
+        if on {
+            p.rect_filled(rect, radius, ACCENT_BG);
+            p.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            p.rect_filled(rect, radius, FIELD_HOVER);
+        }
+        let color = if on { ACCENT_TEXT } else if resp.hovered() { TEXT } else { TEXT_MUTED };
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, color);
+    }
+    resp.on_hover_text(hint)
+}
+
 /// Left navigation entry: icon, label, optional count; accent-tinted when selected.
 pub fn nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, count: Option<usize>, selected: bool) -> Response {
     let height = 32.0;

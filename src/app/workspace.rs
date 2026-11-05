@@ -39,6 +39,10 @@ pub(super) struct Workspace {
     pub(super) tab: Tab,
     /// Name filter per page; kept when switching pages and saved with the tab.
     pub(super) filters: HashMap<Tab, String>,
+    /// Table filters are regular expressions (one switch for every page).
+    pub(super) filter_regex: bool,
+    /// Compiled filter for the current page; refreshed by `ui_filter_bar`.
+    matcher: super::filter::Matcher,
     /// Sorted column per page; saved with the tab.
     pub(super) sorts: HashMap<Tab, Sort>,
     pub(super) context_query: String,
@@ -87,6 +91,8 @@ impl Workspace {
             generation: 0,
             tab: Tab::Pods,
             filters: HashMap::new(),
+            filter_regex: false,
+            matcher: Default::default(),
             sorts: HashMap::new(),
             context_query: String::new(),
             namespace_query: String::new(),
@@ -136,6 +142,7 @@ impl Workspace {
                 .map(|(t, v)| (t.key().to_string(), v.clone()))
                 .collect(),
             sorts: self.sorts.iter().map(|(t, s)| (t.key().to_string(), s.saved())).collect(),
+            filter_regex: self.filter_regex,
         }
     }
 
@@ -544,6 +551,8 @@ impl Workspace {
     // -----------------------------------------------------------------------
 
     fn ui_filter_bar(&mut self, ui: &mut egui::Ui, title: &str, create_kind: &mut Option<Kind>) {
+        let pattern = self.filters.get(&self.tab).map(String::as_str).unwrap_or("");
+        self.matcher.update(pattern, self.filter_regex);
         // "512", or "8 of 512" while a filter narrows the list.
         let (shown, total) = match self.tab {
             Tab::Pods => (self.pods.items.iter().filter(|p| self.matches(&p.name, &p.namespace)).count(), count(&self.pods)),
@@ -562,10 +571,19 @@ impl Workspace {
                 ui.label(RichText::new(text).size(15.0).color(theme::TEXT_FAINT));
             }
             ui.add_space(16.0);
+            let hint = if self.filter_regex { "Regex on name or namespace" } else { "Filter by name or namespace" };
             let filter = self.filters.entry(self.tab).or_default();
-            theme::search_field(ui, filter, "Filter by name or namespace", 300.0);
-            if !filter.is_empty() && theme::icon_button(ui, icon::X, "Clear filter").clicked() {
-                filter.clear();
+            theme::search_field(ui, filter, hint, 300.0);
+            let has_text = !filter.is_empty();
+            if theme::toggle_button(ui, ".*", self.filter_regex, "Regular expression (case-insensitive)").clicked() {
+                self.filter_regex = !self.filter_regex;
+            }
+            if has_text && theme::icon_button(ui, icon::X, "Clear filter").clicked() {
+                self.filters.remove(&self.tab);
+            }
+            if let Some(err) = &self.matcher.error {
+                ui.label(RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD))
+                    .on_hover_text(err);
             }
             if let Some(kind) = self.tab.kinds().first().copied().filter(|_| self.tab.is_list()) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -584,9 +602,7 @@ impl Workspace {
     }
 
     fn matches(&self, name: &str, namespace: &str) -> bool {
-        let Some(filter) = self.filters.get(&self.tab).filter(|f| !f.is_empty()) else { return true };
-        let f = filter.to_lowercase();
-        name.to_lowercase().contains(&f) || namespace.to_lowercase().contains(&f)
+        !self.matcher.is_active() || self.matcher.matches(name) || self.matcher.matches(namespace)
     }
 
     fn is_selected(&self, kind: Kind, namespace: &str, name: &str) -> bool {

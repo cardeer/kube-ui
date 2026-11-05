@@ -54,6 +54,9 @@ pub struct SavedWorkspace {
     /// Sorted column per page.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sorts: BTreeMap<String, SavedSort>,
+    /// Table filters are regular expressions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub filter_regex: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

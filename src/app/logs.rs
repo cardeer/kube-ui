@@ -3,6 +3,8 @@
 
 use egui::text::{LayoutJob, TextFormat};
 
+use super::filter::Matcher;
+
 use super::*;
 
 /// Distinct, readable-on-dark colors for telling pods apart.
@@ -175,6 +177,10 @@ pub(super) struct LogView {
     previous: bool,
     follow: bool,
     filter: String,
+    /// Treat `filter` as a regular expression.
+    regex: bool,
+    /// Compiled form of `filter`/`regex`, rebuilt when either changes.
+    matcher: Matcher,
     sources: Vec<Source>,
     resolving: bool,
     error: Option<String>,
@@ -227,6 +233,8 @@ impl LogView {
             previous: false,
             follow: true,
             filter: String::new(),
+            regex: false,
+            matcher: Matcher::default(),
             sources: Vec::new(),
             resolving: false,
             error: None,
@@ -239,6 +247,12 @@ impl LogView {
             row_pitch: 0.0,
             pending_offset: None,
         }
+    }
+
+    /// Dev screenshot hook: preset the line filter.
+    pub(super) fn set_filter(&mut self, filter: String, regex: bool) {
+        self.filter = filter;
+        self.regex = regex;
     }
 
     pub(super) fn stream_id(&self) -> u64 {
@@ -481,7 +495,7 @@ impl LogView {
 
     fn visible(&self, vl: &ViewLine) -> bool {
         self.sources.get(vl.src).is_none_or(|s| s.visible)
-            && (self.filter.is_empty() || vl.line.text.to_lowercase().contains(&self.filter.to_lowercase()))
+            && self.matcher.matches(&vl.line.text)
     }
 
     fn format_plain(&self, vl: &ViewLine) -> String {
@@ -543,7 +557,17 @@ impl LogView {
             out.restart |= theme::checkbox(ui, &mut self.previous, "Previous").changed();
             theme::checkbox(ui, &mut self.follow, "Auto-scroll");
             ui.add_space(4.0);
-            theme::search_field(ui, &mut self.filter, "Filter lines", 200.0);
+            let hint = if self.regex { "Filter (regex)" } else { "Filter lines" };
+            theme::search_field(ui, &mut self.filter, hint, 200.0);
+            let regex_hint = "Regular expression (case-insensitive)";
+            if theme::toggle_button(ui, ".*", self.regex, regex_hint).clicked() {
+                self.regex = !self.regex;
+            }
+            self.matcher.update(&self.filter, self.regex);
+            if let Some(err) = &self.matcher.error {
+                ui.label(RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD))
+                    .on_hover_text(err);
+            }
             let restart_hint = if self.is_group() { "Restart (also picks up new pods)" } else { "Restart stream" };
             if theme::icon_button(ui, icon::ARROW_CLOCKWISE, restart_hint).clicked() {
                 out.restart = true;

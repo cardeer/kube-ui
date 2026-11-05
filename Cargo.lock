@@ -2359,6 +2359,7 @@ dependencies = [
  "image",
  "k8s-openapi",
  "kube",
+ "regex",
  "rfd",
  "serde",
  "serde_json",
