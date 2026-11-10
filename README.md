@@ -8,6 +8,16 @@ cargo run --release
 
 ## Install (macOS)
 
+Install or update to the latest release (Apple Silicon). Run the same command again to update; it quits and reopens the app if it's running:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cardeer/kube-ui/main/scripts/install.sh | bash
+```
+
+Add `-s -- --version v0.1.0` after `bash` to pick a release, `--force` to reinstall, or `--dir ~/Applications` to install without admin rights.
+
+### From source
+
 Builds `Kube UI.app` and copies it to `/Applications`. Run it again after pulling changes to update the app:
 
 ```bash
@@ -15,6 +25,10 @@ Builds `Kube UI.app` and copies it to `/Applications`. Run it again after pullin
 ```
 
 Without `--install`, the bundle is only built, in `target/release/bundle/`. The app is ad-hoc signed for local use.
+
+### Publishing a release
+
+Bump `version` in `Cargo.toml`, commit, then run `./scripts/release-macos.sh` (needs the GitHub CLI). It builds the app, tags `v<version>`, and uploads `Kube-UI-<version>-macos-<arch>.zip`, the name `install.sh` downloads.
 
 ## Features
 
@@ -52,6 +66,7 @@ Settings are stored in `~/Library/Application Support/kube-ui/settings.json` on 
 - `src/app/workspace.rs`: one cluster tab: connection, lists, detail drawer
 - `src/app/logs.rs`: log tabs, including merged multi-pod streams
 - `src/settings.rs`: persisted settings, including saved port forwards
+- `scripts/install.sh`: installs or updates the app from the latest GitHub release; `scripts/release-macos.sh` publishes one
 - `scripts/bundle-macos.sh`: builds the `.app` bundle; `scripts/make-icon.swift` draws `assets/icon.png`, which is also embedded as the running app's Dock icon
 
 Log streaming uses a separate HTTP/2-capable client because some API proxies (e.g. Rancher) never answer `follow=true` log requests over HTTP/1.1. Everything else, including port-forward (which needs an HTTP/1.1 upgrade), uses the default kube client.
