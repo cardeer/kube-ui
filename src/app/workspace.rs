@@ -58,7 +58,7 @@ pub(super) struct Workspace {
     watch: Option<WatchTask>,
     last_details: Option<Instant>,
     selected: Option<Selected>,
-    drawer_tab: DrawerTab,
+    pub(super) drawer_tab: DrawerTab,
     details: Option<DetailsState>,
     /// Secrets the user chose to reveal, keyed by (namespace, name). Cleared when the drawer changes.
     secrets: HashMap<(String, String), Result<BTreeMap<String, String>, String>>,
@@ -699,68 +699,71 @@ impl Workspace {
         });
 
         // State first (status, restarts, ready) so it stays visible next to the drawer.
-        let mut table = Self::table(ui)
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::exact(132.0).clip(true))
-            // Room for the header's sort arrow.
-            .column(Column::exact(80.0))
-            .column(Column::exact(64.0))
-            .column(Column::exact(72.0));
-        if show_ns {
-            table = table.column(Column::exact(110.0).clip(true));
-        }
-        if show_node {
-            table = table.column(Column::exact(190.0).clip(true));
-        }
-        table
-            .header(26.0, |mut h| {
-                for t in ["Name", "Status", "Restarts", "Ready", "Age"] {
-                    h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                }
-                if show_ns {
-                    h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                }
-                if show_node {
-                    h.col(|ui| sort_header(ui, "Node", sort, &mut clicked));
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let p = rows[row.index()];
-                    row.set_selected(self.is_selected(Kind::Pod, &p.namespace, &p.name));
-                    row.col(|ui| name_cell(ui, &p.name));
-                    row.col(|ui| {
-                        let color = status_color(&p.status);
-                        dot(ui, color);
-                        // Problems read from across the room: tint anything not healthy.
-                        let text = RichText::new(&p.status);
-                        let text = if color == GREEN { text.color(theme::TEXT) } else { text.color(color) };
-                        // Long reasons (Init:CrashLoopBackOff) end in an ellipsis; hover shows them in full.
-                        ui.add(egui::Label::new(text).truncate()).on_hover_text(&p.status);
-                    });
-                    row.col(|ui| restarts_badge(ui, p.restarts));
-                    row.col(|ui| { ui.label(mono(&p.ready)); });
-                    row.col(|ui| { ui.label(mono_muted(p.age())); });
+        // Wide tables scroll sideways instead of clipping columns off the edge.
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            let mut table = Self::table(ui)
+                .column(Column::remainder().at_least(180.0).clip(true))
+                .column(Column::exact(132.0).clip(true))
+                // Room for the header's sort arrow.
+                .column(Column::exact(80.0))
+                .column(Column::exact(64.0))
+                .column(Column::exact(72.0));
+            if show_ns {
+                table = table.column(Column::exact(110.0).clip(true));
+            }
+            if show_node {
+                table = table.column(Column::exact(190.0).clip(true));
+            }
+            table
+                .header(26.0, |mut h| {
+                    for t in ["Name", "Status", "Restarts", "Ready", "Age"] {
+                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                    }
                     if show_ns {
-                        row.col(|ui| { ui.label(mono_muted(&p.namespace)); });
+                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                     }
                     if show_node {
-                        row.col(|ui| { ui.label(mono_muted(&p.node)); });
+                        h.col(|ui| sort_header(ui, "Node", sort, &mut clicked));
                     }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                        let p = rows[row.index()];
+                        row.set_selected(self.is_selected(Kind::Pod, &p.namespace, &p.name));
+                        row.col(|ui| name_cell(ui, &p.name));
+                        row.col(|ui| {
+                            let color = status_color(&p.status);
+                            dot(ui, color);
+                            // Problems read from across the room: tint anything not healthy.
+                            let text = RichText::new(&p.status);
+                            let text = if color == GREEN { text.color(theme::TEXT) } else { text.color(color) };
+                            // Long reasons (Init:CrashLoopBackOff) end in an ellipsis; hover shows them in full.
+                            ui.add(egui::Label::new(text).truncate()).on_hover_text(&p.status);
+                        });
+                        row.col(|ui| restarts_badge(ui, p.restarts));
+                        row.col(|ui| { ui.label(mono(&p.ready)); });
+                        row.col(|ui| { ui.label(mono_muted(p.age())); });
+                        if show_ns {
+                            row.col(|ui| { ui.label(mono_muted(&p.namespace)); });
+                        }
+                        if show_node {
+                            row.col(|ui| { ui.label(mono_muted(&p.node)); });
+                        }
 
-                    let resp = row.response();
-                    if resp.double_clicked() {
-                        actions.push(Action::OpenLogs(p.clone(), None));
-                    }
-                    if resp.clicked() {
-                        actions.push(Action::Select(Selected {
-                            kind: Kind::Pod,
-                            namespace: p.namespace.clone(),
-                            name: p.name.clone(),
-                        }));
-                    }
+                        let resp = row.response();
+                        if resp.double_clicked() {
+                            actions.push(Action::OpenLogs(p.clone(), None));
+                        }
+                        if resp.clicked() {
+                            actions.push(Action::Select(Selected {
+                                kind: Kind::Pod,
+                                namespace: p.namespace.clone(),
+                                name: p.name.clone(),
+                            }));
+                        }
+                    });
                 });
-            });
+        });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Pods, col);
         }
@@ -796,54 +799,57 @@ impl Workspace {
             _ => SortKey::text(&s.name),
         });
 
-        let mut table = Self::table(ui)
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::exact(96.0))
-            .column(Column::exact(170.0).clip(true))
-            .column(Column::exact(120.0).clip(true))
-            .column(Column::exact(72.0));
-        if show_ns {
-            table = table.column(Column::exact(110.0).clip(true));
-        }
-        if show_external {
-            table = table.column(Column::exact(170.0).clip(true));
-        }
-        table
-            .header(26.0, |mut h| {
-                for t in ["Name", "Type", "Ports", "Cluster IP", "Age"] {
-                    h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                }
-                if show_ns {
-                    h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                }
-                if show_external {
-                    h.col(|ui| sort_header(ui, "External", sort, &mut clicked));
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let s = rows[row.index()];
-                    row.set_selected(self.is_selected(Kind::Service, &s.namespace, &s.name));
-                    row.col(|ui| name_cell(ui, &s.name));
-                    row.col(|ui| { ui.label(RichText::new(&s.kind).color(theme::TEXT_MUTED)); });
-                    row.col(|ui| { ui.label(mono(s.ports_label())); });
-                    row.col(|ui| { ui.label(mono_muted(&s.cluster_ip)); });
-                    row.col(|ui| { ui.label(mono_muted(s.age())); });
+        // Wide tables scroll sideways instead of clipping columns off the edge.
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            let mut table = Self::table(ui)
+                .column(Column::remainder().at_least(180.0).clip(true))
+                .column(Column::exact(96.0))
+                .column(Column::exact(170.0).clip(true))
+                .column(Column::exact(120.0).clip(true))
+                .column(Column::exact(72.0));
+            if show_ns {
+                table = table.column(Column::exact(110.0).clip(true));
+            }
+            if show_external {
+                table = table.column(Column::exact(170.0).clip(true));
+            }
+            table
+                .header(26.0, |mut h| {
+                    for t in ["Name", "Type", "Ports", "Cluster IP", "Age"] {
+                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                    }
                     if show_ns {
-                        row.col(|ui| { ui.label(mono_muted(&s.namespace)); });
+                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                     }
                     if show_external {
-                        row.col(|ui| { ui.label(mono_muted(&s.external)); });
+                        h.col(|ui| sort_header(ui, "External", sort, &mut clicked));
                     }
-                    if row.response().clicked() {
-                        actions.push(Action::Select(Selected {
-                            kind: Kind::Service,
-                            namespace: s.namespace.clone(),
-                            name: s.name.clone(),
-                        }));
-                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                        let s = rows[row.index()];
+                        row.set_selected(self.is_selected(Kind::Service, &s.namespace, &s.name));
+                        row.col(|ui| name_cell(ui, &s.name));
+                        row.col(|ui| { ui.label(RichText::new(&s.kind).color(theme::TEXT_MUTED)); });
+                        row.col(|ui| { ui.label(mono(s.ports_label())); });
+                        row.col(|ui| { ui.label(mono_muted(&s.cluster_ip)); });
+                        row.col(|ui| { ui.label(mono_muted(s.age())); });
+                        if show_ns {
+                            row.col(|ui| { ui.label(mono_muted(&s.namespace)); });
+                        }
+                        if show_external {
+                            row.col(|ui| { ui.label(mono_muted(&s.external)); });
+                        }
+                        if row.response().clicked() {
+                            actions.push(Action::Select(Selected {
+                                kind: Kind::Service,
+                                namespace: s.namespace.clone(),
+                                name: s.name.clone(),
+                            }));
+                        }
+                    });
                 });
-            });
+        });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Services, col);
         }
@@ -878,48 +884,51 @@ impl Workspace {
             _ => SortKey::text(&d.name),
         });
 
-        let mut table = Self::table(ui)
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::exact(80.0))
-            .column(Column::exact(102.0))
-            .column(Column::exact(92.0))
-            .column(Column::exact(72.0));
-        if show_ns {
-            table = table.column(Column::exact(110.0).clip(true));
-        }
-        table
-            .header(26.0, |mut h| {
-                for t in ["Name", "Ready", "Up-to-date", "Available", "Age"] {
-                    h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                }
-                if show_ns {
-                    h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let d = rows[row.index()];
-                    row.set_selected(self.is_selected(Kind::Deployment, &d.namespace, &d.name));
-                    row.col(|ui| name_cell(ui, &d.name));
-                    row.col(|ui| {
-                        let c = if d.ready >= d.replicas { theme::TEXT } else { YELLOW };
-                        ui.label(mono(format!("{}/{}", d.ready, d.replicas)).color(c));
-                    });
-                    row.col(|ui| { ui.label(mono_muted(d.updated.to_string())); });
-                    row.col(|ui| { ui.label(mono_muted(d.available.to_string())); });
-                    row.col(|ui| { ui.label(mono_muted(d.age())); });
+        // Wide tables scroll sideways instead of clipping columns off the edge.
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            let mut table = Self::table(ui)
+                .column(Column::remainder().at_least(180.0).clip(true))
+                .column(Column::exact(80.0))
+                .column(Column::exact(102.0))
+                .column(Column::exact(92.0))
+                .column(Column::exact(72.0));
+            if show_ns {
+                table = table.column(Column::exact(110.0).clip(true));
+            }
+            table
+                .header(26.0, |mut h| {
+                    for t in ["Name", "Ready", "Up-to-date", "Available", "Age"] {
+                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                    }
                     if show_ns {
-                        row.col(|ui| { ui.label(mono_muted(&d.namespace)); });
+                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                     }
-                    if row.response().clicked() {
-                        actions.push(Action::Select(Selected {
-                            kind: Kind::Deployment,
-                            namespace: d.namespace.clone(),
-                            name: d.name.clone(),
-                        }));
-                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                        let d = rows[row.index()];
+                        row.set_selected(self.is_selected(Kind::Deployment, &d.namespace, &d.name));
+                        row.col(|ui| name_cell(ui, &d.name));
+                        row.col(|ui| {
+                            let c = if d.ready >= d.replicas { theme::TEXT } else { YELLOW };
+                            ui.label(mono(format!("{}/{}", d.ready, d.replicas)).color(c));
+                        });
+                        row.col(|ui| { ui.label(mono_muted(d.updated.to_string())); });
+                        row.col(|ui| { ui.label(mono_muted(d.available.to_string())); });
+                        row.col(|ui| { ui.label(mono_muted(d.age())); });
+                        if show_ns {
+                            row.col(|ui| { ui.label(mono_muted(&d.namespace)); });
+                        }
+                        if row.response().clicked() {
+                            actions.push(Action::Select(Selected {
+                                kind: Kind::Deployment,
+                                namespace: d.namespace.clone(),
+                                name: d.name.clone(),
+                            }));
+                        }
+                    });
                 });
-            });
+        });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Deployments, col);
         }
@@ -957,61 +966,64 @@ impl Workspace {
         // The column that carries the state gets the state colour when unhealthy.
         let state_col = columns.iter().position(|(t, _)| matches!(*t, "Ready" | "Status"));
 
-        let mut table = Self::table(ui).column(Column::remainder().at_least(180.0).clip(true));
-        for (_, width) in columns {
-            // Room for the header's sort arrow.
-            table = table.column(Column::exact(*width + 14.0).clip(true));
-        }
-        table = table.column(Column::exact(72.0));
-        if show_ns {
-            table = table.column(Column::exact(110.0).clip(true));
-        }
-        table
-            .header(26.0, |mut h| {
-                h.col(|ui| sort_header(ui, "Name", sort, &mut clicked));
-                for (title, _) in columns {
-                    h.col(|ui| sort_header(ui, *title, sort, &mut clicked));
-                }
-                h.col(|ui| sort_header(ui, "Age", sort, &mut clicked));
-                if show_ns {
-                    h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let w = rows[row.index()];
-                    row.set_selected(self.is_selected(kind, &w.namespace, &w.name));
-                    row.col(|ui| name_cell(ui, &w.name));
-                    for (i, cell) in w.cells.iter().enumerate() {
-                        row.col(|ui| {
-                            let text = cell.text();
-                            if Some(i) == state_col {
-                                let color = health_color(w.health);
-                                if columns[i].0 == "Status" {
-                                    dot(ui, color);
-                                }
-                                let c = if w.health == Health::Ok { theme::TEXT } else { color };
-                                ui.label(mono(text).color(c));
-                            } else if i == 0 {
-                                ui.label(mono(text));
-                            } else {
-                                ui.label(mono_muted(text));
-                            }
-                        });
+        // Wide tables scroll sideways instead of clipping columns off the edge.
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            let mut table = Self::table(ui).column(Column::remainder().at_least(180.0).clip(true));
+            for (_, width) in columns {
+                // Room for the header's sort arrow.
+                table = table.column(Column::exact(*width + 14.0).clip(true));
+            }
+            table = table.column(Column::exact(72.0));
+            if show_ns {
+                table = table.column(Column::exact(110.0).clip(true));
+            }
+            table
+                .header(26.0, |mut h| {
+                    h.col(|ui| sort_header(ui, "Name", sort, &mut clicked));
+                    for (title, _) in columns {
+                        h.col(|ui| sort_header(ui, *title, sort, &mut clicked));
                     }
-                    row.col(|ui| { ui.label(mono_muted(w.age())); });
+                    h.col(|ui| sort_header(ui, "Age", sort, &mut clicked));
                     if show_ns {
-                        row.col(|ui| { ui.label(mono_muted(&w.namespace)); });
+                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                     }
-                    if row.response().clicked() {
-                        actions.push(Action::Select(Selected {
-                            kind,
-                            namespace: w.namespace.clone(),
-                            name: w.name.clone(),
-                        }));
-                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                        let w = rows[row.index()];
+                        row.set_selected(self.is_selected(kind, &w.namespace, &w.name));
+                        row.col(|ui| name_cell(ui, &w.name));
+                        for (i, cell) in w.cells.iter().enumerate() {
+                            row.col(|ui| {
+                                let text = cell.text();
+                                if Some(i) == state_col {
+                                    let color = health_color(w.health);
+                                    if columns[i].0 == "Status" {
+                                        dot(ui, color);
+                                    }
+                                    let c = if w.health == Health::Ok { theme::TEXT } else { color };
+                                    ui.label(mono(text).color(c));
+                                } else if i == 0 {
+                                    ui.label(mono(text));
+                                } else {
+                                    ui.label(mono_muted(text));
+                                }
+                            });
+                        }
+                        row.col(|ui| { ui.label(mono_muted(w.age())); });
+                        if show_ns {
+                            row.col(|ui| { ui.label(mono_muted(&w.namespace)); });
+                        }
+                        if row.response().clicked() {
+                            actions.push(Action::Select(Selected {
+                                kind,
+                                namespace: w.namespace.clone(),
+                                name: w.name.clone(),
+                            }));
+                        }
+                    });
                 });
-            });
+        });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Workload(kind), col);
         }
@@ -1149,44 +1161,47 @@ impl Workspace {
             return;
         }
         let show_ns = self.selected_ns.len() != 1;
-        let mut table = Self::table(ui)
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::exact(150.0).clip(true))
-            .column(Column::exact(190.0).clip(true));
-        if show_ns {
-            table = table.column(Column::exact(130.0).clip(true));
-        }
-        table
-            .header(26.0, |mut h| {
-                for t in ["Name", "Kind", "Status"] {
-                    h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                }
-                if show_ns {
-                    h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, problems.len(), |mut row| {
-                    let (kind, ns, name, status, health) = &problems[row.index()];
-                    row.col(|ui| name_cell(ui, name));
-                    row.col(|ui| { ui.label(RichText::new(kind.label()).color(theme::TEXT_MUTED)); });
-                    row.col(|ui| {
-                        let color = health_color(*health);
-                        dot(ui, color);
-                        ui.add(egui::Label::new(RichText::new(status).color(color)).truncate()).on_hover_text(status);
-                    });
+        // Wide tables scroll sideways instead of clipping columns off the edge.
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            let mut table = Self::table(ui)
+                .column(Column::remainder().at_least(180.0).clip(true))
+                .column(Column::exact(150.0).clip(true))
+                .column(Column::exact(190.0).clip(true));
+            if show_ns {
+                table = table.column(Column::exact(130.0).clip(true));
+            }
+            table
+                .header(26.0, |mut h| {
+                    for t in ["Name", "Kind", "Status"] {
+                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                    }
                     if show_ns {
-                        row.col(|ui| { ui.label(mono_muted(*ns)); });
+                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                     }
-                    if row.response().clicked() {
-                        actions.push(Action::OpenSelected(Selected {
-                            kind: *kind,
-                            namespace: ns.to_string(),
-                            name: name.to_string(),
-                        }));
-                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, problems.len(), |mut row| {
+                        let (kind, ns, name, status, health) = &problems[row.index()];
+                        row.col(|ui| name_cell(ui, name));
+                        row.col(|ui| { ui.label(RichText::new(kind.label()).color(theme::TEXT_MUTED)); });
+                        row.col(|ui| {
+                            let color = health_color(*health);
+                            dot(ui, color);
+                            ui.add(egui::Label::new(RichText::new(status).color(color)).truncate()).on_hover_text(status);
+                        });
+                        if show_ns {
+                            row.col(|ui| { ui.label(mono_muted(*ns)); });
+                        }
+                        if row.response().clicked() {
+                            actions.push(Action::OpenSelected(Selected {
+                                kind: *kind,
+                                namespace: ns.to_string(),
+                                name: name.to_string(),
+                            }));
+                        }
+                    });
                 });
-            });
+        });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Overview, col);
         }
@@ -1626,6 +1641,22 @@ impl Workspace {
         }
         let secret = |name: &str| self.secrets.get(&(ns.to_string(), name.to_string()));
 
+        // One search shared by every container's list (kept in egui memory for this drawer).
+        let filter_key = egui::Id::new("env-filter");
+        let mut filter: String = ui.data(|d| d.get_temp(filter_key)).unwrap_or_default();
+        let resp = ui.push_id(("env-filter", &c.name), |ui| theme::search_field(ui, &mut filter, "Search env", 220.0)).inner;
+        if resp.changed() {
+            ui.data_mut(|d| d.insert_temp(filter_key, filter.clone()));
+        }
+        // Esc clears the search; consumed so it doesn't also close the drawer.
+        if resp.has_focus() && !filter.is_empty() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            filter.clear();
+            ui.data_mut(|d| d.insert_temp(filter_key, String::new()));
+        }
+        ui.add_space(4.0);
+        let needle = filter.trim().to_lowercase();
+        let mut shown = 0usize;
+
         // Everything with a known value, for "Copy as .env".
         let mut dotenv = Vec::new();
 
@@ -1635,8 +1666,13 @@ impl Workspace {
                 self.secret_toggle(ui, ns, name, actions);
             });
             if let Some(Ok(values)) = secret(name) {
+                let source = format!("Secret {name}");
                 for (k, v) in values {
-                    env_item(ui, k, Some(v), Some(&format!("Secret {name}")));
+                    if !env_matches(&needle, k, Some(v), Some(&source)) {
+                        continue;
+                    }
+                    shown += 1;
+                    env_item(ui, k, Some(v), Some(&source));
                     dotenv.push(format!("{k}={v}"));
                 }
             }
@@ -1661,6 +1697,10 @@ impl Workspace {
                 EnvSource::Field(path) => (None, Some(format!("field {path}")), None),
                 EnvSource::Resource(r) => (None, Some(format!("resource {r}")), None),
             };
+            if !env_matches(&needle, &e.name, value.as_deref(), source.as_deref()) {
+                continue;
+            }
+            shown += 1;
             if let Some(v) = &value {
                 dotenv.push(format!("{}={v}", e.name));
             }
@@ -1674,7 +1714,7 @@ impl Workspace {
                 }
             });
             match (&value, secret_name) {
-                (Some(v), _) => value_label(ui, v),
+                (Some(v), _) => value_label_in(ui, v, theme::SYNTAX_STRING),
                 (None, Some(_)) => {
                     ui.weak("••••••••");
                 }
@@ -1685,7 +1725,13 @@ impl Workspace {
             ui.add_space(4.0);
         }
 
-        if ui.small_button(format!("{} Copy as .env", icon::COPY)).clicked() {
+        if !needle.is_empty() && shown == 0 {
+            let hidden = c.env_from_secrets.iter().any(|n| !matches!(secret(n), Some(Ok(_))));
+            ui.weak(if hidden { "No variables match (reveal secrets to search their keys)" } else { "No variables match" });
+            ui.add_space(4.0);
+        }
+        let copy_label = if needle.is_empty() { "Copy as .env" } else { "Copy matches as .env" };
+        if ui.small_button(format!("{} {copy_label}", icon::COPY)).clicked() {
             ui.ctx().copy_text(dotenv.join("\n"));
         }
     }

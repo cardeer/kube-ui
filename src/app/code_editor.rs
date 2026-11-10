@@ -1,14 +1,21 @@
 //! A small YAML code editor on top of egui's `TextEdit`: line-number gutter, syntax
 //! colours, indent guides, current-line highlight, and editor keys (auto-indent on Enter,
-//! Tab / Shift+Tab indent by two spaces, Cmd+/ toggles comments, Cmd+S saves).
+//! Tab / Shift+Tab indent by two spaces, Cmd+/ toggles comments, Cmd+S saves), plus a
+//! find bar (Cmd+F) that highlights matches in the viewer and the editor.
 
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    ops::Range,
+    sync::Arc,
+};
 
 use eframe::egui::{
     self, Color32, FontId, Galley, Key, Modifiers, Rect, Shape, Stroke, TextBuffer, TextFormat,
     text::{CCursor, CCursorRange, LayoutJob},
     widgets::text_edit::TextEditState,
 };
+
+use egui_phosphor::regular as icon;
 
 use super::theme;
 
@@ -24,7 +31,7 @@ pub struct EditorOutput {
 
 /// An editable YAML editor. `error_line` (1-based) is marked in the gutter.
 /// `start` puts the cursor at the top and focuses the editor (when editing begins).
-pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_line: Option<usize>, start: bool) -> EditorOutput {
+pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_line: Option<usize>, start: bool, find: &mut Find) -> EditorOutput {
     if start {
         let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
         state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(0))));
@@ -63,17 +70,26 @@ pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_lin
             }
         }
     }
-    let out = show(ui, id, text, true, error_line);
+    let out = show(ui, id, text, true, error_line, find);
     EditorOutput { changed: changed || out, save }
 }
 
 /// The same editor, read-only (selectable, copyable).
-pub fn yaml_viewer(ui: &mut egui::Ui, id: egui::Id, text: &str) {
+pub fn yaml_viewer(ui: &mut egui::Ui, id: egui::Id, text: &str, find: &mut Find) {
     let mut s = text;
-    show(ui, id, &mut s, false, None);
+    show(ui, id, &mut s, false, None, find);
 }
 
-fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: bool, error_line: Option<usize>) -> bool {
+fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: bool, error_line: Option<usize>, find: &mut Find) -> bool {
+    find.update(buffer.as_str());
+    let reveal = std::mem::take(&mut find.reveal).then(|| find.current_match()).flatten();
+    if let Some(m) = &reveal {
+        // Select the current match so closing the bar leaves the cursor on it.
+        let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(m.start), CCursor::new(m.end))));
+        state.store(ui.ctx(), id);
+    }
+
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, ' ')).max(1.0);
     let lines = buffer.as_str().split('\n').count().max(1);
@@ -159,6 +175,26 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
             line += 1;
         }
     }
+    // Find matches: a soft tint on each visible one, a stronger one on the current.
+    if find.open && !find.matches.is_empty() {
+        let current = find.current_match();
+        for m in &find.matches {
+            let r = match_rect(&out.galley, text, m).translate(origin);
+            if r.bottom() < visible.top() || r.top() > visible.bottom() {
+                continue;
+            }
+            if current.as_ref() == Some(m) {
+                shapes.push(Shape::rect_filled(r, 2.0, theme::WARN.gamma_multiply(0.45)));
+                shapes.push(Shape::rect_stroke(r, 2.0, Stroke::new(1.0, theme::WARN), egui::StrokeKind::Outside));
+            } else {
+                shapes.push(Shape::rect_filled(r, 2.0, theme::WARN.gamma_multiply(0.18)));
+            }
+        }
+    }
+    if let Some(m) = &reveal {
+        let r = match_rect(&out.galley, text, m).translate(origin);
+        ui.scroll_to_rect(r.expand2(egui::vec2(40.0, 0.0)), Some(egui::Align::Center));
+    }
     ui.painter().set(background, Shape::Vec(shapes));
     let painter = ui.painter();
     for (pos, n, color) in numbers {
@@ -168,6 +204,209 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
     out.response.changed()
+}
+
+/// Where a match sits in the galley; one spanning lines is drawn to the end of its first line.
+fn match_rect(galley: &Galley, text: &str, m: &Range<usize>) -> Rect {
+    let first_line = text.chars().skip(m.start).take(m.end - m.start).take_while(|c| *c != '\n').count();
+    let a = galley.pos_from_cursor(CCursor::new(m.start));
+    let b = galley.pos_from_cursor(CCursor::new(m.start + first_line));
+    let width = (b.left() - a.left()).max(3.0);
+    Rect::from_min_size(a.min, egui::vec2(width, a.height()))
+}
+
+// ---------------------------------------------------------------------------
+// Find bar
+// ---------------------------------------------------------------------------
+
+/// Matches beyond this are not collected (keeps huge documents responsive).
+const MAX_MATCHES: usize = 10_000;
+
+/// Find-in-document state: the query, its matches (char ranges, as egui's cursors use)
+/// and which one is current. One instance serves the YAML window's viewer and editor.
+#[derive(Default)]
+pub struct Find {
+    pub open: bool,
+    query: String,
+    regex: bool,
+    case_sensitive: bool,
+    matches: Vec<Range<usize>>,
+    current: usize,
+    error: Option<String>,
+    /// (query, regex, case, text hash) the matches were computed for.
+    key: Option<(String, bool, bool, u64)>,
+    /// Cursor position when the bar opened; the first match after it becomes current.
+    anchor: usize,
+    /// Select and scroll to the current match on the next frame.
+    reveal: bool,
+    focus_field: bool,
+    /// The query field had focus at the end of the last frame.
+    pub field_focused: bool,
+}
+
+impl Find {
+    /// Cmd+F: open (or refocus) the bar. A single-line selection in the document becomes the query.
+    pub fn open(&mut self, ctx: &egui::Context, doc_id: egui::Id, text: &str) {
+        self.open = true;
+        self.focus_field = true;
+        if let Some(range) = TextEditState::load(ctx, doc_id).and_then(|s| s.cursor.char_range()) {
+            let sel = range.as_sorted_char_range();
+            self.anchor = sel.start;
+            let selected: String = text.chars().skip(sel.start).take(sel.end - sel.start).collect();
+            if !selected.is_empty() && !selected.contains('\n') {
+                self.query = if self.regex { regex::escape(&selected) } else { selected };
+            }
+        }
+        self.key = None;
+    }
+
+    /// Open the bar with a query (development screenshots).
+    pub fn preset(&mut self, query: String) {
+        self.open = true;
+        self.query = query;
+        self.key = None;
+    }
+
+    pub fn close(&mut self, ctx: &egui::Context, doc_id: egui::Id) {
+        self.open = false;
+        self.field_focused = false;
+        ctx.memory_mut(|m| m.request_focus(doc_id));
+    }
+
+    fn current_match(&self) -> Option<Range<usize>> {
+        self.matches.get(self.current).cloned()
+    }
+
+    /// Step to the next (or previous) match, wrapping around.
+    pub fn step(&mut self, back: bool) {
+        let n = self.matches.len();
+        if n == 0 {
+            return;
+        }
+        self.current = if back { (self.current + n - 1) % n } else { (self.current + 1) % n };
+        self.reveal = true;
+    }
+
+    /// Recompute matches when the query, options or text changed.
+    fn update(&mut self, text: &str) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let key = (self.query.clone(), self.regex, self.case_sensitive, h.finish());
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        let query_changed = self.key.as_ref().is_none_or(|k| (&k.0, k.1, k.2) != (&key.0, key.1, key.2));
+        self.key = Some(key);
+        let (matches, error) = find_matches(text, &self.query, self.regex, self.case_sensitive);
+        self.matches = matches;
+        self.error = error;
+        if query_changed {
+            // Start from the first match at or after where the cursor was.
+            self.current = self.matches.iter().position(|m| m.start >= self.anchor).unwrap_or(0);
+            self.reveal = !self.matches.is_empty();
+        } else if self.current >= self.matches.len() {
+            self.current = self.matches.len().saturating_sub(1);
+        }
+    }
+
+    /// The bar: query field, case / regex toggles, match count, previous / next, close.
+    pub fn bar(&mut self, ui: &mut egui::Ui, doc_id: egui::Id, text: &str) {
+        let field_id = egui::Id::new("yaml-find-field");
+        // Enter / Shift+Enter step through matches; take them before the field surrenders focus.
+        let (mut next, mut prev, mut esc) = (false, false, false);
+        if ui.memory(|m| m.has_focus(field_id)) {
+            ui.input_mut(|i| {
+                prev = i.consume_key(Modifiers::SHIFT, Key::Enter);
+                next = i.consume_key(Modifiers::NONE, Key::Enter);
+                esc = i.consume_key(Modifiers::NONE, Key::Escape);
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let hint = if self.regex { "Find (regex)" } else { "Find" };
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .id(field_id)
+                    .hint_text(egui::RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS)).color(theme::TEXT_FAINT))
+                    .desired_width(240.0)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            if std::mem::take(&mut self.focus_field) {
+                resp.request_focus();
+                if let Some(mut state) = TextEditState::load(ui.ctx(), field_id) {
+                    let n = self.query.chars().count();
+                    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+                    state.store(ui.ctx(), field_id);
+                }
+            }
+            if theme::toggle_button(ui, "Aa", self.case_sensitive, "Match case").clicked() {
+                self.case_sensitive = !self.case_sensitive;
+            }
+            if theme::toggle_button(ui, ".*", self.regex, "Regular expression").clicked() {
+                self.regex = !self.regex;
+            }
+            self.update(text);
+            if let Some(err) = &self.error {
+                ui.label(egui::RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD)).on_hover_text(err);
+            } else if !self.query.is_empty() {
+                let label = if self.matches.is_empty() {
+                    egui::RichText::new("No results").color(theme::BAD)
+                } else {
+                    let more = if self.matches.len() >= MAX_MATCHES { "+" } else { "" };
+                    egui::RichText::new(format!("{} of {}{more}", self.current + 1, self.matches.len())).color(theme::TEXT_MUTED)
+                };
+                ui.label(label);
+            }
+            if theme::icon_button(ui, icon::ARROW_UP, "Previous match (⇧↩)").clicked() {
+                prev = true;
+            }
+            if theme::icon_button(ui, icon::ARROW_DOWN, "Next match (↩)").clicked() {
+                next = true;
+            }
+            if theme::icon_button(ui, icon::X, "Close (Esc)").clicked() {
+                esc = true;
+            }
+            if next || prev {
+                resp.request_focus();
+            }
+            self.field_focused = resp.has_focus() || next || prev;
+        });
+        if esc {
+            self.close(ui.ctx(), doc_id);
+        } else if next || prev {
+            self.step(prev);
+        }
+    }
+}
+
+/// Char ranges of `query` in `text`; an invalid regex finds nothing and reports why.
+fn find_matches(text: &str, query: &str, regex: bool, case_sensitive: bool) -> (Vec<Range<usize>>, Option<String>) {
+    if query.is_empty() {
+        return (Vec::new(), None);
+    }
+    let pattern = if regex { query.to_owned() } else { regex::escape(query) };
+    let re = match regex::RegexBuilder::new(&pattern).case_insensitive(!case_sensitive).size_limit(1 << 20).build() {
+        Ok(re) => re,
+        Err(e) => return (Vec::new(), Some(e.to_string())),
+    };
+    // Byte offsets to char indices, walking the text once.
+    let mut out = Vec::new();
+    let mut chars = text.char_indices().enumerate().peekable();
+    let mut to_char = |byte: usize| -> usize {
+        while let Some(&(ci, (b, _))) = chars.peek() {
+            if b >= byte {
+                return ci;
+            }
+            chars.next();
+        }
+        text.chars().count()
+    };
+    for m in re.find_iter(text).filter(|m| !m.is_empty()).take(MAX_MATCHES) {
+        let start = to_char(m.start());
+        let end = to_char(m.end());
+        out.push(start..end);
+    }
+    (out, None)
 }
 
 /// Leading spaces per line; blank lines take the smaller of their neighbours so guides
@@ -469,6 +708,17 @@ mod tests {
         assert_eq!(t, "a:\n  # b: 1\n  # c: 2");
         toggle_comment(&mut t, r);
         assert_eq!(t, original);
+    }
+
+    #[test]
+    fn find_text_and_regex() {
+        let t = "é: Nginx\nimage: nginx:1.27";
+        assert_eq!(find_matches(t, "nginx", false, false).0, vec![3..8, 16..21]);
+        assert_eq!(find_matches(t, "nginx", false, true).0, vec![16..21]);
+        assert_eq!(find_matches(t, "1.2", false, false).0, vec![22..25]);
+        assert_eq!(find_matches(t, r"\d+", true, false).0, vec![22..23, 24..26]);
+        assert!(find_matches(t, "(", true, false).1.is_some());
+        assert!(find_matches(t, "", false, false).0.is_empty());
     }
 
     #[test]

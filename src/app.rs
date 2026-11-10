@@ -401,6 +401,8 @@ pub struct App {
     /// Index into the dock's tabs: logs, then shells.
     active_log: usize,
     yaml: Option<YamlView>,
+    /// Find bar of the YAML window (kept across windows so the last query is remembered).
+    yaml_find: code_editor::Find,
     forwards: Vec<Forward>,
     pf_dialog: Option<PfDialog>,
     /// (cluster tab, namespace, pod)
@@ -460,6 +462,7 @@ impl App {
             shells: Vec::new(),
             active_log: 0,
             yaml: None,
+            yaml_find: code_editor::Find::default(),
             forwards: Vec::new(),
             pf_dialog: None,
             confirm_delete: None,
@@ -654,6 +657,17 @@ impl App {
             }
             if let Some(sel) = first.filter(|_| edit) {
                 self.apply(Action::EditYaml(sel.kind, sel.namespace, sel.name));
+            }
+            // `KUBE_UI_SCREENSHOT_FIND=<text>` opens the YAML window's find bar with that query.
+            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_FIND") {
+                self.yaml_find.preset(q);
+            }
+            // `KUBE_UI_SCREENSHOT_ENV=<text>` presets the drawer's env search.
+            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_ENV") {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("env-filter"), q));
+                if let Some(ws) = self.ws_mut() {
+                    ws.drawer_tab = DrawerTab::Containers;
+                }
             }
             if std::env::var_os("KUBE_UI_SCREENSHOT_CREATE").is_some() {
                 if let Some(kind) = tab.kinds().first().copied() {
@@ -1469,88 +1483,90 @@ impl App {
             ui.label("No port forwards yet. Select a pod or service and choose Port forward.");
             return;
         }
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(160.0).clip(true))
-            .column(Column::initial(130.0).clip(true))
-            .column(Column::initial(260.0).clip(true))
-            .column(Column::initial(150.0))
-            .column(Column::initial(120.0).clip(true))
-            .column(Column::initial(60.0))
-            .column(Column::remainder().at_least(200.0))
-            .header(24.0, |mut h| {
-                for t in ["Context", "Namespace", "Target", "Local / Remote", "Status", "Conns", ""] {
-                    h.col(|ui| { ui.label(theme::label_small(t)); });
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, self.forwards.len(), |mut row| {
-                    let f = &self.forwards[row.index()];
-                    row.col(|ui| {
-                        ui.label(&f.spec.context)
-                            .on_hover_text(display_path(&f.spec.kubeconfig));
-                    });
-                    row.col(|ui| { ui.label(&f.spec.namespace); });
-                    row.col(|ui| { ui.label(f.spec.target.label()); });
-                    row.col(|ui| {
-                        let local = f.bound_port.unwrap_or(f.spec.local_port);
-                        ui.monospace(format!("{local} {} {}", icon::ARROW_RIGHT, f.spec.remote_port));
-                    });
-                    row.col(|ui| {
-                        let (color, text) = match &f.status {
-                            PfStatus::Starting => (YELLOW, "Starting…"),
-                            PfStatus::Listening => (GREEN, "Active"),
-                            PfStatus::Stopped => (theme::IDLE, "Stopped"),
-                            PfStatus::Failed(_) => (RED, "Failed"),
-                        };
-                        dot(ui, color);
-                        let resp = ui.colored_label(color, text);
-                        if let PfStatus::Failed(e) = &f.status {
-                            resp.on_hover_text(e);
-                        }
-                    });
-                    row.col(|ui| { ui.label(f.connections.load(Ordering::Relaxed).to_string()); });
-                    row.col(|ui| {
-                        let running = f.handle.is_some();
-                        if running {
-                            if ui.small_button(format!("{} Stop", icon::STOP_CIRCLE)).clicked() {
-                                actions.push(Action::StopForward(f.id));
+        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::initial(160.0).clip(true))
+                .column(Column::initial(130.0).clip(true))
+                .column(Column::initial(260.0).clip(true))
+                .column(Column::initial(150.0))
+                .column(Column::initial(120.0).clip(true))
+                .column(Column::initial(60.0))
+                .column(Column::remainder().at_least(200.0))
+                .header(24.0, |mut h| {
+                    for t in ["Context", "Namespace", "Target", "Local / Remote", "Status", "Conns", ""] {
+                        h.col(|ui| { ui.label(theme::label_small(t)); });
+                    }
+                })
+                .body(|body| {
+                    body.rows(ROW_HEIGHT, self.forwards.len(), |mut row| {
+                        let f = &self.forwards[row.index()];
+                        row.col(|ui| {
+                            ui.label(&f.spec.context)
+                                .on_hover_text(display_path(&f.spec.kubeconfig));
+                        });
+                        row.col(|ui| { ui.label(&f.spec.namespace); });
+                        row.col(|ui| { ui.label(f.spec.target.label()); });
+                        row.col(|ui| {
+                            let local = f.bound_port.unwrap_or(f.spec.local_port);
+                            ui.monospace(format!("{local} {} {}", icon::ARROW_RIGHT, f.spec.remote_port));
+                        });
+                        row.col(|ui| {
+                            let (color, text) = match &f.status {
+                                PfStatus::Starting => (YELLOW, "Starting…"),
+                                PfStatus::Listening => (GREEN, "Active"),
+                                PfStatus::Stopped => (theme::IDLE, "Stopped"),
+                                PfStatus::Failed(_) => (RED, "Failed"),
+                            };
+                            dot(ui, color);
+                            let resp = ui.colored_label(color, text);
+                            if let PfStatus::Failed(e) = &f.status {
+                                resp.on_hover_text(e);
                             }
-                        } else if ui.small_button(format!("{} Start", icon::PLAY)).clicked() {
-                            actions.push(Action::RestartForward(f.id));
-                        }
-                        let address = f
-                            .bound_port
-                            .filter(|_| f.status == PfStatus::Listening)
-                            .map(|port| format!("localhost:{port}"));
-                        overflow_menu(ui, |ui| {
-                            if ui
-                                .add_enabled(address.is_some(), egui::Button::new(format!("{} Open in browser", icon::GLOBE)))
-                                .clicked()
-                            {
-                                if let Some(a) = &address {
-                                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("http://{a}")));
+                        });
+                        row.col(|ui| { ui.label(f.connections.load(Ordering::Relaxed).to_string()); });
+                        row.col(|ui| {
+                            let running = f.handle.is_some();
+                            if running {
+                                if ui.small_button(format!("{} Stop", icon::STOP_CIRCLE)).clicked() {
+                                    actions.push(Action::StopForward(f.id));
                                 }
+                            } else if ui.small_button(format!("{} Start", icon::PLAY)).clicked() {
+                                actions.push(Action::RestartForward(f.id));
                             }
-                            if ui
-                                .add_enabled(address.is_some(), egui::Button::new(format!("{} Copy address", icon::COPY)))
-                                .clicked()
-                            {
-                                if let Some(a) = &address {
-                                    ui.ctx().copy_text(a.clone());
+                            let address = f
+                                .bound_port
+                                .filter(|_| f.status == PfStatus::Listening)
+                                .map(|port| format!("localhost:{port}"));
+                            overflow_menu(ui, |ui| {
+                                if ui
+                                    .add_enabled(address.is_some(), egui::Button::new(format!("{} Open in browser", icon::GLOBE)))
+                                    .clicked()
+                                {
+                                    if let Some(a) = &address {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(format!("http://{a}")));
+                                    }
                                 }
-                            }
-                            ui.separator();
-                            let remove = RichText::new(format!("{} Remove", icon::TRASH)).color(RED);
-                            if ui.button(remove).clicked() {
-                                actions.push(Action::RemoveForward(f.id));
-                            }
+                                if ui
+                                    .add_enabled(address.is_some(), egui::Button::new(format!("{} Copy address", icon::COPY)))
+                                    .clicked()
+                                {
+                                    if let Some(a) = &address {
+                                        ui.ctx().copy_text(a.clone());
+                                    }
+                                }
+                                ui.separator();
+                                let remove = RichText::new(format!("{} Remove", icon::TRASH)).color(RED);
+                                if ui.button(remove).clicked() {
+                                    actions.push(Action::RemoveForward(f.id));
+                                }
+                            });
                         });
                     });
                 });
-            });
+        });
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -1880,6 +1896,27 @@ impl App {
                             }
                         });
                     });
+                    let editor_id = egui::Id::new("yaml-editor");
+                    let find = &mut self.yaml_find;
+                    let doc = y.edit.as_deref().unwrap_or(&text);
+                    // Shift+Cmd+G first: egui's key matching ignores an extra Shift.
+                    let (cmd_f, cmd_shift_g, cmd_g) = ui.input_mut(|i| {
+                        (
+                            i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+                            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::G),
+                            i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
+                        )
+                    });
+                    if cmd_f {
+                        find.open(ui.ctx(), editor_id, doc);
+                    }
+                    if find.open && (cmd_g || cmd_shift_g) {
+                        find.step(cmd_shift_g);
+                    }
+                    if find.open {
+                        ui.add_space(4.0);
+                        find.bar(ui, editor_id, doc);
+                    }
                     if editing && text.contains("app.kubernetes.io/managed-by: Helm") {
                         ui.add_space(4.0);
                         ui.colored_label(YELLOW, format!("{} Managed by Helm: the next helm upgrade will overwrite changes made here.", icon::WARNING));
@@ -1896,7 +1933,6 @@ impl App {
                         ui.colored_label(RED, format!("Line {line}: {msg}"));
                     }
                     ui.add_space(4.0);
-                    let editor_id = egui::Id::new("yaml-editor");
                     let mut cmd_save = false;
                     egui::Frame::new().fill(theme::CONTENT).stroke(egui::Stroke::new(1.0, theme::BORDER)).corner_radius(4).show(ui, |ui| {
                         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| match y.edit.as_mut() {
@@ -1905,14 +1941,14 @@ impl App {
                                 if y.edit_started {
                                     ui.scroll_to_cursor(Some(egui::Align::TOP));
                                 }
-                                let out = code_editor::yaml_editor(ui, editor_id, buffer, error_line, y.edit_started);
+                                let out = code_editor::yaml_editor(ui, editor_id, buffer, error_line, y.edit_started, find);
                                 y.edit_started = false;
                                 if out.changed {
                                     y.parse_error = yaml_error(buffer);
                                 }
                                 cmd_save = out.save;
                             }
-                            None => code_editor::yaml_viewer(ui, editor_id, &text),
+                            None => code_editor::yaml_viewer(ui, editor_id, &text, find),
                         });
                     });
                     if cmd_save && dirty && !y.saving && y.parse_error.is_none() {
@@ -2138,6 +2174,12 @@ impl eframe::App for App {
         self.ui_top_bar(ctx);
         self.ui_sidebar(ctx);
         self.ui_logs(ctx);
+        if self.yaml.is_some() && self.yaml_find.open && self.yaml_find.field_focused
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            // Esc in the YAML find field closes the bar, not the drawer behind the window.
+            self.yaml_find.close(ctx, egui::Id::new("yaml-editor"));
+        }
         if tab.is_list() {
             if let Some(ws) = self.workspaces.get_mut(self.active) {
                 ws.ui_drawer(ctx, &mut actions);
@@ -2195,6 +2237,8 @@ fn searchable_combo(
         .icon(theme::caret)
         .width(width)
         .selected_text(selected_text)
+        // Room for the search field and the list's own scroll area, so the outer one never scrolls.
+        .height(480.0)
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.set_min_width(width.max(240.0));
@@ -2213,9 +2257,15 @@ fn searchable_combo(
                 picked = matches.first().map(|(value, _)| value.clone());
             }
             ui.separator();
+            // The list keeps one height while searching: egui popups only offer last frame's
+            // size, so a list that shrank to a few results could never grow back. Sized from all
+            // options (not the matches), capped so long lists scroll.
+            let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let list_height = ((options.len()).max(1) as f32 * row).min(340.0);
             egui::ScrollArea::vertical()
-                .max_height(340.0)
-                .auto_shrink([false, true])
+                .max_height(list_height)
+                .min_scrolled_height(list_height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (value, label) in &matches {
                         if ui.selectable_label(value == current, label).clicked() {
@@ -2266,6 +2316,8 @@ fn namespace_picker(
         .icon(theme::caret)
         .width(width)
         .selected_text(namespaces_label(selected, false))
+        // Room for the search field and the list's own scroll area, so the outer one never scrolls.
+        .height(480.0)
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.set_min_width(width.max(280.0));
@@ -2292,9 +2344,15 @@ fn namespace_picker(
                 }
             });
             ui.separator();
+            // The list keeps one height while searching: egui popups only offer last frame's
+            // size, so a list that shrank to a few results could never grow back. Sized from all
+            // options (not the matches), capped so long lists scroll.
+            let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let list_height = ((options.len() + 1).max(1) as f32 * row).min(360.0);
             egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .auto_shrink([false, true])
+                .max_height(list_height)
+                .min_scrolled_height(list_height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if q.is_empty() && ui.selectable_label(selected.is_empty(), "All namespaces").clicked() {
                         picked = Some(Vec::new());
@@ -2368,16 +2426,28 @@ fn code_block(ui: &mut egui::Ui, text: &str) {
 
 /// Shows a value in monospace, wrapping, with long values cut short (full value on hover).
 fn value_label(ui: &mut egui::Ui, value: &str) {
+    let color = ui.visuals().text_color();
+    value_label_in(ui, value, color);
+}
+
+/// `value_label` in a given colour (env values use the editor's string green).
+fn value_label_in(ui: &mut egui::Ui, value: &str, color: egui::Color32) {
     const MAX: usize = 400;
     if value.is_empty() {
         ui.weak("(empty)");
     } else if value.chars().count() > MAX {
         let short: String = value.chars().take(MAX).collect();
-        ui.add(egui::Label::new(RichText::new(format!("{short}…")).monospace()).wrap())
+        ui.add(egui::Label::new(RichText::new(format!("{short}…")).monospace().color(color)).wrap())
             .on_hover_text(value);
     } else {
-        ui.add(egui::Label::new(RichText::new(value).monospace()).wrap());
+        ui.add(egui::Label::new(RichText::new(value).monospace().color(color)).wrap());
     }
+}
+
+/// Case-insensitive env filter on the name, value and where it comes from.
+fn env_matches(filter: &str, name: &str, value: Option<&str>, source: Option<&str>) -> bool {
+    filter.is_empty()
+        || [Some(name), value, source].into_iter().flatten().any(|s| s.to_lowercase().contains(filter))
 }
 
 fn env_item(ui: &mut egui::Ui, name: &str, value: Option<&str>, source: Option<&str>) {
@@ -2388,7 +2458,7 @@ fn env_item(ui: &mut egui::Ui, name: &str, value: Option<&str>, source: Option<&
         }
     });
     match value {
-        Some(v) => value_label(ui, v),
+        Some(v) => value_label_in(ui, v, theme::SYNTAX_STRING),
         None => {
             ui.weak("set at runtime");
         }
