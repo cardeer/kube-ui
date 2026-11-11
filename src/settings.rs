@@ -123,6 +123,9 @@ pub struct Settings {
     pub log_height: f32,
     #[serde(default)]
     pub log_mode: LogPanelMode,
+    /// Show the current log tab and the current terminal tab side by side.
+    #[serde(default)]
+    pub log_split: bool,
     /// Window inner size from the last run (the size to restore to when it was maximized).
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
@@ -155,6 +158,7 @@ impl Default for Settings {
             nav_collapsed: Vec::new(),
             log_height: default_log_height(),
             log_mode: LogPanelMode::Normal,
+            log_split: false,
             window_size: None,
             window_maximized: false,
             last_seen_version: None,

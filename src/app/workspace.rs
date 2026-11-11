@@ -517,6 +517,11 @@ impl Workspace {
         Some(Selected { kind, namespace: namespace.clone(), name: name.clone() })
     }
 
+    /// Pods in a failing state (CrashLoopBackOff, ImagePullBackOff, Failed, …).
+    pub(super) fn failing_pods(&self) -> usize {
+        self.pods.items.iter().filter(|p| pod_health(&p.status) == Health::Bad).count()
+    }
+
     pub(super) fn workload(&self, kind: Kind) -> &ListState<WorkRow> {
         &self.workloads[&kind]
     }
@@ -755,7 +760,7 @@ impl Workspace {
 
                         let resp = row.response();
                         if resp.double_clicked() {
-                            actions.push(Action::OpenLogs(p.clone(), None));
+                            actions.push(Action::OpenLogs(p.clone(), None, false));
                         }
                         if resp.clicked() {
                             actions.push(Action::Select(Selected {
@@ -1433,8 +1438,30 @@ impl Workspace {
         });
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.add(theme::primary_button(format!("{} Logs", icon::SCROLL))).clicked() {
-                actions.push(Action::OpenLogs(p.clone(), None));
+            // A pod that restarted offers the previous run's logs; when it's failing that's
+            // where the reason is, so it takes the one primary button.
+            let restarted = p.restarts > 0;
+            let failing = pod_health(&p.status) == Health::Bad;
+            let logs_label = format!("{} Logs", icon::SCROLL);
+            let previous_label = format!("{} Previous logs", icon::CLOCK_COUNTER_CLOCKWISE);
+            let previous_hint = match p.containers.iter().find(|c| !c.last_exit.is_empty()) {
+                Some(c) => format!("Logs from the run before the last restart\nLast run: {}", c.last_exit),
+                None => "Logs from the run before the last restart".to_string(),
+            };
+            if restarted && failing {
+                if ui.add(theme::primary_button(previous_label)).on_hover_text(&previous_hint).clicked() {
+                    actions.push(Action::OpenLogs(p.clone(), None, true));
+                }
+                if ui.button(logs_label).clicked() {
+                    actions.push(Action::OpenLogs(p.clone(), None, false));
+                }
+            } else {
+                if ui.add(theme::primary_button(logs_label)).clicked() {
+                    actions.push(Action::OpenLogs(p.clone(), None, false));
+                }
+                if restarted && ui.button(previous_label).on_hover_text(&previous_hint).clicked() {
+                    actions.push(Action::OpenLogs(p.clone(), None, true));
+                }
             }
             if !p.owner.is_empty()
                 && ui
@@ -1562,7 +1589,15 @@ impl Workspace {
                     if let Some(p) = row {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button(format!("{} Logs", icon::SCROLL)).clicked() {
-                                actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone())));
+                                actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone()), false));
+                            }
+                            if info.is_some_and(|i| i.restarts > 0)
+                                && ui
+                                    .small_button(format!("{} Previous", icon::CLOCK_COUNTER_CLOCKWISE))
+                                    .on_hover_text("Logs from the run before the last restart")
+                                    .clicked()
+                            {
+                                actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone()), true));
                             }
                             let can_shell = !c.init && p.status == "Running";
                             if ui.add_enabled(can_shell, egui::Button::new(format!("{} Shell", icon::TERMINAL_WINDOW)).small()).clicked() {

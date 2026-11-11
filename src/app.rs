@@ -50,7 +50,9 @@ const ROW_HEIGHT: f32 = 30.0;
 const NAV_WIDTH: f32 = 224.0;
 const LOG_MIN_HEIGHT: f32 = 160.0;
 /// Height of the log panel when collapsed to its tab strip.
-const LOG_COLLAPSED_HEIGHT: f32 = 40.0;
+/// Just the tab strip: a 32px tab (24px close button, 3px padding and a hairline each side)
+/// between 6px margins.
+const LOG_COLLAPSED_HEIGHT: f32 = 44.0;
 
 const GREEN: Color32 = theme::OK;
 const YELLOW: Color32 = theme::WARN;
@@ -360,7 +362,9 @@ enum Action {
     GoToPod(String, String),
     RevealSecret(String, String),
     HideSecret(String, String),
-    OpenLogs(PodRow, Option<String>),
+    /// Open a pod's logs: container (`None` = the default one), and whether to show the
+    /// previous (crashed) run instead of the current one.
+    OpenLogs(PodRow, Option<String>, bool),
     /// Open a shell in a pod's container (`None` = the default container).
     Shell(PodRow, Option<String>),
     OpenGroupLogs { namespace: String, target: LogTarget },
@@ -404,6 +408,9 @@ pub struct App {
     shells: Vec<ShellView>,
     /// Index into the dock's tabs: logs, then shells.
     active_log: usize,
+    /// In split view: the log tab (left) and shell tab (right) last picked.
+    split_log: usize,
+    split_shell: usize,
     yaml: Option<YamlView>,
     /// Find bar of the YAML window (kept across windows so the last query is remembered).
     yaml_find: code_editor::Find,
@@ -471,6 +478,8 @@ impl App {
             logs: Vec::new(),
             shells: Vec::new(),
             active_log: 0,
+            split_log: 0,
+            split_shell: 0,
             yaml: None,
             yaml_find: code_editor::Find::default(),
             forwards: Vec::new(),
@@ -850,12 +859,18 @@ impl App {
                     namespace: pod.namespace.clone(),
                     name: pod.name.clone(),
                 }));
-                self.apply(Action::OpenLogs(pod, None));
+                // `KUBE_UI_SCREENSHOT_PREVIOUS=1` opens the previous run's logs instead.
+                let previous = std::env::var_os("KUBE_UI_SCREENSHOT_PREVIOUS").is_some();
+                self.apply(Action::OpenLogs(pod, None, previous));
                 if let Some(re) = self.screenshot.as_ref().and_then(|s| s.log_regex.clone()) {
                     if let Some(log) = self.logs.last_mut() {
                         log.set_filter(re, true);
                     }
                 }
+            }
+            // `KUBE_UI_SCREENSHOT_LOGS_COLLAPSED=1` shows the log panel folded to its tab strip.
+            if std::env::var_os("KUBE_UI_SCREENSHOT_LOGS_COLLAPSED").is_some() {
+                self.settings.log_mode = LogPanelMode::Collapsed;
             }
             if let Some(shot) = self.screenshot.as_mut() {
                 shot.staged = Some(Instant::now());
@@ -1042,11 +1057,14 @@ impl App {
                 }
             }
             Action::Shell(pod, container) => self.open_shell(pod, container),
-            Action::OpenLogs(pod, container) => {
+            Action::OpenLogs(pod, container, previous) => {
                 let containers = pod.containers.iter().map(|c| c.name.clone()).collect();
-                self.open_logs(pod.namespace, LogTarget::Pod(pod.name), containers, container);
+                let last_exit = pod.containers.iter().map(|c| (c.name.clone(), c.last_exit.clone())).collect();
+                self.open_logs(pod.namespace, LogTarget::Pod(pod.name), containers, container, previous, last_exit);
             }
-            Action::OpenGroupLogs { namespace, target } => self.open_logs(namespace, target, Vec::new(), None),
+            Action::OpenGroupLogs { namespace, target } => {
+                self.open_logs(namespace, target, Vec::new(), None, false, HashMap::new())
+            }
             Action::Yaml(kind, ns, name) => self.open_yaml(kind, ns, name),
             Action::ForwardPod(pod, port) => {
                 let port = port.or(pod.ports.first().copied()).unwrap_or(8080);
@@ -1206,7 +1224,17 @@ impl App {
     }
 
     /// Opens a log tab for the active cluster, or focuses it if the same logs are already open.
-    fn open_logs(&mut self, namespace: String, target: LogTarget, containers: Vec<String>, container: Option<String>) {
+    /// `previous` opens the run before the last restart (`kubectl logs --previous`) in its own tab;
+    /// `last_exit` says how each container's previous run ended.
+    fn open_logs(
+        &mut self,
+        namespace: String,
+        target: LogTarget,
+        containers: Vec<String>,
+        container: Option<String>,
+        previous: bool,
+        last_exit: HashMap<String, String>,
+    ) {
         let Some(ws) = self.ws() else { return };
         let Some(clients) = ws.clients().cloned() else { return };
         let context = ws.context.clone().unwrap_or_default();
@@ -1216,16 +1244,17 @@ impl App {
             LogTarget::Owner(o) => format!("owner/{o}"),
         };
         let key = format!(
-            "{}|{context}|{namespace}|{target_key}|{}",
+            "{}|{context}|{namespace}|{target_key}|{}{}",
             ws.kubeconfig_path.display(),
-            container.clone().unwrap_or_default()
+            container.clone().unwrap_or_default(),
+            if previous { "|previous" } else { "" }
         );
         self.show_logs();
         if let Some(i) = self.logs.iter().position(|l| l.key == key) {
             self.active_log = i;
             return;
         }
-        let mut view = LogView::new(key, context, clients, namespace, target, containers, container);
+        let mut view = LogView::new(key, context, clients, namespace, target, containers, container, previous, last_exit);
         let id = self.next_id();
         view.start(id, self.rt.handle(), &self.bus);
         self.logs.push(view);
@@ -1587,45 +1616,57 @@ impl App {
             .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(10, 12)))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                let mut workloads = vec![(Tab::Overview, None), (Tab::Pods, count(&ws.pods)), (Tab::Deployments, count(&ws.deployments))];
-                workloads.extend(WORKLOAD_KINDS.map(|k| (Tab::Workload(k), count(ws.workload(k)))));
+                let plain = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| (n.to_string(), None));
+                // Pods report failures rather than a total, so a problem shows from any page.
+                let failing = ws.failing_pods();
+                let pods_badge = if failing > 0 { Some((format!("{failing} failing"), Some(RED))) } else { plain(count(&ws.pods)) };
+                let mut workloads = vec![
+                    (Tab::Overview, None),
+                    (Tab::Pods, pods_badge),
+                    (Tab::Deployments, plain(count(&ws.deployments))),
+                ];
+                workloads.extend(WORKLOAD_KINDS.map(|k| (Tab::Workload(k), plain(count(ws.workload(k))))));
+                let forwards_badge = (active_forwards > 0).then(|| (format!("{active_forwards} live"), Some(GREEN)));
                 let groups = [
                     ("workloads", icon::CUBE, "Workloads", workloads),
-                    ("network", icon::SHARE_NETWORK, "Network", vec![(Tab::Services, count(&ws.services))]),
+                    (
+                        "network",
+                        icon::SHARE_NETWORK,
+                        "Network",
+                        vec![(Tab::Services, plain(count(&ws.services))), (Tab::Forwards, forwards_badge)],
+                    ),
                 ];
-                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-                    for (key, glyph, label, children) in groups {
-                        let open = !collapsed.iter().any(|c| c == key);
-                        let has_selected = children.iter().any(|(t, _)| *t == ws.tab);
-                        // A closed group still shows that the current page lives inside it.
-                        if theme::nav_group(ui, glyph, label, open, !open && has_selected).clicked() {
-                            if open {
-                                collapsed.push(key.to_string());
-                            } else {
-                                collapsed.retain(|c| c != key);
-                            }
-                            toggled = true;
-                        }
-                        if open {
-                            for (tab, n) in children {
-                                if theme::nav_child(ui, tab_label(tab), n, ws.tab == tab).clicked() {
-                                    ws.set_tab(tab);
+                // Settings is pinned to the bottom of the rail; the groups scroll above it.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    if theme::nav_item(ui, icon::GEAR, "Settings", None, ws.tab == Tab::Settings).clicked() {
+                        ws.set_tab(Tab::Settings);
+                    }
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            for (key, glyph, label, children) in groups {
+                                let open = !collapsed.iter().any(|c| c == key);
+                                let has_selected = children.iter().any(|(t, _)| *t == ws.tab);
+                                // A closed group still shows that the current page lives inside it.
+                                if theme::nav_group(ui, glyph, label, open, !open && has_selected).clicked() {
+                                    if open {
+                                        collapsed.push(key.to_string());
+                                    } else {
+                                        collapsed.retain(|c| c != key);
+                                    }
+                                    toggled = true;
                                 }
+                                if open {
+                                    for (tab, badge) in children {
+                                        if theme::nav_child_badge(ui, tab_label(tab), badge, ws.tab == tab).clicked() {
+                                            ws.set_tab(tab);
+                                        }
+                                    }
+                                }
+                                ui.add_space(6.0);
                             }
-                        }
-                        ui.add_space(6.0);
-                    }
-                    // Resource pages, then app-wide pages, separated by a quiet gap.
-                    ui.add_space(8.0);
-                    let app_pages = [
-                        (Tab::Forwards, icon::ARROWS_LEFT_RIGHT, "Port Forwards", Some(active_forwards)),
-                        (Tab::Settings, icon::GEAR, "Settings", None),
-                    ];
-                    for (tab, glyph, label, n) in app_pages {
-                        if theme::nav_item(ui, glyph, label, n, ws.tab == tab).clicked() {
-                            ws.set_tab(tab);
-                        }
-                    }
+                        });
+                    });
                 });
             });
         if toggled {
@@ -1822,6 +1863,26 @@ impl App {
         }
         self.active_log = self.active_log.min(total - 1);
         let n_logs = self.logs.len();
+        let n_shells = self.shells.len();
+        // Split view keeps the last log tab and the last shell tab on screen together.
+        if self.active_log < n_logs {
+            self.split_log = self.active_log;
+        } else {
+            self.split_shell = self.active_log - n_logs;
+        }
+        self.split_log = self.split_log.min(n_logs.saturating_sub(1));
+        self.split_shell = self.split_shell.min(n_shells.saturating_sub(1));
+        let can_split = n_logs > 0 && n_shells > 0;
+        let split = self.settings.log_split && can_split;
+        let mut toggle_split = false;
+        // What the body shows this frame: (log tab, shell tab).
+        let (shown_log, shown_shell) = if split {
+            (Some(self.split_log), Some(self.split_shell))
+        } else if self.active_log < n_logs {
+            (Some(self.active_log), None)
+        } else {
+            (None, Some(self.active_log - n_logs))
+        };
         let mut reconnect = false;
         let mut select = None;
         let mut close = None;
@@ -1849,21 +1910,42 @@ impl App {
             }
         };
 
-        let panel_response = panel.frame(theme::well_frame()).show(ctx, |ui| {
-                ui.add_space(4.0);
+        // Collapsed, the panel is only the tab strip, so it trims its margins to fit it.
+        let frame = if mode == LogPanelMode::Collapsed {
+            theme::well_frame().inner_margin(egui::Margin::symmetric(14, 6))
+        } else {
+            theme::well_frame()
+        };
+        let panel_response = panel.frame(frame).show(ctx, |ui| {
+                if mode != LogPanelMode::Collapsed {
+                    ui.add_space(4.0);
+                }
                 ui.horizontal(|ui| {
                     egui::ScrollArea::horizontal()
                         .id_salt("log-tabs")
-                        .max_width(ui.available_width() - 110.0)
+                        .max_width(ui.available_width() - 140.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let tabs = self
                                     .logs
                                     .iter()
-                                    .map(|l| (if l.is_group() { icon::STACK } else { icon::SCROLL }, l.title(), l.hover(), l.live()))
+                                    .map(|l| {
+                                        let glyph = if l.previous() {
+                                            icon::CLOCK_COUNTER_CLOCKWISE
+                                        } else if l.is_group() {
+                                            icon::STACK
+                                        } else {
+                                            icon::SCROLL
+                                        };
+                                        (glyph, l.title(), l.hover(), l.live())
+                                    })
                                     .chain(self.shells.iter().map(|s| (icon::TERMINAL_WINDOW, s.title(), s.hover(), s.live())));
                                 for (i, (glyph, title, hover, live)) in tabs.enumerate() {
-                                    let selected = i == self.active_log;
+                                    let selected = if split {
+                                        Some(i) == shown_log || Some(i) == shown_shell.map(|s| s + n_logs)
+                                    } else {
+                                        i == self.active_log
+                                    };
                                     let label = format!("{glyph}  {title}");
                                     let text = match (selected, live) {
                                         (true, _) => theme::semibold(label).color(theme::TEXT),
@@ -1907,6 +1989,12 @@ impl App {
                         if theme::icon_button(ui, glyph, hint).clicked() {
                             new_mode = Some(target);
                         }
+                        if can_split {
+                            let hint = if split { "Show one tab at a time" } else { "Split: logs beside the terminal" };
+                            if theme::icon_toggle(ui, icon::SQUARE_SPLIT_HORIZONTAL, split, hint).clicked() {
+                                toggle_split = true;
+                            }
+                        }
                         let (glyph, hint, target) = match mode {
                             LogPanelMode::Collapsed => (icon::CARET_UP, "Restore size", LogPanelMode::Normal),
                             _ => (icon::CARET_DOWN, "Collapse to bottom", LogPanelMode::Collapsed),
@@ -1918,13 +2006,27 @@ impl App {
                 });
                 if mode != LogPanelMode::Collapsed {
                     ui.separator();
-                    if self.active_log < n_logs {
-                        if let Some(log) = self.logs.get_mut(self.active_log) {
-                            event = Some(log.ui(ui, &mut load_older));
-                        }
-                    } else if let Some(shell) = self.shells.get_mut(self.active_log - n_logs) {
-                        reconnect = shell.ui(ui);
+                    let body = ui.available_rect_before_wrap();
+                    let (log_rect, shell_rect) = if split {
+                        // Logs get the wider side; a hairline and a gutter separate the two.
+                        let mid = body.left() + (body.width() * 0.58).round();
+                        ui.painter().vline(mid, body.y_range(), egui::Stroke::new(1.0, theme::BORDER));
+                        (
+                            egui::Rect::from_min_max(body.min, egui::pos2(mid - 10.0, body.max.y)),
+                            egui::Rect::from_min_max(egui::pos2(mid + 11.0, body.min.y), body.max),
+                        )
+                    } else {
+                        (body, body)
+                    };
+                    if let Some(log) = shown_log.and_then(|i| self.logs.get_mut(i)) {
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(log_rect).id_salt("dock-log"));
+                        event = Some(log.ui(&mut child, &mut load_older));
                     }
+                    if let Some(shell) = shown_shell.and_then(|i| self.shells.get_mut(i)) {
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(shell_rect).id_salt("dock-shell"));
+                        reconnect = shell.ui(&mut child);
+                    }
+                    ui.allocate_rect(body, Sense::hover());
                 }
             });
 
@@ -1953,16 +2055,20 @@ impl App {
         if let Some(mode) = new_mode {
             self.set_log_mode(mode);
         }
+        if toggle_split {
+            self.settings.log_split = !self.settings.log_split;
+            self.settings.save();
+        }
 
         let handle = self.rt.handle().clone();
-        if let Some(event) = event.filter(|_| self.active_log < n_logs) {
+        if let (Some(event), Some(i)) = (event, shown_log) {
             if event.restart {
                 let id = self.next_id();
-                if let Some(log) = self.logs.get_mut(self.active_log) {
+                if let Some(log) = self.logs.get_mut(i) {
                     log.start(id, &handle, &self.bus);
                 }
             } else if load_older {
-                if let Some(log) = self.logs.get_mut(self.active_log) {
+                if let Some(log) = self.logs.get_mut(i) {
                     log.load_older(&handle, &self.bus);
                 }
             }
@@ -1972,7 +2078,7 @@ impl App {
             self.show_logs();
         }
         if reconnect {
-            if let Some(shell) = self.shells.get_mut(self.active_log - n_logs) {
+            if let Some(shell) = shown_shell.and_then(|i| self.shells.get_mut(i)) {
                 shell.start(&handle, &self.bus);
             }
         }

@@ -281,6 +281,24 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> Response {
     resp.on_hover_text(hint)
 }
 
+/// [`icon_button`] that stays lit (Selection Navy, accent hairline) while `on`.
+pub fn icon_toggle(ui: &mut egui::Ui, glyph: &str, on: bool, hint: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let radius = CornerRadius::same(RADIUS_SMALL);
+        if on {
+            p.rect_filled(rect, radius, ACCENT_BG);
+            p.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            p.rect_filled(rect, radius, FIELD_HOVER);
+        }
+        let color = if on { ACCENT_TEXT } else if resp.hovered() { TEXT } else { TEXT_MUTED };
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
+    }
+    resp.on_hover_text(hint)
+}
+
 /// Small on/off text toggle (e.g. `.*` for regex), sized to sit beside an icon button.
 pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Response {
     let font = FontId::monospace(13.0);
@@ -302,8 +320,74 @@ pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Res
     resp.on_hover_text(hint)
 }
 
+/// A small segmented control: one bordered strip, the chosen segment filled.
+/// Returns the index clicked when it differs from `selected`.
+pub fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: usize, hint: &str) -> Option<usize> {
+    let font = FontId::proportional(12.5);
+    let bold = FontId::new(12.5, semibold_family());
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| ui.painter().layout_no_wrap(l.to_string(), bold.clone(), TEXT).size().x + 18.0)
+        .collect();
+    let size = Vec2::new(widths.iter().sum::<f32>() + 4.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let mut clicked = None;
+    let radius = CornerRadius::same(RADIUS_SMALL);
+    ui.painter().rect_filled(rect, radius, CHROME);
+    ui.painter().rect_stroke(rect, radius, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    let mut x = rect.left() + 2.0;
+    for (i, (label, w)) in labels.iter().zip(&widths).enumerate() {
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), Vec2::new(*w, size.y - 4.0));
+        x += w;
+        let r = ui.interact(seg, resp.id.with(i), Sense::click());
+        let on = i == selected;
+        let p = ui.painter();
+        if on {
+            p.rect_filled(seg, CornerRadius::same(RADIUS_SMALL.saturating_sub(1)), FIELD_ACTIVE);
+        } else if r.hovered() {
+            p.rect_filled(seg, CornerRadius::same(RADIUS_SMALL.saturating_sub(1)), FIELD_HOVER);
+        }
+        let (f, color) = if on { (bold.clone(), TEXT) } else { (font.clone(), if r.hovered() { TEXT } else { TEXT_MUTED }) };
+        p.text(seg.center(), egui::Align2::CENTER_CENTER, *label, f, color);
+        if r.on_hover_text(hint).clicked() && !on {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
 /// Left navigation entry: icon, label, optional count; accent-tinted when selected.
 pub fn nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, count: Option<usize>, selected: bool) -> Response {
+    nav_item_badge(ui, glyph, label, plain_count(count), selected)
+}
+
+/// A right-aligned nav count: text, and a colour for when the item isn't selected
+/// (`None` = Faint Ink; a state colour only when the number reports state).
+pub type NavBadge = Option<(String, Option<Color32>)>;
+
+fn plain_count(count: Option<usize>) -> NavBadge {
+    count.filter(|n| *n > 0).map(|n| (n.to_string(), None))
+}
+
+fn paint_nav_badge(p: &egui::Painter, rect: egui::Rect, badge: &NavBadge, selected: bool) {
+    if let Some((text, color)) = badge {
+        let color = match (selected, color) {
+            (_, Some(c)) => *c,
+            (true, None) => ACCENT_TEXT,
+            (false, None) => TEXT_FAINT,
+        };
+        p.text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            FontId::proportional(12.0),
+            color,
+        );
+    }
+}
+
+/// [`nav_item`] with a custom count (see [`NavBadge`]).
+pub fn nav_item_badge(ui: &mut egui::Ui, glyph: &str, label: &str, badge: NavBadge, selected: bool) -> Response {
     let height = 32.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -331,15 +415,7 @@ pub fn nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, count: Option<usize
             FontId::proportional(13.5)
         };
         p.text(egui::pos2(rect.left() + 38.0, y), egui::Align2::LEFT_CENTER, label, font, text_color);
-        if let Some(n) = count.filter(|n| *n > 0) {
-            p.text(
-                egui::pos2(rect.right() - 10.0, y),
-                egui::Align2::RIGHT_CENTER,
-                n.to_string(),
-                FontId::proportional(12.0),
-                if selected { ACCENT_TEXT } else { TEXT_FAINT },
-            );
-        }
+        paint_nav_badge(p, rect, &badge, selected);
     }
     resp
 }
@@ -382,7 +458,7 @@ pub fn nav_group(ui: &mut egui::Ui, glyph: &str, label: &str, open: bool, marked
 }
 
 /// A page inside a sidebar group: text only, hung off a hairline guide under the group glyph.
-pub fn nav_child(ui: &mut egui::Ui, label: &str, count: Option<usize>, selected: bool) -> Response {
+pub fn nav_child_badge(ui: &mut egui::Ui, label: &str, badge: NavBadge, selected: bool) -> Response {
     let height = 30.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -423,15 +499,7 @@ pub fn nav_child(ui: &mut egui::Ui, label: &str, count: Option<usize>, selected:
         };
         let y = rect.center().y;
         p.text(egui::pos2(item.left() + 10.0, y), egui::Align2::LEFT_CENTER, label, font, text_color);
-        if let Some(n) = count.filter(|n| *n > 0) {
-            p.text(
-                egui::pos2(rect.right() - 10.0, y),
-                egui::Align2::RIGHT_CENTER,
-                n.to_string(),
-                FontId::proportional(12.0),
-                if selected { ACCENT_TEXT } else { TEXT_FAINT },
-            );
-        }
+        paint_nav_badge(p, rect, &badge, selected);
     }
     resp
 }

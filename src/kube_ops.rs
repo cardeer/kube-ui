@@ -338,6 +338,8 @@ pub struct ContainerInfo {
     pub restarts: i32,
     pub state: String,
     pub init: bool,
+    /// How the previous run ended, e.g. "OOMKilled (exit 137) 4m ago"; empty if it never restarted.
+    pub last_exit: String,
 }
 
 #[derive(Clone)]
@@ -428,6 +430,17 @@ pub fn pod_row(p: &Pod) -> PodRow {
                     restarts: st.map(|s| s.restart_count).unwrap_or(0),
                     state: container_state(st.and_then(|s| s.state.as_ref())),
                     init,
+                    last_exit: st
+                        .and_then(|s| s.last_state.as_ref())
+                        .and_then(|s| s.terminated.as_ref())
+                        .map(|t| {
+                            let reason = t.reason.clone().unwrap_or_else(|| "Terminated".into());
+                            match &t.finished_at {
+                                Some(f) => format!("{reason} (exit {}) {} ago", t.exit_code, age(Some(f))),
+                                None => format!("{reason} (exit {})", t.exit_code),
+                            }
+                        })
+                        .unwrap_or_default(),
                 });
             }
         }

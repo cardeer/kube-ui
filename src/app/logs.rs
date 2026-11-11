@@ -174,7 +174,10 @@ pub(super) struct LogView {
     container: String,
     tail: i64,
     timestamps: bool,
+    /// Show the run before the last restart (`kubectl logs --previous`).
     previous: bool,
+    /// How each container's previous run ended, from the pod list when the tab opened.
+    last_exit: HashMap<String, String>,
     follow: bool,
     filter: String,
     /// Treat `filter` as a regular expression.
@@ -218,6 +221,8 @@ impl LogView {
         target: LogTarget,
         containers: Vec<String>,
         container: Option<String>,
+        previous: bool,
+        last_exit: HashMap<String, String>,
     ) -> Self {
         Self {
             stream_id: 0,
@@ -230,7 +235,8 @@ impl LogView {
             target,
             tail: 500,
             timestamps: false,
-            previous: false,
+            previous,
+            last_exit,
             follow: true,
             filter: String::new(),
             regex: false,
@@ -263,13 +269,18 @@ impl LogView {
         !matches!(self.target, LogTarget::Pod(_))
     }
 
+    pub(super) fn previous(&self) -> bool {
+        self.previous
+    }
+
     pub(super) fn title(&self) -> String {
         let label = self.target.label();
-        if self.is_group() && !self.sources.is_empty() {
+        let label = if self.is_group() && !self.sources.is_empty() {
             format!("{label} ({})", self.sources.len())
         } else {
             label
-        }
+        };
+        if self.previous { format!("{label} · previous") } else { label }
     }
 
     pub(super) fn hover(&self) -> String {
@@ -393,7 +404,14 @@ impl LogView {
             Msg::LogEnded { src, error, .. } => {
                 if let Some(s) = self.sources.get_mut(src) {
                     s.streaming = false;
-                    s.status = Some(error.unwrap_or_else(|| "Stream ended".into()));
+                    s.status = Some(match error {
+                        // `--previous` on a container that never restarted.
+                        Some(e) if e.contains("previous terminated container") => {
+                            "No previous run: this container hasn't restarted".into()
+                        }
+                        Some(e) => e,
+                        None => "Stream ended".into(),
+                    });
                 }
             }
             Msg::LogOlder { src, result, .. } => {
@@ -554,8 +572,18 @@ impl LogView {
                 .on_hover_text("Lines per pod to start from. Scroll to the top to load older lines.");
             ui.add_space(4.0);
             theme::checkbox(ui, &mut self.timestamps, "Timestamps");
-            out.restart |= theme::checkbox(ui, &mut self.previous, "Previous").changed();
             theme::checkbox(ui, &mut self.follow, "Auto-scroll");
+            ui.add_space(4.0);
+            let run_hint = "Current run, or the run before the last restart (--previous)";
+            if let Some(i) = theme::segmented(ui, &["Current", "Previous"], self.previous as usize, run_hint) {
+                self.previous = i == 1;
+                out.restart = true;
+            }
+            if self.previous {
+                if let Some(exit) = self.last_exit.get(&self.container).filter(|e| !e.is_empty()) {
+                    ui.label(RichText::new(format!("Last run: {exit}")).color(YELLOW));
+                }
+            }
             ui.add_space(4.0);
             let hint = if self.regex { "Filter (regex)" } else { "Filter lines" };
             theme::search_field(ui, &mut self.filter, hint, 200.0);
@@ -589,11 +617,12 @@ impl LogView {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Kept short so it never runs over the controls; a stream's message gets its own line below.
                 if self.live() {
                     ui.colored_label(GREEN, "live");
                     dot(ui, GREEN);
-                } else if let Some(s) = self.sources.first().and_then(|s| s.status.as_ref()).filter(|_| self.sources.len() == 1) {
-                    ui.weak(s);
+                } else if !self.sources.is_empty() {
+                    ui.weak("stopped");
                 }
                 ui.weak(format!("{} lines", self.lines.len()));
             });
@@ -632,6 +661,9 @@ impl LogView {
             });
         } else if let Some(e) = &self.error {
             ui.colored_label(RED, e);
+        } else if let Some(st) = self.sources.first().filter(|s| !s.streaming).and_then(|s| s.status.as_ref()) {
+            let color = if st == "Stream ended" || st.starts_with("No previous run") { theme::TEXT_MUTED } else { YELLOW };
+            ui.add(egui::Label::new(RichText::new(st).color(color)).wrap());
         }
         ui.separator();
 
