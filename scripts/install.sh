@@ -74,14 +74,15 @@ NEW_APP="$TMP/unzipped/$APP_NAME.app"
 # The app is ad-hoc signed, not notarized: drop the quarantine flag so it opens normally.
 xattr -dr com.apple.quarantine "$NEW_APP" 2>/dev/null || true
 
-# Quit the running app (it reopens afterwards).
+# Quit the running app (it reopens afterwards). `-a` matters: when the app's own Update
+# button runs this script, the app is our ancestor, which pgrep/pkill skip by default.
 WAS_RUNNING=0
-if pgrep -xq kube-ui; then
+if pgrep -axq kube-ui; then
     WAS_RUNNING=1
     say "Quitting $APP_NAME"
     osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
-    for _ in $(seq 20); do pgrep -xq kube-ui || break; sleep 0.5; done
-    pkill -x kube-ui 2>/dev/null || true
+    for _ in $(seq 20); do pgrep -axq kube-ui || break; sleep 0.5; done
+    pkill -ax kube-ui 2>/dev/null || true
 fi
 
 # Replace it. Use sudo only when the folder isn't writable.

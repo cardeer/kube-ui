@@ -22,6 +22,9 @@ pub enum UpdateState {
     /// A newer release, by tag (e.g. `v0.2.0`).
     Available(String),
     Installing(String),
+    /// The installer finished but this process is still running (it couldn't quit us):
+    /// the new version starts on the next launch.
+    Installed(String),
     Failed(String),
 }
 
@@ -64,15 +67,36 @@ pub fn log_path() -> PathBuf {
 /// The folder holding the running `Kube UI.app`, so an update replaces this copy.
 /// `None` when not running from a bundle (e.g. `cargo run`): the installer's default applies.
 fn install_dir() -> Option<PathBuf> {
+    app_bundle()?.parent().map(PathBuf::from)
+}
+
+/// The running `Kube UI.app`, when running from a bundle.
+fn app_bundle() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // .../Kube UI.app/Contents/MacOS/kube-ui
     let app = exe.parent()?.parent()?.parent()?;
-    (app.extension()? == "app").then(|| app.parent().map(PathBuf::from)).flatten()
+    (app.extension()? == "app").then(|| app.to_path_buf())
 }
 
-/// Starts the installer for `tag`, detached. Returns once it is running; if it fails, the
-/// returned receiver gets the error (on success the installer quits and reopens the app).
-pub fn install(tag: &str) -> Result<std::sync::mpsc::Receiver<String>, String> {
+/// Reopens the app shortly after this process exits (the caller then closes the window).
+/// False when not running from a bundle.
+pub fn relaunch() -> bool {
+    let Some(app) = app_bundle() else { return false };
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$0""#)
+        .arg(&app)
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Starts the installer for `tag`, detached. The receiver gets its outcome; normally the
+/// installer quits and reopens the app first, so a result only arrives when it couldn't.
+pub fn install(tag: &str) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
     let log = log_path();
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -101,11 +125,14 @@ pub fn install(tag: &str) -> Result<std::sync::mpsc::Receiver<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        if !ok {
+        let result = if ok {
+            Ok(())
+        } else {
             let tail = std::fs::read_to_string(log_path()).unwrap_or_default();
             let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-            let _ = tx.send(if last.is_empty() { "The installer failed.".into() } else { strip_ansi(&last) });
-        }
+            Err(if last.is_empty() { "The installer failed.".into() } else { strip_ansi(&last) })
+        };
+        let _ = tx.send(result);
     });
     Ok(rx)
 }

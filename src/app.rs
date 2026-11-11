@@ -412,8 +412,8 @@ pub struct App {
     confirm_delete: Option<(u64, Kind, String, String)>,
     toasts: Vec<Toast>,
     update: update::UpdateState,
-    /// Errors from a running installer (it quits the app when it succeeds).
-    update_failed: Option<Receiver<String>>,
+    /// Outcome of a running installer (normally it quits and reopens the app before reporting).
+    update_result: Option<Receiver<Result<(), String>>>,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
@@ -474,7 +474,7 @@ impl App {
             confirm_delete: None,
             toasts: Vec::new(),
             update: update::UpdateState::Idle,
-            update_failed: None,
+            update_result: None,
             next_id: 1,
             window_dirty: None,
             log_resizing: false,
@@ -586,7 +586,7 @@ impl App {
     fn start_update(&mut self, tag: String) {
         match update::install(&tag) {
             Ok(rx) => {
-                self.update_failed = Some(rx);
+                self.update_result = Some(rx);
                 self.update = update::UpdateState::Installing(tag);
             }
             Err(e) => {
@@ -598,13 +598,28 @@ impl App {
 
     /// Right end of the tab row: check for updates, or offer the one found.
     fn ui_update_control(&mut self, ui: &mut egui::Ui) {
-        if let Some(rx) = &self.update_failed {
-            if let Ok(e) = rx.try_recv() {
-                self.update_failed = None;
-                self.toast(format!("Update failed: {e} (log: {})", display_path(&update::log_path())), true);
-                self.update = update::UpdateState::Failed(e);
-            } else {
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
+        if let Some(rx) = &self.update_result {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.update_result = None;
+                    let tag = match &self.update {
+                        update::UpdateState::Installing(t) => t.clone(),
+                        _ => String::new(),
+                    };
+                    match result {
+                        // Installed, but we weren't quit: offer the restart ourselves.
+                        Ok(()) => {
+                            self.toast(format!("Kube UI {tag} is installed. Restart to use it."), false);
+                            self.update = update::UpdateState::Installed(tag);
+                        }
+                        Err(e) => {
+                            self.toast(format!("Update failed: {e} (log: {})", display_path(&update::log_path())), true);
+                            self.update = update::UpdateState::Failed(e);
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(Duration::from_millis(500)),
+                Err(mpsc::TryRecvError::Disconnected) => self.update_result = None,
             }
         }
         let current = update::CURRENT;
@@ -617,6 +632,20 @@ impl App {
             update::UpdateState::Installing(tag) => {
                 ui.weak(format!("Installing {tag}… Kube UI will reopen"));
                 ui.spinner();
+            }
+            update::UpdateState::Installed(tag) => {
+                let tag = tag.clone();
+                if ui
+                    .add(theme::primary_button(format!("{} Restart to finish", icon::ARROW_CLOCKWISE)))
+                    .on_hover_text(format!("{tag} is installed. Quits and reopens Kube UI."))
+                    .clicked()
+                {
+                    if update::relaunch() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.toast("Quit and reopen Kube UI to use the new version.", false);
+                    }
+                }
             }
             update::UpdateState::Available(tag) => {
                 let tag = tag.clone();
