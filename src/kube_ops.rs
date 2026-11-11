@@ -243,7 +243,7 @@ pub async fn watch_rows<K, R>(
             }
             Err(e) => {
                 // The backoff retries forever; only report when the message changes.
-                let e = format!("{:#}", anyhow::Error::from(e));
+                let e = describe_error(&anyhow::Error::from(e));
                 let changed = scope.error.as_ref() != Some(&e);
                 scope.error = Some(e);
                 changed
@@ -252,6 +252,58 @@ pub async fn watch_rows<K, R>(
         if changed && deadline.is_none() {
             deadline = Some(tokio::time::Instant::now() + WATCH_DEBOUNCE);
         }
+    }
+}
+
+/// A readable message for an error. When the API server answered with a `Status` (403, 404,
+/// …) this says what went wrong in plain words instead of dumping the nested debug output.
+pub fn describe_error(e: &anyhow::Error) -> String {
+    let status = e.chain().find_map(|c| {
+        if let Some(kube::Error::Api(s)) = c.downcast_ref::<kube::Error>() {
+            return Some(&**s);
+        }
+        if let Some(watcher::Error::WatchError(s)) = c.downcast_ref::<watcher::Error>() {
+            return Some(&**s);
+        }
+        c.downcast_ref::<kube::core::Status>()
+    });
+    match status {
+        Some(s) => describe_status(s),
+        None => format!("{e:#}"),
+    }
+}
+
+fn describe_status(s: &kube::core::Status) -> String {
+    static FORBIDDEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"User "([^"]+)" cannot (\w+) resource "([^"]+)"(?: in API group "([^"]*)")?(?: in the namespace "([^"]+)")?"#,
+        )
+        .unwrap()
+    });
+    let message = s.message.trim();
+    match s.code {
+        401 => "Not authenticated: the cluster rejected this kubeconfig's credentials. They may have expired.".into(),
+        403 => match FORBIDDEN.captures(message) {
+            Some(c) => {
+                let user = &c[1];
+                let verb = &c[2];
+                let mut resource = c[3].to_string();
+                if let Some(group) = c.get(4).map(|g| g.as_str()).filter(|g| !g.is_empty()) {
+                    resource = format!("{resource}.{group}");
+                }
+                let place = match c.get(5) {
+                    Some(ns) => format!("in namespace \"{}\"", ns.as_str()),
+                    None => "across the cluster".into(),
+                };
+                format!("No permission to {verb} {resource} {place}. Signed in as {user}.")
+            }
+            None => format!("Permission denied: {message}"),
+        },
+        404 => format!("Not found: {message}"),
+        409 => format!("Conflict: {message}"),
+        422 => format!("Invalid: {message}"),
+        _ if !message.is_empty() => message.to_string(),
+        code => format!("Request failed ({code} {})", s.reason),
     }
 }
 
@@ -1686,5 +1738,36 @@ mod tests {
         check::<CronJob>(Kind::CronJob);
         assert_eq!(Kind::from_label("CronJob"), Some(Kind::CronJob));
         assert_eq!(Kind::from_label("Ingress"), None);
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    fn status(code: u16, message: &str) -> anyhow::Error {
+        let s = kube::core::Status { code, message: message.into(), reason: "Forbidden".into(), ..Default::default() };
+        anyhow::Error::from(kube::Error::Api(Box::new(s)))
+    }
+
+    #[test]
+    fn forbidden_in_namespace() {
+        let e = status(
+            403,
+            r#"pods is forbidden: User "system:serviceaccount:kube-system:dev" cannot list resource "pods" in API group "" in the namespace "cattle-fleet-system""#,
+        );
+        assert_eq!(
+            describe_error(&e),
+            r#"No permission to list pods in namespace "cattle-fleet-system". Signed in as system:serviceaccount:kube-system:dev."#
+        );
+    }
+
+    #[test]
+    fn forbidden_cluster_scope_with_group() {
+        let e = status(
+            403,
+            r#"deployments.apps is forbidden: User "alice" cannot list resource "deployments" in API group "apps" at the cluster scope"#,
+        );
+        assert_eq!(describe_error(&e), "No permission to list deployments.apps across the cluster. Signed in as alice.");
     }
 }

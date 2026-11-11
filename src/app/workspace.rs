@@ -618,7 +618,7 @@ impl Workspace {
             return false;
         }
         if let Some(e) = &state.error {
-            ui.colored_label(RED, e);
+            error_callout(ui, e);
         }
         if !state.loaded {
             ui.horizontal(|ui| {
@@ -628,6 +628,9 @@ impl Workspace {
             return false;
         }
         if state.items.is_empty() {
+            if state.error.is_some() {
+                return false;
+            }
             ui.label("Nothing here.");
             return false;
         }
@@ -2268,4 +2271,23 @@ where
         }
     }
     (Ok(items), warning)
+}
+
+/// A list error as a tinted box, one row per message (one per failed namespace).
+fn error_callout(ui: &mut egui::Ui, error: &str) {
+    egui::Frame::new()
+        .fill(theme::BAD.gamma_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0, theme::BAD.gamma_multiply(0.45)))
+        .corner_radius(theme::RADIUS)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for line in error.lines().filter(|l| !l.trim().is_empty()) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icon::WARNING_CIRCLE).color(theme::BAD));
+                    ui.label(RichText::new(line).color(theme::TEXT));
+                });
+            }
+        });
+    ui.add_space(8.0);
 }

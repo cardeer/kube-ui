@@ -1,3 +1,4 @@
+mod changelog;
 mod code_editor;
 mod filter;
 mod logs;
@@ -56,7 +57,7 @@ const YELLOW: Color32 = theme::WARN;
 const RED: Color32 = theme::BAD;
 
 fn err_string(e: anyhow::Error) -> String {
-    format!("{e:#}")
+    kube_ops::describe_error(&e)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +415,8 @@ pub struct App {
     update: update::UpdateState,
     /// Outcome of a running installer (normally it quits and reopens the app before reporting).
     update_result: Option<Receiver<Result<(), String>>>,
+    /// The "What's new" window is showing.
+    changelog_open: bool,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
@@ -423,6 +426,7 @@ pub struct App {
     /// With `KUBE_UI_SCREENSHOT_TAB=<page key>` (e.g. `overview`, `jobs`) it shows that page
     /// instead of a pod with its logs; `KUBE_UI_SCREENSHOT_SELECT=1` also opens the first row,
     /// and `KUBE_UI_SCREENSHOT_EDIT=1` opens it in the YAML editor (nothing is saved).
+    /// `KUBE_UI_SCREENSHOT_CHANGELOG=1` opens the "What's new" window.
     screenshot: Option<DevScreenshot>,
 }
 
@@ -475,6 +479,7 @@ impl App {
             toasts: Vec::new(),
             update: update::UpdateState::Idle,
             update_result: None,
+            changelog_open: false,
             next_id: 1,
             window_dirty: None,
             log_resizing: false,
@@ -494,6 +499,15 @@ impl App {
                 }),
             }),
         };
+
+        // Show what changed after an update (not on a fresh install).
+        if app.screenshot.is_some() {
+            app.changelog_open = std::env::var_os("KUBE_UI_SCREENSHOT_CHANGELOG").is_some();
+        } else if app.settings.last_seen_version.as_deref() != Some(update::CURRENT) {
+            app.changelog_open = app.settings.last_seen_version.is_some();
+            app.settings.last_seen_version = Some(update::CURRENT.to_string());
+            app.settings.save();
+        }
 
         // Restore cluster tabs (or migrate the single kubeconfig from older versions).
         let mut saved = app.settings.workspaces.clone();
@@ -668,7 +682,10 @@ impl App {
                 if ui.add(egui::Button::new(label).frame(false)).on_hover_text(hint).clicked() {
                     self.check_for_updates(true);
                 }
-                ui.label(RichText::new(format!("v{current}")).small().color(theme::TEXT_FAINT));
+                let version = RichText::new(format!("v{current}")).small().color(theme::TEXT_FAINT);
+                if ui.add(egui::Button::new(version).frame(false)).on_hover_text("What's new").clicked() {
+                    self.changelog_open = true;
+                }
             }
         }
     }
@@ -1767,8 +1784,15 @@ impl App {
         if theme::checkbox(ui, &mut self.settings.live_updates, "Live updates (watch lists for changes)").changed() {
             self.settings.save();
         }
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.weak(format!("Kube UI v{}", update::CURRENT));
+            if ui.small_button(format!("{} What's new", icon::SPARKLE)).clicked() {
+                self.changelog_open = true;
+            }
+        });
         if let Some(p) = Settings::path() {
-            ui.add_space(16.0);
+            ui.add_space(8.0);
             ui.weak(format!("Settings stored in {}", p.display()));
         }
     }
@@ -2136,6 +2160,8 @@ impl App {
                 y.edit_on_load = editing;
             }
         }
+
+        changelog::show(ctx, &mut self.changelog_open);
 
         // Port-forward dialog
         let mut start = None;

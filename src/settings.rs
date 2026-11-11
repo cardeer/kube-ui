@@ -128,6 +128,9 @@ pub struct Settings {
     pub window_size: Option<[f32; 2]>,
     #[serde(default)]
     pub window_maximized: bool,
+    /// Version that last ran; "What's new" opens once when it differs from the running one.
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 fn default_log_height() -> f32 {
@@ -154,6 +157,7 @@ impl Default for Settings {
             log_mode: LogPanelMode::Normal,
             window_size: None,
             window_maximized: false,
+            last_seen_version: None,
         }
     }
 }
