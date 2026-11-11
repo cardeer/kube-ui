@@ -3,6 +3,7 @@ mod filter;
 mod logs;
 mod shell;
 mod theme;
+mod update;
 mod workspace;
 
 use std::{
@@ -111,6 +112,8 @@ enum Msg {
     PfListening { id: u64, port: u16 },
     PfFailed { id: u64, error: String },
     Toast { text: String, error: bool },
+    /// The latest release tag from GitHub; `manual` when the user asked (reports "up to date").
+    UpdateChecked { result: Result<String, String>, manual: bool },
     ShellOutput { id: u64, data: Vec<u8> },
     ShellExited { id: u64, error: Option<String> },
 }
@@ -408,6 +411,9 @@ pub struct App {
     /// (cluster tab, namespace, pod)
     confirm_delete: Option<(u64, Kind, String, String)>,
     toasts: Vec<Toast>,
+    update: update::UpdateState,
+    /// Errors from a running installer (it quits the app when it succeeds).
+    update_failed: Option<Receiver<String>>,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
@@ -467,6 +473,8 @@ impl App {
             pf_dialog: None,
             confirm_delete: None,
             toasts: Vec::new(),
+            update: update::UpdateState::Idle,
+            update_failed: None,
             next_id: 1,
             window_dirty: None,
             log_resizing: false,
@@ -531,7 +539,109 @@ impl App {
                 app.start_forward(id);
             }
         }
+        // `KUBE_UI_SCREENSHOT_UPDATE=<tag>` shows that release as available instead of asking GitHub.
+        match std::env::var("KUBE_UI_SCREENSHOT_UPDATE") {
+            Ok(tag) => app.update = update::UpdateState::Available(tag),
+            Err(_) if app.screenshot.is_none() => app.check_for_updates(false),
+            Err(_) => {}
+        }
         app
+    }
+
+    // -----------------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------------
+
+    fn check_for_updates(&mut self, manual: bool) {
+        if matches!(self.update, update::UpdateState::Checking { .. } | update::UpdateState::Installing(_)) {
+            return;
+        }
+        self.update = update::UpdateState::Checking { manual };
+        let bus = self.bus.clone();
+        self.rt.spawn(async move {
+            let result = update::latest_tag().await;
+            bus.send(Msg::UpdateChecked { result, manual });
+        });
+    }
+
+    fn update_checked(&mut self, result: Result<String, String>, manual: bool) {
+        self.update = match result {
+            Ok(tag) if update::is_newer(&tag, update::CURRENT) => update::UpdateState::Available(tag),
+            Ok(_) => {
+                if manual {
+                    self.toast(format!("Kube UI {} is up to date.", update::CURRENT), false);
+                }
+                update::UpdateState::UpToDate
+            }
+            Err(e) => {
+                if manual {
+                    self.toast(format!("Couldn't check for updates: {e}"), true);
+                }
+                // A failed background check stays quiet; the button still offers a retry.
+                if manual { update::UpdateState::Failed(e) } else { update::UpdateState::Idle }
+            }
+        };
+    }
+
+    fn start_update(&mut self, tag: String) {
+        match update::install(&tag) {
+            Ok(rx) => {
+                self.update_failed = Some(rx);
+                self.update = update::UpdateState::Installing(tag);
+            }
+            Err(e) => {
+                self.toast(e.clone(), true);
+                self.update = update::UpdateState::Failed(e);
+            }
+        }
+    }
+
+    /// Right end of the tab row: check for updates, or offer the one found.
+    fn ui_update_control(&mut self, ui: &mut egui::Ui) {
+        if let Some(rx) = &self.update_failed {
+            if let Ok(e) = rx.try_recv() {
+                self.update_failed = None;
+                self.toast(format!("Update failed: {e} (log: {})", display_path(&update::log_path())), true);
+                self.update = update::UpdateState::Failed(e);
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+        }
+        let current = update::CURRENT;
+        match &self.update {
+            // The launch check runs silently; only a check the user asked for shows progress.
+            update::UpdateState::Checking { manual: true } => {
+                ui.weak("Checking for updates…");
+                ui.spinner();
+            }
+            update::UpdateState::Installing(tag) => {
+                ui.weak(format!("Installing {tag}… Kube UI will reopen"));
+                ui.spinner();
+            }
+            update::UpdateState::Available(tag) => {
+                let tag = tag.clone();
+                let button = theme::primary_button(format!("{} Update to {tag}", icon::ARROW_CIRCLE_UP));
+                if ui
+                    .add(button)
+                    .on_hover_text(format!("You have {current}. Downloads {tag}, installs it and reopens Kube UI."))
+                    .clicked()
+                {
+                    self.start_update(tag);
+                }
+            }
+            state => {
+                let hint = match state {
+                    update::UpdateState::UpToDate => format!("Kube UI {current} is up to date. Check again"),
+                    update::UpdateState::Failed(e) => format!("Last check failed: {e}"),
+                    _ => format!("Kube UI {current}. Check GitHub for a newer release"),
+                };
+                let label = RichText::new(format!("{} Check for updates", icon::ARROW_CLOCKWISE)).color(theme::TEXT_MUTED);
+                if ui.add(egui::Button::new(label).frame(false)).on_hover_text(hint).clicked() {
+                    self.check_for_updates(true);
+                }
+                ui.label(RichText::new(format!("v{current}")).small().color(theme::TEXT_FAINT));
+            }
+        }
     }
 
     fn next_id(&mut self) -> u64 {
@@ -853,6 +963,7 @@ impl App {
                     self.toast(format!("Port forward failed: {error}"), true);
                 }
                 Msg::Toast { text, error } => self.toast(text, error),
+                Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
                 _ => {}
             }
         }
@@ -1317,6 +1428,10 @@ impl App {
                         new_tab = Some(t);
                         ui.close();
                     }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    self.ui_update_control(ui);
                 });
             });
             if let Some(i) = activate {
