@@ -230,7 +230,7 @@ impl ShellView {
                 }
             }
             ShellMsg::CopyScreen => {
-                return iced::clipboard::write(self.parser.screen().contents());
+                return Task::done(Message::Copy(self.parser.screen().contents()));
             }
             ShellMsg::Reconnect => self.start(rt, bus),
         }

@@ -10,8 +10,8 @@ use iced::{
 
 use super::{Drag, Message, ROW_HEIGHT, Sort, icons as icon, theme};
 
-const HEADER_HEIGHT: f32 = 26.0;
-const CELL_PAD: f32 = 8.0;
+const HEADER_HEIGHT: f32 = 30.0;
+const CELL_PAD: f32 = 12.0;
 /// The grab area at the right edge of each header cell.
 const HANDLE_W: f32 = 7.0;
 pub const MIN_COL_WIDTH: f32 = 40.0;

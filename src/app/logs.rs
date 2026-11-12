@@ -759,7 +759,7 @@ impl LogView {
                     .map(|l| self.format_plain(l))
                     .collect::<Vec<_>>()
                     .join("\n");
-                return iced::clipboard::write(text);
+                return Task::done(Message::Copy(text));
             }
             LogMsg::Clear => {
                 self.lines.clear();

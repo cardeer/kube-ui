@@ -1270,7 +1270,7 @@ impl Workspace {
             }
             line = line.push(theme::txt(c.state.as_str()));
             line = line.push(theme::faint(format!("· {} restarts", c.restarts)));
-            col = col.push(container(line).padding([3, 0]));
+            col = col.push(container(line).padding([6, 0]));
         }
 
         if let Some(d) = details {
@@ -1391,7 +1391,7 @@ impl Workspace {
             }
 
             // Image, pull policy, working dir and ports in one aligned key/value grid.
-            let mut props = column![prop_row("Image", image_label(&c.image))].spacing(8);
+            let mut props = column![prop_row("Image", image_label(&c.image))].spacing(14);
             props = props.push(prop_row(
                 "Pull policy",
                 theme::mono(c.pull_policy.clone()).into(),
@@ -2181,15 +2181,15 @@ pub(in crate::app) const SHELL_MENU: &str = "shell-menu";
 
 fn section<'a>(title: &'a str) -> El<'a> {
     column![
-        theme::vspace(16.0),
+        theme::vspace(28.0),
         theme::label_small(title),
-        theme::vspace(4.0)
+        theme::vspace(10.0)
     ]
     .into()
 }
 
 fn sub_section<'a>(title: &'a str) -> El<'a> {
-    column![theme::vspace(6.0), theme::label_small(title)].into()
+    column![theme::vspace(14.0), theme::label_small(title), theme::vspace(4.0)].into()
 }
 
 fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
@@ -2200,7 +2200,7 @@ fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
             value
         };
         row![
-            theme::muted(key).width(120),
+            theme::muted(key).width(136),
             theme::tip(
                 theme::mono(value.clone()).wrapping(text::Wrapping::WordOrGlyph),
                 if value.chars().count() > 48 {
@@ -2210,10 +2210,10 @@ fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
                 },
             )
         ]
-        .spacing(16)
+        .spacing(20)
         .into()
     }))
-    .spacing(7)
+    .spacing(14)
     .into()
 }
 
@@ -2227,7 +2227,7 @@ fn tags<'a>(items: impl Iterator<Item = String>) -> El<'a> {
                     .size(11.5)
                     .color(theme::TEXT),
             )
-            .padding([2, 6])
+            .padding([4, 10])
             .style(|_, status| {
                 let fill = match status {
                     button::Status::Hovered | button::Status::Pressed => theme::FIELD_HOVER,
@@ -2248,9 +2248,9 @@ fn tags<'a>(items: impl Iterator<Item = String>) -> El<'a> {
             "Click to copy",
         )
     }))
-    .spacing(4)
+    .spacing(8)
     .wrap()
-    .vertical_spacing(4)
+    .vertical_spacing(8)
     .into()
 }
 
@@ -2320,7 +2320,7 @@ fn conditions<'a>(list: &'a [details::Condition]) -> El<'a> {
     if list.is_empty() {
         return Space::new().into();
     }
-    let mut col = column![section("Conditions")].spacing(3);
+    let mut col = column![section("Conditions")].spacing(9);
     for c in list {
         let mut line = row![
             theme::dot(if c.ok { GREEN } else { YELLOW }),

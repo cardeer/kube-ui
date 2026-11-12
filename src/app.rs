@@ -57,7 +57,7 @@ const MAX_LOG_LINES: usize = 100_000;
 /// How many extra lines to request each time the user scrolls to the top of the logs.
 const LOG_PAGE: usize = 1_000;
 const TOAST_FOR: Duration = Duration::from_secs(5);
-const ROW_HEIGHT: f32 = 30.0;
+const ROW_HEIGHT: f32 = 36.0;
 const NAV_WIDTH: f32 = 224.0;
 const LOG_MIN_HEIGHT: f32 = 160.0;
 /// Height of the log panel when collapsed to its tab strip.
@@ -1142,7 +1142,10 @@ impl App {
                 }
             }
 
-            Message::Copy(text) => return iced::clipboard::write(text),
+            Message::Copy(text) => {
+                self.toast(copied_message(&text), false);
+                return iced::clipboard::write(text);
+            }
             Message::OpenUrl(url) => {
                 self.popup = None;
                 open_url(&url);
@@ -2898,4 +2901,16 @@ pub fn theme_font() -> iced::Font {
 /// Font files the app needs loaded.
 pub fn fonts() -> [&'static [u8]; 4] {
     theme::fonts()
+}
+
+/// The toast shown after copying: short single-line values are quoted, the rest summarised.
+fn copied_message(text: &str) -> String {
+    let lines = text.lines().count();
+    if lines <= 1 && text.chars().count() <= 60 && !text.is_empty() {
+        format!("Copied “{}”", text.trim())
+    } else if lines > 1 {
+        format!("Copied {lines} lines")
+    } else {
+        "Copied to clipboard".to_string()
+    }
 }
