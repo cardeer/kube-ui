@@ -851,7 +851,8 @@ pub fn nav_item<'a, M: Clone + 'a>(
             text(glyph).font(ICONS).size(16.0).line_height(1.0),
             text(label)
                 .size(BODY)
-                .font(if selected { SEMIBOLD } else { INTER }),
+                .font(if selected { SEMIBOLD } else { INTER })
+                .wrapping(text::Wrapping::None),
             fill_space(),
             nav_badge(badge, selected),
         ]
@@ -888,7 +889,8 @@ pub fn nav_group<'a, M: Clone + 'a>(
             .color(TEXT_FAINT)
             .line_height(1.0),
             text(glyph).font(ICONS).size(16.0).line_height(1.0),
-            text(label).size(BODY).font(SEMIBOLD),
+            text(label).size(BODY).font(SEMIBOLD)
+                .wrapping(text::Wrapping::None),
         ]
         .spacing(8)
         .height(Length::Fill)
@@ -931,7 +933,8 @@ pub fn nav_child<'a, M: Clone + 'a>(
                 row![
                     text(label)
                         .size(BODY)
-                        .font(if selected { SEMIBOLD } else { INTER }),
+                        .font(if selected { SEMIBOLD } else { INTER })
+                .wrapping(text::Wrapping::None),
                     fill_space(),
                     nav_badge(badge, selected),
                 ]
