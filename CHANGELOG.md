@@ -5,9 +5,20 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-12
+
 ### Changed
 - The interface is rebuilt on iced 0.14 (from egui). Everything works as before; long lists,
   logs and the terminal draw only what's on screen.
+- On macOS, "Check for updates" and the version link moved from the top bar to the Kube UI
+  menu. The top bar still shows Update, Installing and Restart when one applies.
+- The Containers tab is easier to read: state and restarts are badges next to the container
+  name, the image shows its `name:tag` prominently under the registry path (click to copy),
+  image, pull policy, working dir and ports line up in one grid, resources are a small table,
+  and environment variables are a striped two-column table of name and value.
+- Table cells stay on one line and cut long text with an ellipsis; hover for the full value.
+  Port Forwards uses the same table as the other pages.
+- Sidebar labels no longer wrap.
 
 ### Added
 - Native macOS menu bar. The Kube UI menu has About, Check for Updates…, What's New and
@@ -19,14 +30,15 @@ and match the `v<version>` git tags.
   - ⌘R reload, ⌘J show or hide logs and terminals.
   - ⌥⌘1–5 go to Overview, Pods, Deployments, Services and Port Forwards.
   - ⌘⇧] and ⌘⇧[ switch cluster tabs. ⌘1–8 pick a tab and ⌘9 the last one.
-
-### Changed
-- On macOS, "Check for updates" and the version link moved from the top bar to the Kube UI
-  menu. The top bar still shows Update, Installing and Restart when one applies.
+- Resizable table columns: drag a column's edge in the header, double-click it to reset.
+  Widths are remembered per page.
+- Indent guides in the YAML editor, with the guide around the cursor highlighted.
 
 ### Fixed
 - Namespace and context pickers no longer stay cut off after first opening while the
   list was still loading or short.
+- The YAML viewer and editor scroll with the mouse wheel and trackpad again.
+- Following logs no longer resets the sideways scroll position.
 
 ## [0.3.0] - 2026-11-11
 
