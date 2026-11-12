@@ -1323,7 +1323,7 @@ impl Workspace {
             .iter()
             .find(|p| p.namespace == sel.namespace && p.name == sel.name);
 
-        let mut col = column![].spacing(6);
+        let mut col = column![].spacing(10);
         for c in &pod.containers {
             let info = row_info.and_then(|p| p.containers.iter().find(|i| i.name == c.name));
             let color = match info {
@@ -1331,11 +1331,23 @@ impl Workspace {
                 Some(i) => status_color(&i.state),
                 None => theme::IDLE,
             };
-            let mut head = row![theme::dot(color), theme::semibold(c.name.as_str())]
-                .spacing(6)
-                .align_y(iced::Center);
+            let mut head = row![
+                theme::dot(color),
+                theme::semibold(c.name.as_str()).size(15.0)
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
             if c.init {
-                head = head.push(theme::faint("init"));
+                head = head.push(theme::badge("init", theme::IDLE, false));
+            }
+            if let Some(i) = info {
+                head = head.push(theme::badge(i.state.clone(), color, false));
+                if i.restarts > 0 {
+                    head = head.push(theme::tip(
+                        restarts_badge(i.restarts),
+                        format!("{} restarts", i.restarts),
+                    ));
+                }
             }
             head = head.push(theme::fill_space());
             if let Some(p) = row_info {
@@ -1365,29 +1377,38 @@ impl Workspace {
                     can_shell.then(|| act(Action::Shell(p.clone(), Some(c.name.clone())))),
                 ));
             }
-            let mut card = column![head].spacing(4);
-            if let Some(i) = info {
+            let mut card = column![head].spacing(10);
+            if !c.last_termination.is_empty() {
                 card = card.push(
                     row![
-                        theme::txt(i.state.as_str()),
-                        theme::faint(format!("· {} restarts", i.restarts))
+                        theme::icon(icon::WARNING_CIRCLE).color(YELLOW),
+                        theme::colored(format!("Last terminated: {}", c.last_termination), YELLOW)
+                            .size(theme::SMALL)
                     ]
-                    .spacing(6),
+                    .spacing(6)
+                    .align_y(iced::Center),
                 );
             }
-            if !c.last_termination.is_empty() {
-                card = card.push(theme::colored(
-                    format!("Last terminated: {}", c.last_termination),
-                    YELLOW,
+
+            // Image, pull policy, working dir and ports in one aligned key/value grid.
+            let mut props = column![prop_row("Image", image_label(&c.image))].spacing(8);
+            props = props.push(prop_row(
+                "Pull policy",
+                theme::mono(c.pull_policy.clone()).into(),
+            ));
+            if !c.working_dir.is_empty() {
+                props = props.push(prop_row(
+                    "Working dir",
+                    theme::mono(c.working_dir.clone())
+                        .wrapping(text::Wrapping::WordOrGlyph)
+                        .into(),
                 ));
             }
-            card = card.push(theme::mono_muted(c.image.as_str()));
-
-            let mut rows = vec![("Pull policy", c.pull_policy.clone())];
-            if !c.working_dir.is_empty() {
-                rows.push(("Working dir", c.working_dir.clone()));
+            if !c.ports.is_empty() {
+                props = props.push(prop_row("Ports", tags(c.ports.iter().cloned())));
             }
-            card = card.push(details_grid(rows));
+            card = card.push(theme::hline());
+            card = card.push(props);
 
             if !c.command.is_empty() || !c.args.is_empty() {
                 card = card.push(sub_section("Command"));
@@ -1400,16 +1421,13 @@ impl Workspace {
                     .join(" ");
                 card = card.push(code_block(line));
             }
-            if !c.ports.is_empty() {
-                card = card.push(sub_section("Ports"));
-                card = card.push(tags(c.ports.iter().cloned()));
-            }
             if !c.requests.is_empty() || !c.limits.is_empty() {
                 card = card.push(sub_section("Resources"));
                 card = card.push(resources_grid(&c.requests, &c.limits));
             }
 
             let env_count = c.env.len() + c.env_from_secrets.len();
+            card = card.push(theme::hline());
             card = card.push(collapsible(
                 ctx,
                 format!("env/{}", c.name),
@@ -1458,7 +1476,7 @@ impl Workspace {
                     },
                 ));
             }
-            col = col.push(container(card).padding([10, 12]).width(Length::Fill).style(
+            col = col.push(container(card).padding([12, 14]).width(Length::Fill).style(
                 theme::boxed(
                     theme::alpha(theme::FIELD, 0.55),
                     theme::BORDER,
@@ -1484,17 +1502,25 @@ impl Workspace {
         .spacing(4);
         let needle = ctx.env_filter.trim().to_lowercase();
         let mut shown = 0usize;
+        // The variables as a striped two-column table.
+        let mut table = column![];
         // Everything with a known value, for "Copy as .env".
         let mut dotenv = Vec::new();
 
         for name in &c.env_from_secrets {
-            col = col.push(
-                row![
-                    theme::faint(format!("All keys from Secret {name}")),
-                    self.secret_toggle(ns, name)
-                ]
-                .spacing(6)
-                .align_y(iced::Center),
+            table = table.push(
+                container(
+                    row![
+                        theme::small(format!("All keys from Secret {name}")),
+                        theme::fill_space(),
+                        self.secret_toggle(ns, name)
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Center),
+                )
+                .padding([5, 8])
+                .width(Length::Fill)
+                .style(theme::fill(theme::RAISED)),
             );
             if let Some(Ok(values)) = secret(name) {
                 let source = format!("Secret {name}");
@@ -1503,7 +1529,13 @@ impl Workspace {
                         continue;
                     }
                     shown += 1;
-                    col = col.push(env_item(k, Some(v.clone()), Some(source.clone()), None));
+                    table = table.push(env_item(
+                        k,
+                        Some(v.clone()),
+                        Some(source.clone()),
+                        None,
+                        shown,
+                    ));
                     dotenv.push(format!("{k}={v}"));
                 }
             }
@@ -1548,13 +1580,24 @@ impl Workspace {
                 dotenv.push(format!("{}={v}", e.name));
             }
             let toggle = secret_name.map(|name| self.secret_toggle(ns, name));
-            col = col.push(env_item(
+            table = table.push(env_item(
                 &e.name,
                 value,
                 source,
                 toggle.map(|t| (t, secret_name.is_some())),
+                shown,
             ));
         }
+        col = col.push(
+            container(table)
+                .width(Length::Fill)
+                .clip(true)
+                .style(theme::boxed(
+                    theme::CONTENT,
+                    theme::BORDER,
+                    theme::RADIUS_SMALL,
+                )),
+        );
 
         if !needle.is_empty() && shown == 0 {
             let hidden = c
@@ -2314,32 +2357,87 @@ fn value_label<'a>(value: &str, color: Color) -> El<'a> {
     }
 }
 
-/// One environment variable: name, where it comes from, its value.
+/// One environment variable as a table row: name and its source on the left, the value on
+/// the right. `index` alternates the row stripe.
 fn env_item<'a>(
     name: &str,
     value: Option<String>,
     source: Option<String>,
     secret: Option<(El<'a>, bool)>,
+    index: usize,
 ) -> El<'a> {
-    let mut head = row![theme::mono(name.to_string()).font(iced::Font {
-        weight: iced::font::Weight::Bold,
-        ..theme::MONO
-    })]
-    .spacing(6)
-    .align_y(iced::Center);
+    let mut key = column![
+        theme::mono(name.to_string())
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..theme::MONO
+            })
+            .wrapping(text::Wrapping::WordOrGlyph)
+    ]
+    .spacing(2);
     if let Some(s) = source {
-        head = head.push(theme::small(s));
+        key = key.push(theme::small(s).color(theme::TEXT_FAINT));
     }
     let is_secret = secret.as_ref().is_some_and(|(_, s)| *s);
     if let Some((toggle, _)) = secret {
-        head = head.push(toggle);
+        key = key.push(toggle);
     }
     let value: El<'a> = match value {
         Some(v) => value_label(&v, theme::SYNTAX_STRING),
         None if is_secret => theme::faint("••••••••").into(),
         None => theme::faint("set at runtime").into(),
     };
-    column![head.wrap(), value].spacing(2).into()
+    let stripe = if index % 2 == 0 {
+        theme::STRIPE
+    } else {
+        theme::CONTENT
+    };
+    container(
+        row![
+            key.width(Length::FillPortion(2)),
+            container(value).width(Length::FillPortion(3))
+        ]
+        .spacing(12),
+    )
+    .padding([5, 8])
+    .width(Length::Fill)
+    .style(theme::fill(stripe))
+    .into()
+}
+
+/// A label column and its value, for the container card's property grid.
+fn prop_row<'a>(label: &'a str, value: El<'a>) -> El<'a> {
+    row![
+        theme::muted(label).width(96),
+        container(value).width(Length::Fill)
+    ]
+    .spacing(12)
+    .into()
+}
+
+/// An image reference with its registry/repository path muted and `name:tag` emphasised.
+/// Click copies the whole reference.
+fn image_label<'a>(image: &str) -> El<'a> {
+    let (path, name) = match image.rfind('/') {
+        Some(i) => (&image[..=i], &image[i + 1..]),
+        None => ("", image),
+    };
+    let mut col = column![].spacing(1);
+    if !path.is_empty() {
+        col = col.push(
+            theme::mono_muted(path.to_string())
+                .size(theme::SMALL)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    col = col.push(theme::mono(name.to_string()).wrapping(text::Wrapping::WordOrGlyph));
+    theme::tip(
+        button(col)
+            .padding(0)
+            .style(theme::link(theme::TEXT))
+            .on_press(Message::Copy(image.to_string())),
+        "Click to copy",
+    )
 }
 
 fn resources_grid<'a>(requests: &[(String, String)], limits: &[(String, String)]) -> El<'a> {
@@ -2356,20 +2454,47 @@ fn resources_grid<'a>(requests: &[(String, String)], limits: &[(String, String)]
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "-".into())
     };
-    let mut col = column![row![
-        Space::new().width(90),
-        theme::faint("Request").width(90),
-        theme::faint("Limit").width(90)
-    ]]
-    .spacing(4);
-    for name in names {
-        col = col.push(row![
-            theme::txt(name.clone()).width(90),
-            theme::mono(find(requests, name)).width(90),
-            theme::mono(find(limits, name)).width(90),
-        ]);
+    let cell = |e: El<'a>| container(e).width(Length::FillPortion(1));
+    let mut col = column![
+        container(
+            row![
+                cell(Space::new().into()),
+                cell(theme::label_small("Request").into()),
+                cell(theme::label_small("Limit").into())
+            ]
+            .spacing(8)
+        )
+        .padding([5, 8])
+        .style(theme::fill(theme::RAISED))
+    ];
+    for (i, name) in names.into_iter().enumerate() {
+        let stripe = if i % 2 == 0 {
+            theme::CONTENT
+        } else {
+            theme::STRIPE
+        };
+        col = col.push(
+            container(
+                row![
+                    cell(theme::txt(name.clone()).into()),
+                    cell(theme::mono(find(requests, name)).into()),
+                    cell(theme::mono(find(limits, name)).into()),
+                ]
+                .spacing(8),
+            )
+            .padding([5, 8])
+            .style(theme::fill(stripe)),
+        );
     }
-    col.into()
+    container(col)
+        .width(Length::Fill)
+        .clip(true)
+        .style(theme::boxed(
+            theme::CONTENT,
+            theme::BORDER,
+            theme::RADIUS_SMALL,
+        ))
+        .into()
 }
 
 fn code_block<'a>(line: String) -> El<'a> {

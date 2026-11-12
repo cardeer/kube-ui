@@ -1,14 +1,16 @@
 //! The YAML editor's pieces on top of iced's `text_editor`: a line-based YAML highlighter
 //! (which also tints find matches), editor keys (auto-indent on Enter, Tab / Shift+Tab
-//! indent by two spaces, Cmd+/ toggles comments, Cmd+S saves), a line-number gutter, and
-//! the find bar (Cmd+F).
+//! indent by two spaces, Cmd+/ toggles comments, Cmd+S saves), a line-number gutter,
+//! indent guides, and the find bar (Cmd+F).
 
 use std::ops::Range;
 
 use iced::{
     Color, Element, Length, Task,
     keyboard::{Key, key::Named},
-    widget::{column, container, operation, rich_text, row, span, text, text_editor, text_input},
+    widget::{
+        canvas, column, container, operation, rich_text, row, span, text, text_editor, text_input,
+    },
 };
 
 use super::{Message, icons as icon, theme};
@@ -569,6 +571,105 @@ pub fn error_line<'a>(line: usize, msg: &'a str) -> Element<'a, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// Indent guides
+// ---------------------------------------------------------------------------
+
+/// Leading-space depth of each line. Blank lines take the shallower of their nearest
+/// non-blank neighbours, so guides run through gaps inside a block but not past its end.
+pub fn indent_depths<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Vec<usize> {
+    let raw: Vec<Option<usize>> = lines
+        .into_iter()
+        .map(|l| {
+            let l = l.as_ref();
+            let depth = l.len() - l.trim_start_matches(' ').len();
+            (!l.trim().is_empty()).then_some(depth)
+        })
+        .collect();
+    let mut next = vec![0; raw.len()];
+    let mut below = 0;
+    for (i, d) in raw.iter().enumerate().rev() {
+        next[i] = below;
+        if let Some(d) = d {
+            below = *d;
+        }
+    }
+    let mut above = 0;
+    raw.iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            Some(d) => {
+                above = *d;
+                *d
+            }
+            None => above.min(next[i]),
+        })
+        .collect()
+}
+
+/// Vertical lines at each indent level, drawn on a canvas behind the (transparent) editor.
+/// The innermost guide around the cursor is drawn brighter.
+pub struct IndentGuides {
+    pub depths: Vec<usize>,
+    pub cursor_line: Option<usize>,
+}
+
+impl<M> canvas::Program<M> for IndentGuides {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let levels = self
+            .depths
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .div_ceil(INDENT);
+        let active = self.cursor_line.and_then(|line| {
+            let depth = *self.depths.get(line)?;
+            (depth > 0).then(|| ((depth - 1) / INDENT, line))
+        });
+        let n = self.depths.len();
+        for level in 0..levels {
+            let col = level * INDENT;
+            let x = (EDITOR_PAD + col as f32 * CHAR_WIDTH).round() + 0.5;
+            let mut start = None;
+            for i in 0..=n {
+                let inside = i < n && self.depths[i] > col;
+                match (inside, start) {
+                    (true, None) => start = Some(i),
+                    (false, Some(s)) => {
+                        let lit =
+                            matches!(active, Some((l, c)) if l == level && (s..i).contains(&c));
+                        let color = if lit {
+                            theme::alpha(theme::TEXT_FAINT, 0.7)
+                        } else {
+                            theme::BORDER_STRONG
+                        };
+                        let top = EDITOR_PAD + s as f32 * LINE_HEIGHT;
+                        let bottom = EDITOR_PAD + i as f32 * LINE_HEIGHT;
+                        frame.stroke(
+                            &canvas::Path::line([x, top].into(), [x, bottom].into()),
+                            canvas::Stroke::default().with_color(color).with_width(1.0),
+                        );
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Syntax colours (a line-based YAML tokenizer; good enough for Kubernetes objects)
 // ---------------------------------------------------------------------------
 
@@ -740,6 +841,12 @@ fn push_value(push: &mut impl FnMut(usize, usize, Color), at: usize, value: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indent_depths_bridge_blank_lines() {
+        let d = indent_depths("a:\n  b:\n    c: 1\n\n    d: 2\n\ne: 3\n".split('\n'));
+        assert_eq!(d, vec![0, 2, 4, 4, 4, 0, 0, 0]);
+    }
 
     #[test]
     fn enter_keeps_and_deepens_indent() {
