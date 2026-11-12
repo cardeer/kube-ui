@@ -568,7 +568,7 @@ impl LogView {
         if self.follow && self.at_bottom && new_lines {
             // Scrolling by operation reports no scroll event, so track the offset here.
             self.offset = self.end_offset();
-            return operation::snap_to_end(self.scroll_id.clone());
+            return self.snap_to_bottom();
         }
         Task::none()
     }
@@ -662,6 +662,17 @@ impl LogView {
         };
     }
 
+    /// Scrolls to the last line, leaving the sideways position where the user put it.
+    fn snap_to_bottom(&self) -> Task<Message> {
+        operation::snap_to(
+            self.scroll_id.clone(),
+            operation::RelativeOffset {
+                x: None,
+                y: Some(1.0),
+            },
+        )
+    }
+
     /// The scroll offset of the last line (the banner row counts too).
     fn end_offset(&self) -> f32 {
         let view_h = if self.view_h > 0.0 {
@@ -724,7 +735,7 @@ impl LogView {
                 if self.follow {
                     self.at_bottom = true;
                     self.offset = self.end_offset();
-                    return operation::snap_to_end(self.scroll_id.clone());
+                    return self.snap_to_bottom();
                 }
             }
             LogMsg::SetPrevious(previous) => {
