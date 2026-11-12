@@ -1,31 +1,39 @@
 mod changelog;
 mod code_editor;
 mod filter;
+mod icons;
 mod logs;
 #[cfg(target_os = "macos")]
 mod menu;
 mod shell;
+mod table;
 mod theme;
 mod update;
+mod view;
 mod workspace;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
 };
 
-use eframe::egui::{self, Align2, Color32, PopupCloseBehavior, RichText, Sense};
-use egui_extras::{Column, TableBuilder};
-use egui_phosphor::regular as icon;
+use iced::{
+    Color, Point, Rectangle, Size, Subscription, Task,
+    keyboard::{self, Key, key::Named},
+    mouse,
+    widget::{self, operation, text_editor},
+    window,
+};
 use kube::Client;
 use tokio::{
     runtime::{Handle, Runtime},
+    sync::Notify,
     task::JoinHandle,
 };
 
@@ -37,6 +45,7 @@ use crate::{
     },
     settings::{LogPanelMode, SavedForward, SavedSort, SavedWorkspace, Settings},
 };
+use icons as icon;
 use logs::{LogTarget, LogView};
 use shell::ShellView;
 use workspace::Workspace;
@@ -52,20 +61,20 @@ const ROW_HEIGHT: f32 = 30.0;
 const NAV_WIDTH: f32 = 224.0;
 const LOG_MIN_HEIGHT: f32 = 160.0;
 /// Height of the log panel when collapsed to its tab strip.
-/// Just the tab strip: a 32px tab (24px close button, 3px padding and a hairline each side)
-/// between 6px margins.
 const LOG_COLLAPSED_HEIGHT: f32 = 44.0;
+const DRAWER_MIN_WIDTH: f32 = 340.0;
+pub const MIN_WINDOW_SIZE: Size = Size::new(1120.0, 600.0);
 
-const GREEN: Color32 = theme::OK;
-const YELLOW: Color32 = theme::WARN;
-const RED: Color32 = theme::BAD;
+const GREEN: Color = theme::OK;
+const YELLOW: Color = theme::WARN;
+const RED: Color = theme::BAD;
 
 fn err_string(e: anyhow::Error) -> String {
     kube_ops::describe_error(&e)
 }
 
 // ---------------------------------------------------------------------------
-// Messages from background tasks to the UI thread
+// Messages from background tasks
 // ---------------------------------------------------------------------------
 
 enum ListData {
@@ -86,7 +95,8 @@ const WORKLOAD_KINDS: [Kind; 6] = [
     Kind::CronJob,
 ];
 
-/// `ws` is the cluster tab a message belongs to; `id` is a log tab's stream id.
+/// Results from background tasks. `ws` is the cluster tab a message belongs to; `id` is a
+/// log tab's stream id. They travel over [`Bus`] and are drained on [`Message::Wake`].
 enum Msg {
     Connected {
         ws: u64,
@@ -169,6 +179,8 @@ enum Msg {
         result: Result<String, String>,
         manual: bool,
     },
+    /// The installer finished without quitting us.
+    UpdateInstalled(Result<(), String>),
     ShellOutput {
         id: u64,
         data: Vec<u8>,
@@ -208,18 +220,28 @@ impl Msg {
     }
 }
 
-/// Sender that also wakes the UI so messages are handled promptly.
+/// Wakes the UI when the bus has messages. Notifications coalesce, so a burst of log
+/// lines is drained in one update.
+static WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// Sender for background results; also wakes the UI so they're handled promptly.
 #[derive(Clone)]
 struct Bus {
     tx: Sender<Msg>,
-    ctx: egui::Context,
 }
 
 impl Bus {
     fn send(&self, msg: Msg) {
         let _ = self.tx.send(msg);
-        self.ctx.request_repaint();
+        WAKE.notify_one();
     }
+}
+
+fn wake_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::futures::stream::unfold((), |()| async {
+        WAKE.notified().await;
+        Some((Message::Wake, ()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +249,7 @@ impl Bus {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Tab {
+pub enum Tab {
     Overview,
     Pods,
     Services,
@@ -271,16 +293,7 @@ impl Tab {
             k => Tab::Workload(k),
         }
     }
-}
 
-enum Conn {
-    Idle,
-    Connecting,
-    Ready(Clients),
-    Failed(String),
-}
-
-impl Tab {
     /// Key used when saving per-page state such as filters.
     fn key(self) -> &'static str {
         match self {
@@ -315,8 +328,15 @@ impl Tab {
     }
 }
 
+enum Conn {
+    Idle,
+    Connecting,
+    Ready(Clients),
+    Failed(String),
+}
+
 impl Conn {
-    fn status(&self) -> (Color32, &'static str) {
+    fn status(&self) -> (Color, &'static str) {
         match self {
             Conn::Ready(_) => (GREEN, "Connected"),
             Conn::Connecting => (YELLOW, "Connecting…"),
@@ -345,15 +365,15 @@ impl<T> Default for ListState<T> {
 }
 
 /// The resource shown in the detail drawer.
-#[derive(Clone, PartialEq)]
-struct Selected {
+#[derive(Clone, PartialEq, Debug)]
+pub struct Selected {
     kind: Kind,
     namespace: String,
     name: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DrawerTab {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DrawerTab {
     Overview,
     Containers,
     Volumes,
@@ -368,7 +388,7 @@ struct DetailsState {
     loading: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Older {
     Idle,
     Loading,
@@ -384,16 +404,18 @@ struct YamlView {
     namespace: String,
     name: String,
     text: Option<Result<String, String>>,
-    /// The edit buffer while editing.
-    edit: Option<String>,
+    /// The editor's document: the YAML being viewed, or the edit buffer while editing.
+    content: text_editor::Content,
+    /// Editing (vs. viewing).
+    editing: bool,
+    /// The buffer differs from the fetched YAML (always true when creating).
+    dirty: bool,
     /// Open straight into editing once the YAML arrives.
     edit_on_load: bool,
     saving: bool,
     save_error: Option<String>,
     /// Live YAML check of the edit buffer: (1-based line, message).
     parse_error: Option<(usize, String)>,
-    /// Editing just began: focus the editor with the cursor at the top.
-    edit_started: bool,
     /// A new object (Apply creates it) rather than an existing one.
     create: bool,
 }
@@ -424,6 +446,9 @@ struct PfDialog {
     ports: Vec<u16>,
     remote_port: u16,
     local_port: u16,
+    /// What's typed in the two port fields (may be mid-edit).
+    remote_text: String,
+    local_text: String,
 }
 
 struct Toast {
@@ -432,9 +457,9 @@ struct Toast {
     at: Instant,
 }
 
-/// Things the user clicked while rendering; applied after rendering to keep borrows simple.
-/// Resource actions apply to the active cluster tab.
-enum Action {
+/// Something the user asked for on a resource. Applies to the active cluster tab.
+#[derive(Clone)]
+pub enum Action {
     Select(Selected),
     GoToPod(String, String),
     RevealSecret(String, String),
@@ -473,11 +498,150 @@ enum Action {
     RemoveForward(u64),
 }
 
+/// The dropdowns and menus that float over the window.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PopupKind {
+    /// "+": open any context of any known kubeconfig in a new tab.
+    NewTab,
+    /// The "+" menu's submenu for one kubeconfig.
+    NewTabContexts(PathBuf),
+    Kubeconfig,
+    Context,
+    Namespace,
+    /// The drawer's "⋯" menu (its items depend on the selected resource).
+    Drawer,
+    /// The drawer's Shell menu, for pods with several containers.
+    ShellContainers,
+    /// A port forward row's "⋯" menu.
+    Forward(u64),
+    /// A log tab's "Initial lines" picker.
+    LogTail(usize),
+    /// A log tab's container picker.
+    LogContainer(usize),
+}
+
+struct Popup {
+    kind: PopupKind,
+    /// Where the trigger is; the popup opens below it.
+    anchor: Rectangle,
+    /// Search text, for the searchable pickers.
+    query: String,
+}
+
+/// An edge being dragged to resize a panel.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Drag {
+    Drawer,
+    Dock,
+}
+
+/// Messages from the UI.
+#[derive(Clone)]
+pub enum Message {
+    /// Background results are waiting on the bus.
+    Wake,
+    Tick,
+    WindowOpened(window::Id),
+    WindowResized(Size),
+    CloseRequested,
+    CursorMoved(Point),
+    MouseReleased,
+    /// A key nobody else handled: the key, its Latin letter (layout-independent), modifiers.
+    Key(Key, Option<char>, keyboard::Modifiers),
+    Screenshot(window::Screenshot),
+
+    // Cluster tabs and pickers
+    ActivateWorkspace(usize),
+    CloseWorkspace(usize),
+    AddWorkspace(PathBuf, Option<String>),
+    BrowseNewTab,
+    UseKubeconfig(PathBuf),
+    BrowseKubeconfig,
+    SwitchContext(String),
+    SetNamespaces(Vec<String>),
+    /// Set the namespaces and close the picker.
+    PickNamespaces(Vec<String>),
+    Refresh,
+    RemoveKubeconfig(PathBuf),
+
+    // Popups
+    OpenPopup(PopupKind, widget::Id),
+    PopupAnchored(PopupKind, Rectangle),
+    ClosePopup,
+    /// Unfold one kubeconfig's contexts in the "+" menu.
+    NewTabExpand(PathBuf),
+    PopupQuery(String),
+    PopupSubmit,
+
+    // Navigation and lists
+    SetTab(Tab),
+    ToggleNavGroup(&'static str),
+    Filter(String),
+    ToggleRegex,
+    ClearFilter,
+    Sort(Tab, String),
+    ListScrolled(f32),
+    RowHover(Option<usize>),
+    RowLeave(usize),
+    Action(Action),
+
+    // Drawer
+    DrawerTab(DrawerTab),
+    CloseDrawer,
+    EnvFilter(String),
+    ToggleSection(String),
+    DragStart(Drag),
+
+    // Generic
+    Copy(String),
+    OpenUrl(String),
+    Noop,
+
+    // Updates and "What's new"
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    CheckUpdates,
+    StartUpdate(String),
+    Relaunch,
+    ShowChangelog(bool),
+    ToggleLive,
+
+    // Bottom dock: logs and shells
+    DockSelect(usize),
+    DockClose(usize),
+    DockCloseAll,
+    SetLogMode(LogPanelMode),
+    ToggleSplit,
+    Log(usize, logs::LogMsg),
+    Shell(u64, shell::ShellMsg),
+
+    // YAML window
+    YamlAction(text_editor::Action),
+    YamlEdit,
+    YamlApply,
+    YamlCancel,
+    YamlReload,
+    YamlClose,
+    YamlIndent(bool),
+    YamlComment,
+    YamlEnter,
+    Find(code_editor::FindMsg),
+
+    // Dialogs
+    PfRemote(String),
+    PfLocal(String),
+    PfStart,
+    PfCancel,
+    ConfirmDelete(bool),
+}
+
 pub struct App {
     rt: Runtime,
     bus: Bus,
     rx: Receiver<Msg>,
     settings: Settings,
+    window: Option<window::Id>,
+    window_size: Size,
+    cursor: Point,
 
     /// Cluster tabs. Empty means the welcome screen.
     workspaces: Vec<Workspace>,
@@ -493,27 +657,30 @@ pub struct App {
     split_shell: usize,
     yaml: Option<YamlView>,
     /// Find bar of the YAML window (kept across windows so the last query is remembered).
-    yaml_find: code_editor::Find,
+    find: code_editor::Find,
     forwards: Vec<Forward>,
     pf_dialog: Option<PfDialog>,
-    /// (cluster tab, namespace, pod)
+    /// (cluster tab, kind, namespace, name)
     confirm_delete: Option<(u64, Kind, String, String)>,
     toasts: Vec<Toast>,
     update: update::UpdateState,
     /// Outcome of a running installer (normally it quits and reopens the app before reporting).
-    update_result: Option<Receiver<Result<(), String>>>,
-    /// The "What's new" window is showing.
     changelog_open: bool,
+    popup: Option<Popup>,
+    drag: Option<Drag>,
+    drawer_width: f32,
+    /// The pointer is over this row of the current list.
+    hovered_row: Option<usize>,
+    /// The env search in the drawer (shared by every container).
+    env_filter: String,
+    /// Collapsible drawer sections whose state differs from their default.
+    toggled_sections: HashSet<String>,
     /// The native menu bar; kept so its items stay alive.
     #[cfg(target_os = "macos")]
     _menu_bar: Option<menu::MenuBar>,
-    /// Open the "+" new-tab menu on the next frame (File › New Tab).
-    open_new_tab_menu: bool,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
-    /// The user is dragging the log panel's edge.
-    log_resizing: bool,
     /// Development aid: `KUBE_UI_SCREENSHOT=<file.png>` captures the window once and quits.
     /// With `KUBE_UI_SCREENSHOT_TAB=<page key>` (e.g. `overview`, `jobs`) it shows that page
     /// instead of a pod with its logs; `KUBE_UI_SCREENSHOT_SELECT=1` also opens the first row,
@@ -541,23 +708,27 @@ struct DevScreenshot {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = cc.egui_ctx.clone();
-        ctx.set_theme(egui::Theme::Dark);
-        theme::install(&ctx);
-
+    pub fn new() -> (Self, Task<Message>) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("failed to start tokio runtime");
         let (tx, rx) = mpsc::channel();
+        let settings = Settings::load();
+        let window_size = settings
+            .window_size
+            .map(|[w, h]| Size::new(w, h))
+            .unwrap_or(Size::new(1360.0, 860.0));
 
         let mut app = Self {
             rt,
-            bus: Bus { tx, ctx },
+            bus: Bus { tx },
             rx,
-            settings: Settings::load(),
+            settings,
+            window: None,
+            window_size,
+            cursor: Point::ORIGIN,
             workspaces: Vec::new(),
             active: 0,
             logs: Vec::new(),
@@ -566,20 +737,23 @@ impl App {
             split_log: 0,
             split_shell: 0,
             yaml: None,
-            yaml_find: code_editor::Find::default(),
+            find: code_editor::Find::default(),
             forwards: Vec::new(),
             pf_dialog: None,
             confirm_delete: None,
             toasts: Vec::new(),
             update: update::UpdateState::Idle,
-            update_result: None,
             changelog_open: false,
+            popup: None,
+            drag: None,
+            drawer_width: 460.0,
+            hovered_row: None,
+            env_filter: String::new(),
+            toggled_sections: HashSet::new(),
             #[cfg(target_os = "macos")]
             _menu_bar: None,
-            open_new_tab_menu: false,
             next_id: 1,
             window_dirty: None,
-            log_resizing: false,
             screenshot: std::env::var_os("KUBE_UI_SCREENSHOT").map(|p| DevScreenshot {
                 path: PathBuf::from(p),
                 started: Instant::now(),
@@ -651,13 +825,10 @@ impl App {
                         ))
                     })
                     .collect();
+                ws.update_matcher();
             }
         }
         app.active = active.min(app.workspaces.len().saturating_sub(1));
-        #[cfg(target_os = "macos")]
-        {
-            app._menu_bar = menu::MenuBar::install(app.bus.clone());
-        }
 
         // Bring back saved forwards; resume the ones that were running when the app closed.
         for spec in app.settings.forwards.clone() {
@@ -673,15 +844,548 @@ impl App {
             Err(_) if app.screenshot.is_none() => app.check_for_updates(false),
             Err(_) => {}
         }
-        app
+        app.sync();
+        (app, Task::none())
+    }
+
+    pub fn title(&self) -> String {
+        "Kube UI".into()
+    }
+
+    pub fn theme(&self) -> iced::Theme {
+        theme::theme()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![
+            Subscription::run(wake_stream),
+            window::open_events().map(Message::WindowOpened),
+            window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            window::close_requests().map(|_| Message::CloseRequested),
+            keyboard::listen().filter_map(|e| match e {
+                keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                } => {
+                    let latin = key.to_latin(physical_key);
+                    Some(Message::Key(key, latin, modifiers))
+                }
+                _ => None,
+            }),
+            iced::time::every(if self.screenshot.is_some() {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            })
+            .map(|_| Message::Tick),
+        ];
+        // Pointer tracking: anchors fallbacks for popups and drives panel resizing.
+        subs.push(iced::event::listen_with(
+            |event, _status, _window| match event {
+                iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position))
+                }
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::MouseReleased)
+                }
+                _ => None,
+            },
+        ));
+        Subscription::batch(subs)
     }
 
     // -----------------------------------------------------------------------
-    // Updates
+    // Update
+    // -----------------------------------------------------------------------
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        self.sync();
+        task
+    }
+
+    /// Keeps background state in line with what's on screen after every message: only the
+    /// front tab watches its list, and open tabs are saved when they change.
+    fn sync(&mut self) {
+        if self.workspaces.is_empty() {
+            self.save_workspaces();
+            return;
+        }
+        self.active = self.active.min(self.workspaces.len() - 1);
+        let live = self.settings.live_updates;
+        let active = self.active;
+        for (i, ws) in self.workspaces.iter_mut().enumerate() {
+            if i == active {
+                ws.sync_watch(live);
+            } else {
+                ws.pause_watch();
+            }
+        }
+        self.save_workspaces();
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Wake => return self.handle_messages(),
+            Message::Tick => return self.tick(),
+            Message::WindowOpened(id) => {
+                self.window = Some(id);
+                #[cfg(target_os = "macos")]
+                {
+                    // Installed once the app has launched, replacing winit's default menu.
+                    if self._menu_bar.is_none() {
+                        self._menu_bar = menu::MenuBar::install(self.bus.clone());
+                    }
+                }
+            }
+            Message::WindowResized(size) => {
+                self.window_size = size;
+                self.track_window();
+            }
+            Message::CloseRequested => return self.quit(),
+            Message::CursorMoved(p) => {
+                self.cursor = p;
+                if let Some(drag) = self.drag {
+                    self.drag_to(drag, p);
+                }
+            }
+            Message::MouseReleased => {
+                if self.drag.take() == Some(Drag::Dock) {
+                    self.settings.save();
+                }
+            }
+            Message::Key(key, latin, modifiers) => return self.key(key, latin, modifiers),
+            Message::Screenshot(shot) => self.save_screenshot(shot),
+
+            Message::ActivateWorkspace(i) => self.activate_workspace(i),
+            Message::CloseWorkspace(i) => self.close_workspace(i),
+            Message::AddWorkspace(path, context) => {
+                self.popup = None;
+                self.add_workspace(path, context, None);
+            }
+            Message::BrowseNewTab => {
+                self.popup = None;
+                if let Some(path) = pick_kubeconfig() {
+                    self.add_workspace(path, None, None);
+                }
+            }
+            Message::UseKubeconfig(path) => {
+                self.popup = None;
+                if let Some(ws) = self.workspaces.get_mut(self.active) {
+                    if ws.kubeconfig_path != path {
+                        ws.load_kubeconfig(path, None, &mut self.settings);
+                    }
+                }
+            }
+            Message::BrowseKubeconfig => {
+                self.popup = None;
+                if let Some(path) = pick_kubeconfig() {
+                    return self.handle(Message::UseKubeconfig(path));
+                }
+            }
+            Message::SwitchContext(c) => {
+                self.popup = None;
+                if let Some(ws) = self.workspaces.get_mut(self.active) {
+                    if ws.context.as_ref() != Some(&c) {
+                        ws.switch_context(c, &mut self.settings);
+                    }
+                }
+            }
+            Message::SetNamespaces(selection) => {
+                if let Some(ws) = self.workspaces.get_mut(self.active) {
+                    ws.set_namespaces(selection, &mut self.settings);
+                }
+            }
+            Message::PickNamespaces(selection) => {
+                self.popup = None;
+                return self.handle(Message::SetNamespaces(selection));
+            }
+            Message::Refresh => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.refresh();
+                }
+            }
+            Message::RemoveKubeconfig(p) => {
+                // Forget the file; tabs already using it stay open until closed.
+                self.settings.kubeconfigs.retain(|k| k != &p);
+                self.settings.save();
+            }
+
+            Message::OpenPopup(kind, id) => {
+                if self.popup.as_ref().is_some_and(|p| p.kind == kind) {
+                    self.popup = None;
+                    return Task::none();
+                }
+                // A submenu stays inside its parent's popup; anything else replaces it.
+                let anchor = Rectangle::new(self.cursor, Size::new(1.0, 1.0));
+                self.popup = Some(Popup {
+                    kind: kind.clone(),
+                    anchor,
+                    query: String::new(),
+                });
+                let find = widget::selector::find(id).map(move |target| match target {
+                    Some(t) => Message::PopupAnchored(kind.clone(), t.bounds()),
+                    None => Message::Noop,
+                });
+                return Task::batch([find, operation::focus(view::POPUP_SEARCH)]);
+            }
+            Message::PopupAnchored(kind, bounds) => {
+                if let Some(p) = self.popup.as_mut().filter(|p| p.kind == kind) {
+                    p.anchor = bounds;
+                }
+            }
+            Message::ClosePopup => self.popup = None,
+            Message::NewTabExpand(path) => {
+                if let Some(p) = self.popup.as_mut() {
+                    p.kind = if p.kind == PopupKind::NewTabContexts(path.clone()) {
+                        PopupKind::NewTab
+                    } else {
+                        PopupKind::NewTabContexts(path)
+                    };
+                }
+            }
+            Message::PopupQuery(q) => {
+                if let Some(p) = self.popup.as_mut() {
+                    p.query = q;
+                }
+            }
+            Message::PopupSubmit => return self.popup_submit(),
+
+            Message::SetTab(tab) => {
+                self.popup = None;
+                if let Some(ws) = self.ws_mut() {
+                    ws.set_tab(tab);
+                }
+                self.hovered_row = None;
+            }
+            Message::ToggleNavGroup(key) => {
+                let collapsed = &mut self.settings.nav_collapsed;
+                if collapsed.iter().any(|c| c == key) {
+                    collapsed.retain(|c| c != key);
+                } else {
+                    collapsed.push(key.to_string());
+                }
+                self.settings.save();
+            }
+            Message::Filter(text) => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.set_filter(text);
+                }
+            }
+            Message::ToggleRegex => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.filter_regex = !ws.filter_regex;
+                    ws.update_matcher();
+                }
+            }
+            Message::ClearFilter => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.set_filter(String::new());
+                }
+            }
+            Message::Sort(tab, col) => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.toggle_sort(tab, col);
+                }
+            }
+            Message::ListScrolled(y) => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.list_scroll = y;
+                }
+            }
+            Message::RowHover(row) => self.hovered_row = row,
+            Message::RowLeave(row) => {
+                if self.hovered_row == Some(row) {
+                    self.hovered_row = None;
+                }
+            }
+            Message::Action(action) => {
+                self.popup = None;
+                return self.apply(action);
+            }
+
+            Message::DrawerTab(tab) => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.drawer_tab = tab;
+                }
+            }
+            Message::CloseDrawer => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.close_drawer();
+                }
+            }
+            Message::EnvFilter(f) => self.env_filter = f,
+            Message::ToggleSection(key) => {
+                if !self.toggled_sections.remove(&key) {
+                    self.toggled_sections.insert(key);
+                }
+            }
+            Message::DragStart(drag) => self.drag = Some(drag),
+
+            Message::Copy(text) => return iced::clipboard::write(text),
+            Message::OpenUrl(url) => {
+                self.popup = None;
+                open_url(&url);
+            }
+            Message::Noop => {}
+
+            Message::CheckUpdates => self.check_for_updates(true),
+            Message::StartUpdate(tag) => self.start_update(tag),
+            Message::Relaunch => {
+                if update::relaunch() {
+                    return self.quit();
+                }
+                self.toast("Quit and reopen Kube UI to use the new version.", false);
+            }
+            Message::ShowChangelog(open) => self.changelog_open = open,
+            Message::ToggleLive => {
+                self.settings.live_updates = !self.settings.live_updates;
+                self.settings.save();
+            }
+
+            Message::DockSelect(i) => {
+                self.active_log = i;
+                self.show_logs();
+            }
+            Message::DockClose(i) => self.close_dock_tab(i),
+            Message::DockCloseAll => {
+                self.logs.clear();
+                self.shells.clear();
+            }
+            Message::SetLogMode(mode) => self.set_log_mode(mode),
+            Message::ToggleSplit => {
+                self.settings.log_split = !self.settings.log_split;
+                self.settings.save();
+            }
+            Message::Log(i, msg) => return self.log_message(i, msg),
+            Message::Shell(id, msg) => return self.shell_message(id, msg),
+
+            Message::YamlAction(action) => self.yaml_action(action),
+            Message::YamlEdit => {
+                if let Some(y) = self.yaml.as_mut() {
+                    y.editing = true;
+                    y.content.move_to(text_editor::Cursor {
+                        position: text_editor::Position { line: 0, column: 0 },
+                        selection: None,
+                    });
+                    return operation::focus(view::YAML_EDITOR);
+                }
+            }
+            Message::YamlApply => self.yaml_apply(),
+            Message::YamlCancel => {
+                if let Some(y) = self.yaml.as_mut() {
+                    if y.create {
+                        self.yaml = None;
+                    } else {
+                        y.editing = false;
+                        y.dirty = false;
+                        y.save_error = None;
+                        y.parse_error = None;
+                        if let Some(Ok(t)) = &y.text {
+                            y.content = text_editor::Content::with_text(t);
+                        }
+                    }
+                }
+            }
+            Message::YamlReload => {
+                if let Some(y) = &self.yaml {
+                    let (kind, ns, name, editing) =
+                        (y.kind, y.namespace.clone(), y.name.clone(), y.editing);
+                    self.open_yaml(kind, ns, name);
+                    if let Some(y) = self.yaml.as_mut() {
+                        y.edit_on_load = editing;
+                    }
+                }
+            }
+            Message::YamlClose => self.yaml = None,
+            Message::YamlIndent(outdent) => {
+                self.yaml_edit_with(|text, range| code_editor::indent_lines(text, range, outdent))
+            }
+            Message::YamlComment => self.yaml_edit_with(code_editor::toggle_comment),
+            Message::YamlEnter => self.yaml_enter(),
+            Message::Find(msg) => return self.find_message(msg),
+
+            Message::PfRemote(text) => {
+                if let Some(d) = self.pf_dialog.as_mut() {
+                    if let Ok(p) = text.parse::<u16>() {
+                        d.remote_port = p.max(1);
+                    }
+                    d.remote_text = text;
+                }
+            }
+            Message::PfLocal(text) => {
+                if let Some(d) = self.pf_dialog.as_mut() {
+                    if let Ok(p) = text.parse::<u16>() {
+                        d.local_port = p;
+                    } else if text.is_empty() {
+                        d.local_port = 0;
+                    }
+                    d.local_text = text;
+                }
+            }
+            Message::PfStart => {
+                if let Some(d) = self.pf_dialog.take() {
+                    let id = self.add_forward(SavedForward {
+                        kubeconfig: d.kubeconfig,
+                        context: d.context,
+                        namespace: d.namespace,
+                        target: d.target,
+                        remote_port: d.remote_port,
+                        local_port: d.local_port,
+                        active: false,
+                    });
+                    self.start_forward(id);
+                    if let Some(ws) = self.ws_mut() {
+                        ws.set_tab(Tab::Forwards);
+                    }
+                }
+            }
+            Message::PfCancel => self.pf_dialog = None,
+            Message::ConfirmDelete(yes) => {
+                if let Some((ws, kind, ns, name)) = self.confirm_delete.take() {
+                    if yes {
+                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws) {
+                            w.close_drawer();
+                        }
+                        self.run_change(
+                            Some(ws),
+                            format!("Deleted {} {name}", kind.label().to_lowercase()),
+                            move |c| kube_ops::delete(c, kind, ns, name),
+                        );
+                    }
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn quit(&mut self) -> Task<Message> {
+        if self.window_dirty.take().is_some() {
+            self.settings.save();
+        }
+        iced::exit()
+    }
+
+    /// Once a second (every 100ms while taking a dev screenshot): expire toasts, refresh
+    /// the open drawer, flush the window size.
+    fn tick(&mut self) -> Task<Message> {
+        self.toasts.retain(|t| t.at.elapsed() < TOAST_FOR);
+        if self.settings.live_updates {
+            if let Some(ws) = self.ws_mut().filter(|ws| ws.client().is_some()) {
+                ws.poll_details(DETAILS_EVERY);
+            }
+        }
+        if self
+            .window_dirty
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.window_dirty = None;
+            self.settings.save();
+        }
+        self.dev_screenshot()
+    }
+
+    /// Remembers the window size. Writes wait until resizing has paused for a second (and
+    /// happen on exit), so dragging the window edge doesn't hit the disk on every step.
+    /// (Not the maximized state: macOS reports any window that fills the screen as maximized.)
+    fn track_window(&mut self) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        let size = self.window_size;
+        let changed = self
+            .settings
+            .window_size
+            .is_none_or(|[w, h]| (w - size.width).abs() > 1.0 || (h - size.height).abs() > 1.0);
+        if changed {
+            self.settings.window_size = Some([size.width, size.height]);
+            self.window_dirty = Some(Instant::now());
+        }
+    }
+
+    fn drag_to(&mut self, drag: Drag, p: Point) {
+        match drag {
+            Drag::Drawer => {
+                let max = (self.window_size.width - NAV_WIDTH - 360.0).max(DRAWER_MIN_WIDTH);
+                self.drawer_width = (self.window_size.width - p.x).clamp(DRAWER_MIN_WIDTH, max);
+            }
+            Drag::Dock => {
+                let max = self.dock_max_height();
+                self.settings.log_height =
+                    (self.window_size.height - p.y).clamp(LOG_MIN_HEIGHT, max);
+            }
+        }
+    }
+
+    /// Leave room for the top bar and a bit of the page when the dock is expanded.
+    fn dock_max_height(&self) -> f32 {
+        (self.window_size.height - 180.0).max(LOG_MIN_HEIGHT)
+    }
+
+    fn key(&mut self, key: Key, latin: Option<char>, m: keyboard::Modifiers) -> Task<Message> {
+        if self.screenshot.is_some() {
+            return Task::none();
+        }
+        if let Key::Named(Named::Escape) = key {
+            if self.popup.take().is_some() {
+                return Task::none();
+            }
+            if self.yaml.is_some() && self.find.open {
+                return self.find_message(code_editor::FindMsg::Close);
+            }
+            if self.pf_dialog.take().is_some() || self.confirm_delete.take().is_some() {
+                return Task::none();
+            }
+            if self.yaml.is_some() || self.changelog_open {
+                return Task::none();
+            }
+            if let Some(ws) = self.ws_mut() {
+                ws.close_drawer();
+            }
+            return Task::none();
+        }
+        if !m.command() {
+            return Task::none();
+        }
+        let Some(c) = latin else {
+            return Task::none();
+        };
+        match c {
+            // ⌘1…⌘8 pick a cluster tab and ⌘9 the last one, as in browsers.
+            '1'..='9' if !m.alt() => {
+                let i = c as usize - '1' as usize;
+                if i == 8 {
+                    self.activate_workspace(self.workspaces.len().saturating_sub(1));
+                } else {
+                    self.activate_workspace(i);
+                }
+            }
+            'f' if self.yaml.is_some() => return self.find_message(code_editor::FindMsg::Open),
+            'g' if self.yaml.is_some() && self.find.open => {
+                return self.find_message(code_editor::FindMsg::Step(m.shift()));
+            }
+            's' if self.yaml.as_ref().is_some_and(|y| y.editing) => self.yaml_apply(),
+            #[cfg(not(target_os = "macos"))]
+            'w' => self.close_frontmost(),
+            #[cfg(not(target_os = "macos"))]
+            'r' => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.refresh();
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    // -----------------------------------------------------------------------
+    // Menu bar
     // -----------------------------------------------------------------------
 
     #[cfg(target_os = "macos")]
-    fn menu_command(&mut self, cmd: menu::MenuCommand) {
+    fn menu_command(&mut self, cmd: menu::MenuCommand) -> Task<Message> {
         use menu::MenuCommand;
         match cmd {
             MenuCommand::CheckForUpdates => match &self.update {
@@ -700,8 +1404,13 @@ impl App {
                 Some(ws) => ws.set_tab(Tab::Settings),
                 None => self.toast("Add a cluster to open Settings.", false),
             },
-            MenuCommand::Quit => self.bus.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            MenuCommand::NewTab if !self.workspaces.is_empty() => self.open_new_tab_menu = true,
+            MenuCommand::Quit => return self.quit(),
+            MenuCommand::NewTab if !self.workspaces.is_empty() => {
+                return self.handle(Message::OpenPopup(
+                    PopupKind::NewTab,
+                    widget::Id::new(view::NEW_TAB_BUTTON),
+                ));
+            }
             MenuCommand::NewTab | MenuCommand::OpenKubeconfig => {
                 if let Some(path) = pick_kubeconfig() {
                     self.add_workspace(path, None, None);
@@ -729,10 +1438,7 @@ impl App {
             }
             MenuCommand::NextTab => self.cycle_workspace(1),
             MenuCommand::PreviousTab => self.cycle_workspace(-1),
-            MenuCommand::OpenGitHub => self.bus.ctx.open_url(egui::OpenUrl::new_tab(format!(
-                "https://github.com/{}",
-                update::REPO
-            ))),
+            MenuCommand::OpenGitHub => open_url(&format!("https://github.com/{}", update::REPO)),
             MenuCommand::OpenUpdateLog => {
                 let path = update::log_path();
                 if !path.exists() {
@@ -746,15 +1452,14 @@ impl App {
                 }
             }
         }
+        Task::none()
     }
 
     /// ⌘W: closes the innermost thing showing: the YAML window, "What's new", the detail
     /// drawer, then the cluster tab (never the last one).
-    #[cfg(target_os = "macos")]
     fn close_frontmost(&mut self) {
         if let Some(y) = &self.yaml {
-            let dirty = y.create || matches!((&y.edit, &y.text), (Some(e), Some(Ok(t))) if e != t);
-            if dirty {
+            if y.editing && y.dirty {
                 self.toast(
                     "This YAML has unapplied changes. Apply them or close the window with ×.",
                     false,
@@ -780,29 +1485,9 @@ impl App {
         }
     }
 
-    /// ⌘1…⌘8 pick a cluster tab and ⌘9 the last one, as in browsers.
-    fn tab_number_shortcuts(&mut self, ctx: &egui::Context) {
-        const KEYS: [egui::Key; 9] = [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-            egui::Key::Num6,
-            egui::Key::Num7,
-            egui::Key::Num8,
-            egui::Key::Num9,
-        ];
-        let pressed = ctx.input_mut(|i| {
-            KEYS.iter()
-                .position(|k| i.consume_key(egui::Modifiers::COMMAND, *k))
-        });
-        match pressed {
-            Some(8) => self.activate_workspace(self.workspaces.len().saturating_sub(1)),
-            Some(i) => self.activate_workspace(i),
-            None => {}
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------------
 
     fn check_for_updates(&mut self, manual: bool) {
         if matches!(
@@ -835,11 +1520,9 @@ impl App {
             Err(e) => {
                 if manual {
                     self.toast(format!("Couldn't check for updates: {e}"), true);
-                }
-                // A failed background check stays quiet; the button still offers a retry.
-                if manual {
                     update::UpdateState::Failed(e)
                 } else {
+                    // A failed background check stays quiet; the button still offers a retry.
                     update::UpdateState::Idle
                 }
             }
@@ -849,8 +1532,13 @@ impl App {
     fn start_update(&mut self, tag: String) {
         match update::install(&tag) {
             Ok(rx) => {
-                self.update_result = Some(rx);
                 self.update = update::UpdateState::Installing(tag);
+                let bus = self.bus.clone();
+                std::thread::spawn(move || {
+                    if let Ok(result) = rx.recv() {
+                        bus.send(Msg::UpdateInstalled(result));
+                    }
+                });
             }
             Err(e) => {
                 self.toast(e.clone(), true);
@@ -859,116 +1547,29 @@ impl App {
         }
     }
 
-    /// Right end of the tab row: check for updates, or offer the one found.
-    fn ui_update_control(&mut self, ui: &mut egui::Ui) {
-        if let Some(rx) = &self.update_result {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.update_result = None;
-                    let tag = match &self.update {
-                        update::UpdateState::Installing(t) => t.clone(),
-                        _ => String::new(),
-                    };
-                    match result {
-                        // Installed, but we weren't quit: offer the restart ourselves.
-                        Ok(()) => {
-                            self.toast(
-                                format!("Kube UI {tag} is installed. Restart to use it."),
-                                false,
-                            );
-                            self.update = update::UpdateState::Installed(tag);
-                        }
-                        Err(e) => {
-                            self.toast(
-                                format!(
-                                    "Update failed: {e} (log: {})",
-                                    display_path(&update::log_path())
-                                ),
-                                true,
-                            );
-                            self.update = update::UpdateState::Failed(e);
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ui.ctx().request_repaint_after(Duration::from_millis(500))
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.update_result = None,
+    fn update_installed(&mut self, result: Result<(), String>) {
+        let tag = match &self.update {
+            update::UpdateState::Installing(t) => t.clone(),
+            _ => String::new(),
+        };
+        match result {
+            // Installed, but we weren't quit: offer the restart ourselves.
+            Ok(()) => {
+                self.toast(
+                    format!("Kube UI {tag} is installed. Restart to use it."),
+                    false,
+                );
+                self.update = update::UpdateState::Installed(tag);
             }
-        }
-        let current = update::CURRENT;
-        match &self.update {
-            // The launch check runs silently; only a check the user asked for shows progress.
-            update::UpdateState::Checking { manual: true } => {
-                ui.weak("Checking for updates…");
-                ui.spinner();
-            }
-            update::UpdateState::Installing(tag) => {
-                ui.weak(format!("Installing {tag}… Kube UI will reopen"));
-                ui.spinner();
-            }
-            update::UpdateState::Installed(tag) => {
-                let tag = tag.clone();
-                if ui
-                    .add(theme::primary_button(format!(
-                        "{} Restart to finish",
-                        icon::ARROW_CLOCKWISE
-                    )))
-                    .on_hover_text(format!("{tag} is installed. Quits and reopens Kube UI."))
-                    .clicked()
-                {
-                    if update::relaunch() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    } else {
-                        self.toast("Quit and reopen Kube UI to use the new version.", false);
-                    }
-                }
-            }
-            update::UpdateState::Available(tag) => {
-                let tag = tag.clone();
-                let button =
-                    theme::primary_button(format!("{} Update to {tag}", icon::ARROW_CIRCLE_UP));
-                if ui
-                    .add(button)
-                    .on_hover_text(format!(
-                        "You have {current}. Downloads {tag}, installs it and reopens Kube UI."
-                    ))
-                    .clicked()
-                {
-                    self.start_update(tag);
-                }
-            }
-            // On macOS, checking and "What's new" live in the menu bar instead.
-            #[cfg(target_os = "macos")]
-            _ => {}
-            #[cfg(not(target_os = "macos"))]
-            state => {
-                let hint = match state {
-                    update::UpdateState::UpToDate => {
-                        format!("Kube UI {current} is up to date. Check again")
-                    }
-                    update::UpdateState::Failed(e) => format!("Last check failed: {e}"),
-                    _ => format!("Kube UI {current}. Check GitHub for a newer release"),
-                };
-                let label = RichText::new(format!("{} Check for updates", icon::ARROW_CLOCKWISE))
-                    .color(theme::TEXT_MUTED);
-                if ui
-                    .add(egui::Button::new(label).frame(false))
-                    .on_hover_text(hint)
-                    .clicked()
-                {
-                    self.check_for_updates(true);
-                }
-                let version = RichText::new(format!("v{current}"))
-                    .small()
-                    .color(theme::TEXT_FAINT);
-                if ui
-                    .add(egui::Button::new(version).frame(false))
-                    .on_hover_text("What's new")
-                    .clicked()
-                {
-                    self.changelog_open = true;
-                }
+            Err(e) => {
+                self.toast(
+                    format!(
+                        "Update failed: {e} (log: {})",
+                        display_path(&update::log_path())
+                    ),
+                    true,
+                );
+                self.update = update::UpdateState::Failed(e);
             }
         }
     }
@@ -1023,7 +1624,8 @@ impl App {
             return;
         }
         self.active = index;
-        // A live tab restarts its watch on the next frame; otherwise catch up here.
+        self.popup = None;
+        // A live tab restarts its watch in `sync`; otherwise catch up here.
         let ws = &mut self.workspaces[index];
         if !self.settings.live_updates
             && ws.last_refresh.is_none_or(|t| t.elapsed() >= DETAILS_EVERY)
@@ -1042,185 +1644,6 @@ impl App {
         }
     }
 
-    /// Remembers the window size. Writes are held back until resizing has paused for a
-    /// second (and done on exit), so dragging the window edge doesn't hit the disk every frame.
-    fn track_window(&mut self, ctx: &egui::Context) {
-        let (size, maximized) = ctx.input(|i| {
-            let v = i.viewport();
-            (
-                v.inner_rect.map(|r| [r.width(), r.height()]),
-                v.maximized.unwrap_or(false),
-            )
-        });
-        if maximized != self.settings.window_maximized {
-            self.settings.window_maximized = maximized;
-            self.window_dirty = Some(Instant::now());
-        }
-        // While maximized, keep the normal size so un-maximizing next launch restores it.
-        if let Some(size) = size.filter(|_| !maximized) {
-            let changed = self
-                .settings
-                .window_size
-                .is_none_or(|[w, h]| (w - size[0]).abs() > 1.0 || (h - size[1]).abs() > 1.0);
-            if changed {
-                self.settings.window_size = Some(size);
-                self.window_dirty = Some(Instant::now());
-            }
-        }
-        if let Some(at) = self.window_dirty {
-            if at.elapsed() >= Duration::from_secs(1) {
-                self.window_dirty = None;
-                self.settings.save();
-            } else {
-                ctx.request_repaint_after(Duration::from_secs(1));
-            }
-        }
-    }
-
-    /// Stages a representative scene, captures the window to a PNG and closes the app.
-    fn dev_screenshot(&mut self, ctx: &egui::Context) {
-        let Some(shot) = self.screenshot.as_ref() else {
-            return;
-        };
-        ctx.request_repaint_after(Duration::from_millis(100));
-        if shot.staged.is_none()
-            && let Some(tab) = shot.tab
-        {
-            let (select, edit, sort) = (shot.select, shot.edit, shot.sort.clone());
-            let timed_out = shot.started.elapsed() > Duration::from_secs(30);
-            let Some(ws) = self.ws_mut() else { return };
-            if let Some(sort) = sort {
-                ws.sorts.insert(tab, sort);
-            }
-            // `KUBE_UI_SCREENSHOT_FILTER=<regex>` presets the page's filter in regex mode.
-            if let Ok(re) = std::env::var("KUBE_UI_SCREENSHOT_FILTER") {
-                ws.filters.insert(tab, re);
-                ws.filter_regex = true;
-            }
-            if ws.tab != tab {
-                ws.set_tab(tab);
-                return;
-            }
-            let loaded = ws.client().is_some() && !ws.is_loading() && ws.last_refresh.is_some();
-            if !loaded && !timed_out {
-                return;
-            }
-            let running = ws
-                .pods
-                .items
-                .iter()
-                .find(|p| p.status == "Running")
-                .cloned();
-            let first = ws.first_row(tab);
-            if select {
-                if let Some(sel) = first.clone() {
-                    ws.select(sel);
-                }
-            }
-            if let Some(sel) = first.filter(|_| edit) {
-                self.apply(Action::EditYaml(sel.kind, sel.namespace, sel.name));
-            }
-            // `KUBE_UI_SCREENSHOT_FIND=<text>` opens the YAML window's find bar with that query.
-            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_FIND") {
-                self.yaml_find.preset(q);
-            }
-            // `KUBE_UI_SCREENSHOT_ENV=<text>` presets the drawer's env search.
-            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_ENV") {
-                ctx.data_mut(|d| d.insert_temp(egui::Id::new("env-filter"), q));
-                if let Some(ws) = self.ws_mut() {
-                    ws.drawer_tab = DrawerTab::Containers;
-                }
-            }
-            if std::env::var_os("KUBE_UI_SCREENSHOT_CREATE").is_some() {
-                if let Some(kind) = tab.kinds().first().copied() {
-                    self.apply(Action::Create(kind));
-                }
-            }
-            if let Some(pod) =
-                running.filter(|_| self.screenshot.as_ref().is_some_and(|s| s.shell.is_some()))
-            {
-                self.apply(Action::Shell(pod, None));
-            }
-            if let Some(shot) = self.screenshot.as_mut() {
-                shot.staged = Some(Instant::now());
-            }
-            return;
-        }
-        if shot.staged.is_none() {
-            let first_pod = self.ws().and_then(|w| w.pods.items.first().cloned());
-            let timed_out = shot.started.elapsed() > Duration::from_secs(20);
-            if first_pod.is_none() && !timed_out {
-                return;
-            }
-            if let Some(pod) = first_pod {
-                self.apply(Action::Select(Selected {
-                    kind: Kind::Pod,
-                    namespace: pod.namespace.clone(),
-                    name: pod.name.clone(),
-                }));
-                // `KUBE_UI_SCREENSHOT_PREVIOUS=1` opens the previous run's logs instead.
-                let previous = std::env::var_os("KUBE_UI_SCREENSHOT_PREVIOUS").is_some();
-                self.apply(Action::OpenLogs(pod, None, previous));
-                if let Some(re) = self.screenshot.as_ref().and_then(|s| s.log_regex.clone()) {
-                    if let Some(log) = self.logs.last_mut() {
-                        log.set_filter(re, true);
-                    }
-                }
-            }
-            // `KUBE_UI_SCREENSHOT_LOGS_COLLAPSED=1` shows the log panel folded to its tab strip.
-            if std::env::var_os("KUBE_UI_SCREENSHOT_LOGS_COLLAPSED").is_some() {
-                self.settings.log_mode = LogPanelMode::Collapsed;
-            }
-            if let Some(shot) = self.screenshot.as_mut() {
-                shot.staged = Some(Instant::now());
-            }
-            return;
-        }
-        // Type the shell command once the session is up, then give it time to print.
-        if let Some(cmd) = self.screenshot.as_ref().and_then(|s| s.shell.clone()) {
-            match self.shells.last_mut() {
-                Some(sh) if sh.status == shell::ShellStatus::Open => {
-                    sh.type_text(&format!("{cmd}\r"));
-                    if let Some(s) = self.screenshot.as_mut() {
-                        s.shell = None;
-                        s.staged = Some(Instant::now());
-                    }
-                }
-                _ => return,
-            }
-        }
-        let Some(shot) = self.screenshot.as_mut() else {
-            return;
-        };
-        if !shot.requested
-            && shot
-                .staged
-                .is_some_and(|t| t.elapsed() > Duration::from_secs(3))
-        {
-            shot.requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-        }
-        let image = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(image) = image {
-            let [w, h] = image.size;
-            if let Err(e) = image::save_buffer(
-                &shot.path,
-                image.as_raw(),
-                w as u32,
-                h as u32,
-                image::ExtendedColorType::Rgba8,
-            ) {
-                eprintln!("screenshot failed: {e}");
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-
     /// Persists the open tabs whenever they change.
     fn save_workspaces(&mut self) {
         let saved: Vec<SavedWorkspace> = self.workspaces.iter().map(Workspace::saved).collect();
@@ -1232,10 +1655,53 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Popups
+    // -----------------------------------------------------------------------
+
+    /// Enter in a searchable picker takes the first match.
+    fn popup_submit(&mut self) -> Task<Message> {
+        let Some(p) = &self.popup else {
+            return Task::none();
+        };
+        let q = p.query.to_lowercase();
+        let Some(ws) = self.ws() else {
+            return Task::none();
+        };
+        match p.kind {
+            PopupKind::Context => {
+                let first = ws
+                    .kubeconfig
+                    .iter()
+                    .flat_map(|k| k.contexts.iter())
+                    .find(|c| c.to_lowercase().contains(&q))
+                    .cloned();
+                if let Some(c) = first {
+                    return self.handle(Message::SwitchContext(c));
+                }
+            }
+            PopupKind::Namespace => {
+                let first = ws
+                    .namespaces
+                    .iter()
+                    .find(|n| n.to_lowercase().contains(&q))
+                    .cloned();
+                if let Some(ns) = first {
+                    self.popup = None;
+                    return self.handle(Message::SetNamespaces(vec![ns]));
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    // -----------------------------------------------------------------------
     // Background message handling
     // -----------------------------------------------------------------------
 
-    fn handle_messages(&mut self) {
+    fn handle_messages(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let mut touched_logs = HashSet::new();
         while let Ok(msg) = self.rx.try_recv() {
             if let Some(id) = msg.workspace() {
                 if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == id) {
@@ -1251,13 +1717,12 @@ impl App {
             }
             if let Some(id) = msg.log_stream() {
                 let handle = self.rt.handle().clone();
-                let error = self
-                    .logs
-                    .iter_mut()
-                    .find(|l| l.stream_id() == id)
-                    .and_then(|l| l.handle(msg, &handle, &self.bus));
-                if let Some(e) = error {
-                    self.toast(e, true);
+                let found = self.logs.iter_mut().position(|l| l.stream_id() == id);
+                if let Some(i) = found {
+                    touched_logs.insert(i);
+                    if let Some(e) = self.logs[i].handle(msg, &handle, &self.bus) {
+                        self.toast(e, true);
+                    }
                 }
                 continue;
             }
@@ -1270,12 +1735,20 @@ impl App {
                 }
                 Msg::Yaml { title, result } => {
                     if let Some(y) = self.yaml.as_mut().filter(|y| y.title == title) {
-                        if y.edit_on_load {
+                        if let Ok(t) = &result {
+                            y.content = text_editor::Content::with_text(t);
+                        }
+                        if y.edit_on_load && result.is_ok() {
                             y.edit_on_load = false;
-                            y.edit = result.as_ref().ok().cloned();
-                            y.edit_started = y.edit.is_some();
+                            y.editing = true;
+                            tasks.push(operation::focus(view::YAML_EDITOR));
                         }
                         y.text = Some(result);
+                        if self.find.open {
+                            let _ = self
+                                .find
+                                .update(code_editor::FindMsg::Refresh, &mut y.content);
+                        }
                     }
                 }
                 Msg::YamlCreated { title, result } => {
@@ -1297,11 +1770,11 @@ impl App {
                             w.changed();
                         }
                         // Show it: its page, with the drawer open on it (it fills in as the watch sees it).
-                        self.apply(Action::OpenSelected(Selected {
+                        tasks.push(self.apply(Action::OpenSelected(Selected {
                             kind,
                             namespace,
                             name,
-                        }));
+                        })));
                     }
                 }
                 Msg::YamlApplied { title, result } => {
@@ -1310,7 +1783,6 @@ impl App {
                         y.saving = false;
                         match result {
                             Ok(()) => {
-                                y.edit = None;
                                 y.save_error = None;
                                 saved = Some((y.ws, y.kind, y.namespace.clone(), y.name.clone()));
                             }
@@ -1343,23 +1815,33 @@ impl App {
                 }
                 Msg::Toast { text, error } => self.toast(text, error),
                 Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
+                Msg::UpdateInstalled(result) => self.update_installed(result),
                 #[cfg(target_os = "macos")]
-                Msg::Menu(cmd) => self.menu_command(cmd),
+                Msg::Menu(cmd) => tasks.push(self.menu_command(cmd)),
                 _ => {}
             }
         }
+        // Keep followed logs pinned to the bottom, and older pages from moving the view.
+        for i in touched_logs {
+            if let Some(log) = self.logs.get_mut(i) {
+                tasks.push(log.after_update());
+            }
+        }
+        Task::batch(tasks)
     }
 
     // -----------------------------------------------------------------------
     // Actions
     // -----------------------------------------------------------------------
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Select(sel) => {
                 if let Some(ws) = self.ws_mut() {
                     ws.select(sel);
                 }
+                self.env_filter.clear();
+                self.toggled_sections.clear();
             }
             Action::GoToPod(ns, name) => {
                 if let Some(ws) = self.ws_mut() {
@@ -1425,7 +1907,7 @@ impl App {
                     self.confirm_delete = Some((id, kind, ns, name));
                 }
             }
-            Action::Create(kind) => self.open_create(kind),
+            Action::Create(kind) => return self.open_create(kind),
             Action::EditYaml(kind, ns, name) => {
                 self.open_yaml(kind, ns, name);
                 if let Some(y) = self.yaml.as_mut() {
@@ -1435,7 +1917,7 @@ impl App {
             Action::Trigger(ns, name) => {
                 let Some((ws, client)) = self.ws().and_then(|w| w.client().map(|c| (w.id, c)))
                 else {
-                    return;
+                    return Task::none();
                 };
                 let bus = self.bus.clone();
                 self.rt.spawn(async move {
@@ -1505,6 +1987,7 @@ impl App {
                 self.save_forwards();
             }
         }
+        Task::none()
     }
 
     /// Runs a mutating API call against a cluster tab (the active one when `ws` is `None`),
@@ -1534,10 +2017,12 @@ impl App {
     }
 
     /// The editor on a template for a new object, in the page's namespace.
-    fn open_create(&mut self, kind: Kind) {
-        let Some(ws) = self.ws() else { return };
+    fn open_create(&mut self, kind: Kind) -> Task<Message> {
+        let Some(ws) = self.ws() else {
+            return Task::none();
+        };
         if ws.client().is_none() {
-            return;
+            return Task::none();
         }
         let ns = ws
             .selected_ns
@@ -1551,15 +2036,17 @@ impl App {
             kind,
             namespace: ns,
             name: String::new(),
-            text: Some(Ok(text.clone())),
-            edit: Some(text),
+            content: text_editor::Content::with_text(&text),
+            text: Some(Ok(text)),
+            editing: true,
+            dirty: true,
             edit_on_load: false,
             saving: false,
             save_error: None,
             parse_error: None,
-            edit_started: true,
             create: true,
         });
+        operation::focus(view::YAML_EDITOR)
     }
 
     fn open_yaml(&mut self, kind: Kind, ns: String, name: String) {
@@ -1574,12 +2061,13 @@ impl App {
             namespace: ns.clone(),
             name: name.clone(),
             text: None,
-            edit: None,
+            content: text_editor::Content::new(),
+            editing: false,
+            dirty: false,
             edit_on_load: false,
             saving: false,
             save_error: None,
             parse_error: None,
-            edit_started: false,
             create: false,
         });
         let bus = self.bus.clone();
@@ -1590,6 +2078,133 @@ impl App {
             bus.send(Msg::Yaml { title, result });
         });
     }
+
+    // -----------------------------------------------------------------------
+    // YAML window
+    // -----------------------------------------------------------------------
+
+    fn yaml_action(&mut self, action: text_editor::Action) {
+        let Some(y) = self.yaml.as_mut() else { return };
+        let is_edit = action.is_edit();
+        if is_edit && (!y.editing || y.saving) {
+            return; // The viewer is read-only; selection and scrolling still work.
+        }
+        y.content.perform(action);
+        if is_edit {
+            Self::yaml_changed(y);
+            self.refresh_find();
+        }
+    }
+
+    /// Recounts find matches after the document changed.
+    fn refresh_find(&mut self) {
+        if let Some(y) = self.yaml.as_mut().filter(|_| self.find.open) {
+            let _ = self
+                .find
+                .update(code_editor::FindMsg::Refresh, &mut y.content);
+        }
+    }
+
+    /// After an edit: recompute dirty and the live YAML check.
+    fn yaml_changed(y: &mut YamlView) {
+        let text = y.content.text();
+        y.dirty = y.create || !matches!(&y.text, Some(Ok(t)) if *t == text);
+        y.parse_error = yaml_error(&text);
+    }
+
+    /// Applies a whole-document edit (indent, comment) to the selection's lines.
+    fn yaml_edit_with(
+        &mut self,
+        f: impl FnOnce(&mut String, std::ops::Range<usize>) -> std::ops::Range<usize>,
+    ) {
+        let Some(y) = self.yaml.as_mut().filter(|y| y.editing && !y.saving) else {
+            return;
+        };
+        let mut text = y.content.text();
+        let range = code_editor::char_range(&text, y.content.cursor());
+        let new = f(&mut text, range);
+        y.content = text_editor::Content::with_text(&text);
+        y.content.move_to(code_editor::cursor_for(&text, new));
+        Self::yaml_changed(y);
+        self.refresh_find();
+    }
+
+    /// Enter: newline plus the current line's indentation, deeper after `key:` or `- `.
+    fn yaml_enter(&mut self) {
+        let Some(y) = self.yaml.as_mut().filter(|y| y.editing && !y.saving) else {
+            return;
+        };
+        let cursor = y.content.cursor();
+        let line = y
+            .content
+            .line(cursor.position.line)
+            .map(|l| l.text.to_string())
+            .unwrap_or_default();
+        let before = &line[..cursor.position.column.min(line.len())];
+        let insert = code_editor::newline_insert(before);
+        y.content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(insert),
+            )));
+        Self::yaml_changed(y);
+        self.refresh_find();
+    }
+
+    fn yaml_apply(&mut self) {
+        let Some(y) = self.yaml.as_mut() else { return };
+        if !(y.editing && y.dirty && !y.saving && y.parse_error.is_none()) {
+            return;
+        }
+        let yaml = y.content.text();
+        y.saving = true;
+        y.save_error = None;
+        let (title, ws, kind, ns, name) = (
+            y.title.clone(),
+            y.ws,
+            y.kind,
+            y.namespace.clone(),
+            y.name.clone(),
+        );
+        let client = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == ws)
+            .and_then(Workspace::client);
+        let bus = self.bus.clone();
+        match client {
+            Some(client) if y.create => {
+                self.rt.spawn(async move {
+                    let result = kube_ops::create_yaml(client, ns, yaml)
+                        .await
+                        .map_err(err_string);
+                    bus.send(Msg::YamlCreated { title, result });
+                });
+            }
+            Some(client) => {
+                self.rt.spawn(async move {
+                    let result = kube_ops::apply_yaml(client, kind, ns, name, yaml)
+                        .await
+                        .map_err(err_string);
+                    bus.send(Msg::YamlApplied { title, result });
+                });
+            }
+            None => {
+                y.saving = false;
+                y.save_error = Some("That cluster tab is no longer connected.".into());
+            }
+        }
+    }
+
+    fn find_message(&mut self, msg: code_editor::FindMsg) -> Task<Message> {
+        let Some(y) = self.yaml.as_mut() else {
+            return Task::none();
+        };
+        self.find.update(msg, &mut y.content)
+    }
+
+    // -----------------------------------------------------------------------
+    // Logs and shells
+    // -----------------------------------------------------------------------
 
     /// Opens a log tab for the active cluster, or focuses it if the same logs are already open.
     /// `previous` opens the run before the last restart (`kubectl logs --previous`) in its own tab;
@@ -1654,6 +2269,86 @@ impl App {
         self.show_logs();
     }
 
+    fn log_message(&mut self, i: usize, msg: logs::LogMsg) -> Task<Message> {
+        if matches!(
+            msg,
+            logs::LogMsg::Restart | logs::LogMsg::SetTail(_) | logs::LogMsg::SetContainer(_)
+        ) {
+            self.popup = None;
+        }
+        let id = self.next_id();
+        let handle = self.rt.handle().clone();
+        match self.logs.get_mut(i) {
+            Some(log) => log.update(msg, id, &handle, &self.bus),
+            None => Task::none(),
+        }
+    }
+
+    fn shell_message(&mut self, id: u64, msg: shell::ShellMsg) -> Task<Message> {
+        let handle = self.rt.handle().clone();
+        match self.shells.iter_mut().find(|s| s.id == id) {
+            Some(s) => s.update(msg, &handle, &self.bus),
+            None => Task::none(),
+        }
+    }
+
+    fn close_dock_tab(&mut self, i: usize) {
+        let n_logs = self.logs.len();
+        if i < n_logs {
+            self.logs.remove(i);
+        } else if i - n_logs < self.shells.len() {
+            self.shells.remove(i - n_logs);
+        }
+        let total = self.logs.len() + self.shells.len();
+        if self.active_log > i || self.active_log >= total {
+            self.active_log = self.active_log.saturating_sub(1);
+        }
+    }
+
+    fn set_log_mode(&mut self, mode: LogPanelMode) {
+        if self.settings.log_mode != mode {
+            self.settings.log_mode = mode;
+            self.settings.save();
+        }
+    }
+
+    /// Un-collapses the log panel (opening or picking a log should show it).
+    fn show_logs(&mut self) {
+        if self.settings.log_mode == LogPanelMode::Collapsed {
+            self.set_log_mode(LogPanelMode::Normal);
+        }
+    }
+
+    /// What the dock body shows: (log tab, shell tab). Split view keeps the last log tab
+    /// and the last shell tab on screen together.
+    fn dock_shown(&self) -> (Option<usize>, Option<usize>) {
+        let (n_logs, n_shells) = (self.logs.len(), self.shells.len());
+        let total = n_logs + n_shells;
+        if total == 0 {
+            return (None, None);
+        }
+        let active = self.active_log.min(total - 1);
+        let (mut split_log, mut split_shell) = (self.split_log, self.split_shell);
+        if active < n_logs {
+            split_log = active;
+        } else {
+            split_shell = active - n_logs;
+        }
+        let split_log = split_log.min(n_logs.saturating_sub(1));
+        let split_shell = split_shell.min(n_shells.saturating_sub(1));
+        if self.settings.log_split && n_logs > 0 && n_shells > 0 {
+            (Some(split_log), Some(split_shell))
+        } else if active < n_logs {
+            (Some(active), None)
+        } else {
+            (None, Some(active - n_logs))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Port forwards
+    // -----------------------------------------------------------------------
+
     fn open_pf_dialog(
         &mut self,
         namespace: String,
@@ -1674,6 +2369,8 @@ impl App {
             ports,
             remote_port: remote,
             local_port: local,
+            remote_text: remote.to_string(),
+            local_text: local.to_string(),
         });
     }
 
@@ -1776,1891 +2473,154 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Rendering: chrome
+    // Development screenshot
     // -----------------------------------------------------------------------
 
-    fn ui_onboarding(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(theme::content_frame()).show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.22);
-                ui.label(RichText::new(icon::STEERING_WHEEL).size(56.0).color(theme::ACCENT));
-                ui.add_space(6.0);
-                ui.label(theme::title("Welcome to Kube UI").size(26.0));
-                ui.add_space(4.0);
-                ui.label("Pick a kubeconfig file to get started. You can open more clusters as tabs later.");
-                ui.add_space(18.0);
-
-                let choose = theme::primary_button(format!("{}  Choose kubeconfig file…", icon::FOLDER_OPEN))
-                    .min_size(egui::vec2(260.0, 36.0));
-                if ui.add(choose).clicked() {
-                    if let Some(path) = pick_kubeconfig() {
-                        self.add_workspace(path, None, None);
-                    }
-                }
-                if let Some(default) = default_kubeconfig() {
-                    ui.add_space(6.0);
-                    let use_default = egui::Button::new(format!("Use {}", display_path(&default)))
-                        .min_size(egui::vec2(260.0, 30.0));
-                    if ui.add(use_default).clicked() {
-                        self.add_workspace(default, None, None);
-                    }
-                }
-                let recent: Vec<PathBuf> = self.settings.kubeconfigs.clone();
-                if !recent.is_empty() {
-                    ui.add_space(14.0);
-                    ui.weak("Recent");
-                    for p in recent {
-                        if ui.link(display_path(&p)).clicked() {
-                            self.add_workspace(p, None, None);
-                        }
-                    }
-                }
-            });
-        });
-    }
-
-    /// "+" menu: open any context of any known kubeconfig in a new tab.
-    fn new_tab_menu(&mut self, ui: &mut egui::Ui) -> Option<(PathBuf, Option<String>)> {
-        let mut picked = None;
-        ui.set_min_width(240.0);
-        ui.weak("Open cluster in new tab");
-        for path in self.settings.kubeconfigs.clone() {
-            ui.menu_button(format!("{} {}", icon::FILE, display_path(&path)), |ui| {
-                match kube_ops::read_kubeconfig(&path) {
-                    Ok(info) => {
-                        egui::ScrollArea::vertical()
-                            .max_height(360.0)
-                            .show(ui, |ui| {
-                                for c in info.contexts {
-                                    if ui.button(&c).clicked() {
-                                        picked = Some((path.clone(), Some(c)));
-                                    }
-                                }
-                            });
-                    }
-                    Err(e) => {
-                        ui.colored_label(RED, err_string(e));
-                    }
-                }
-            });
-        }
-        ui.separator();
-        if ui
-            .button(format!("{} Add kubeconfig file…", icon::FOLDER_OPEN))
-            .clicked()
+    /// Stages a representative scene, then captures the window to a PNG and quits.
+    fn dev_screenshot(&mut self) -> Task<Message> {
+        let Some(shot) = self.screenshot.as_ref() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        if shot.staged.is_none()
+            && let Some(tab) = shot.tab
         {
-            picked = pick_kubeconfig().map(|p| (p, None));
-        }
-        picked
-    }
-
-    fn ui_top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top")
-            .frame(theme::chrome_frame())
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                // No gap between the tab row and the picker row, so the active tab joins it.
-                ui.spacing_mut().item_spacing.y = 0.0;
-
-                // Cluster tabs
-                let mut activate = None;
-                let mut close = None;
-                let mut new_tab = None;
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(
-                        RichText::new(icon::STEERING_WHEEL)
-                            .size(18.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                    ui.label(theme::semibold("Kube UI").size(14.5).color(theme::TEXT));
-                    ui.add_space(10.0);
-                    let closable = self.workspaces.len() > 1;
-                    for (i, ws) in self.workspaces.iter().enumerate() {
-                        let (color, status) = ws.conn.status();
-                        let selected = i == self.active;
-                        // The active tab shares the picker row's ground and opens into it.
-                        egui::Frame::new()
-                            .fill(if selected {
-                                theme::CONTENT
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(egui::CornerRadius {
-                                nw: 7,
-                                ne: 7,
-                                sw: 0,
-                                se: 0,
-                            })
-                            .inner_margin(egui::Margin {
-                                left: 12,
-                                right: 6,
-                                top: 7,
-                                bottom: 8,
-                            })
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    dot(ui, color);
-                                    let title = if selected {
-                                        theme::semibold(ws.title()).color(theme::TEXT)
-                                    } else {
-                                        RichText::new(ws.title()).color(theme::TEXT_MUTED)
-                                    };
-                                    let resp = ui
-                                        .add(egui::Label::new(title).sense(Sense::click()))
-                                        .on_hover_text(format!(
-                                            "{status}\n{}",
-                                            display_path(&ws.kubeconfig_path)
-                                        ));
-                                    if resp.clicked() {
-                                        activate = Some(i);
-                                    }
-                                    if resp.middle_clicked() && closable {
-                                        close = Some(i);
-                                    }
-                                    if closable
-                                        && theme::icon_button(ui, icon::X, "Close tab").clicked()
-                                    {
-                                        close = Some(i);
-                                    }
-                                });
-                            });
-                    }
-                    let plus = theme::icon_menu(
-                        ui,
-                        icon::PLUS,
-                        "Open another cluster in a new tab (⌘T)",
-                        |ui| {
-                            if let Some(t) = self.new_tab_menu(ui) {
-                                new_tab = Some(t);
-                                ui.close();
-                            }
-                        },
-                    );
-                    if std::mem::take(&mut self.open_new_tab_menu) {
-                        egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&plus));
-                        ui.ctx().request_repaint();
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(4.0);
-                        self.ui_update_control(ui);
-                    });
-                });
-                if let Some(i) = activate {
-                    self.activate_workspace(i);
-                }
-                if let Some(i) = close {
-                    self.close_workspace(i);
-                }
-                if let Some((path, context)) = new_tab {
-                    self.add_workspace(path, context, None);
-                }
-
-                // Pickers for the active tab, on the content ground the active tab opens into.
-                let Some(ws) = self.workspaces.get_mut(self.active) else {
-                    return;
-                };
-                let settings = &mut self.settings;
-                egui::Frame::new()
-                    .fill(theme::CONTENT)
-                    .outer_margin(egui::Margin {
-                        left: -14,
-                        right: -14,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Config").color(theme::TEXT_MUTED));
-                            let active = ws.kubeconfig_path.clone();
-                            let mut choose: Option<PathBuf> = None;
-                            let mut browse = false;
-                            egui::ComboBox::from_id_salt(("kubeconfig", ws.id))
-                                .icon(theme::caret)
-                                .width(170.0)
-                                .selected_text(file_label(&active))
-                                .show_ui(ui, |ui| {
-                                    for p in &settings.kubeconfigs {
-                                        if ui
-                                            .selectable_label(*p == active, display_path(p))
-                                            .clicked()
-                                        {
-                                            choose = Some(p.clone());
-                                        }
-                                    }
-                                    ui.separator();
-                                    if ui
-                                        .button(format!("{} Add kubeconfig…", icon::PLUS))
-                                        .clicked()
-                                    {
-                                        browse = true;
-                                    }
-                                });
-                            if browse {
-                                choose = pick_kubeconfig();
-                            }
-                            if let Some(p) = choose.filter(|p| *p != active) {
-                                ws.load_kubeconfig(p, None, settings);
-                            }
-
-                            ui.label(RichText::new("Context").color(theme::TEXT_MUTED));
-                            let contexts: Vec<(Option<String>, String)> = ws
-                                .kubeconfig
-                                .iter()
-                                .flat_map(|k| k.contexts.iter())
-                                .map(|c| (Some(c.clone()), c.clone()))
-                                .collect();
-                            let current_context = ws.context.clone();
-                            let picked = searchable_combo(
-                                ui,
-                                &format!("context-{}", ws.id),
-                                220.0,
-                                current_context.as_deref().unwrap_or_default(),
-                                &mut ws.context_query,
-                                &contexts,
-                                &current_context,
-                            );
-                            if let Some(Some(c)) = picked.filter(|c| *c != current_context) {
-                                ws.switch_context(c, settings);
-                            }
-
-                            ui.label(RichText::new("Namespace").color(theme::TEXT_MUTED));
-                            let picked = namespace_picker(
-                                ui,
-                                &format!("namespace-{}", ws.id),
-                                220.0,
-                                &mut ws.namespace_query,
-                                &ws.namespaces,
-                                &ws.selected_ns,
-                            );
-                            if let Some(selection) = picked {
-                                ws.set_namespaces(selection, settings);
-                            }
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let (color, text) = ws.conn.status();
-                                    ui.colored_label(color, text);
-                                    dot(ui, color);
-                                    let reload = egui::Button::new(format!(
-                                        "{} Refresh",
-                                        icon::ARROW_CLOCKWISE
-                                    ));
-                                    if ui.add_enabled(ws.client().is_some(), reload).clicked() {
-                                        ws.refresh();
-                                    }
-                                    if ws.is_loading() {
-                                        ui.spinner();
-                                    }
-                                },
-                            );
-                        });
-                    });
-            });
-    }
-
-    fn ui_sidebar(&mut self, ctx: &egui::Context) {
-        let active_forwards = self
-            .forwards
-            .iter()
-            .filter(|f| f.status == PfStatus::Listening)
-            .count();
-        let collapsed = &mut self.settings.nav_collapsed;
-        let mut toggled = false;
-        let Some(ws) = self.workspaces.get_mut(self.active) else {
-            return;
-        };
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(NAV_WIDTH)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin::symmetric(10, 12)),
-            )
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                let plain = |n: Option<usize>| n.filter(|n| *n > 0).map(|n| (n.to_string(), None));
-                // Pods report failures rather than a total, so a problem shows from any page.
-                let failing = ws.failing_pods();
-                let pods_badge = if failing > 0 {
-                    Some((format!("{failing} failing"), Some(RED)))
-                } else {
-                    plain(count(&ws.pods))
-                };
-                let mut workloads = vec![
-                    (Tab::Overview, None),
-                    (Tab::Pods, pods_badge),
-                    (Tab::Deployments, plain(count(&ws.deployments))),
-                ];
-                workloads.extend(
-                    WORKLOAD_KINDS.map(|k| (Tab::Workload(k), plain(count(ws.workload(k))))),
-                );
-                let forwards_badge =
-                    (active_forwards > 0).then(|| (format!("{active_forwards} live"), Some(GREEN)));
-                let groups = [
-                    ("workloads", icon::CUBE, "Workloads", workloads),
-                    (
-                        "network",
-                        icon::SHARE_NETWORK,
-                        "Network",
-                        vec![
-                            (Tab::Services, plain(count(&ws.services))),
-                            (Tab::Forwards, forwards_badge),
-                        ],
-                    ),
-                ];
-                // Settings is pinned to the bottom of the rail; the groups scroll above it.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if theme::nav_item(ui, icon::GEAR, "Settings", None, ws.tab == Tab::Settings)
-                        .clicked()
-                    {
-                        ws.set_tab(Tab::Settings);
-                    }
-                    ui.add_space(6.0);
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for (key, glyph, label, children) in groups {
-                                    let open = !collapsed.iter().any(|c| c == key);
-                                    let has_selected = children.iter().any(|(t, _)| *t == ws.tab);
-                                    // A closed group still shows that the current page lives inside it.
-                                    if theme::nav_group(
-                                        ui,
-                                        glyph,
-                                        label,
-                                        open,
-                                        !open && has_selected,
-                                    )
-                                    .clicked()
-                                    {
-                                        if open {
-                                            collapsed.push(key.to_string());
-                                        } else {
-                                            collapsed.retain(|c| c != key);
-                                        }
-                                        toggled = true;
-                                    }
-                                    if open {
-                                        for (tab, badge) in children {
-                                            if theme::nav_child_badge(
-                                                ui,
-                                                tab_label(tab),
-                                                badge,
-                                                ws.tab == tab,
-                                            )
-                                            .clicked()
-                                            {
-                                                ws.set_tab(tab);
-                                            }
-                                        }
-                                    }
-                                    ui.add_space(6.0);
-                                }
-                            });
-                    });
-                });
-            });
-        if toggled {
-            self.settings.save();
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Rendering: pages
-    // -----------------------------------------------------------------------
-
-    fn ui_forwards(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.label(theme::title("Port Forwards"));
-        ui.add_space(4.0);
-        if self.forwards.is_empty() {
-            ui.label("No port forwards yet. Select a pod or service and choose Port forward.");
-            return;
-        }
-        egui::ScrollArea::horizontal()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::initial(160.0).clip(true))
-                    .column(Column::initial(130.0).clip(true))
-                    .column(Column::initial(260.0).clip(true))
-                    .column(Column::initial(150.0))
-                    .column(Column::initial(120.0).clip(true))
-                    .column(Column::initial(60.0))
-                    .column(Column::remainder().at_least(200.0))
-                    .header(24.0, |mut h| {
-                        for t in [
-                            "Context",
-                            "Namespace",
-                            "Target",
-                            "Local / Remote",
-                            "Status",
-                            "Conns",
-                            "",
-                        ] {
-                            h.col(|ui| {
-                                ui.label(theme::label_small(t));
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(ROW_HEIGHT, self.forwards.len(), |mut row| {
-                            let f = &self.forwards[row.index()];
-                            row.col(|ui| {
-                                ui.label(&f.spec.context)
-                                    .on_hover_text(display_path(&f.spec.kubeconfig));
-                            });
-                            row.col(|ui| {
-                                ui.label(&f.spec.namespace);
-                            });
-                            row.col(|ui| {
-                                ui.label(f.spec.target.label());
-                            });
-                            row.col(|ui| {
-                                let local = f.bound_port.unwrap_or(f.spec.local_port);
-                                ui.monospace(format!(
-                                    "{local} {} {}",
-                                    icon::ARROW_RIGHT,
-                                    f.spec.remote_port
-                                ));
-                            });
-                            row.col(|ui| {
-                                let (color, text) = match &f.status {
-                                    PfStatus::Starting => (YELLOW, "Starting…"),
-                                    PfStatus::Listening => (GREEN, "Active"),
-                                    PfStatus::Stopped => (theme::IDLE, "Stopped"),
-                                    PfStatus::Failed(_) => (RED, "Failed"),
-                                };
-                                dot(ui, color);
-                                let resp = ui.colored_label(color, text);
-                                if let PfStatus::Failed(e) = &f.status {
-                                    resp.on_hover_text(e);
-                                }
-                            });
-                            row.col(|ui| {
-                                ui.label(f.connections.load(Ordering::Relaxed).to_string());
-                            });
-                            row.col(|ui| {
-                                let running = f.handle.is_some();
-                                if running {
-                                    if ui
-                                        .small_button(format!("{} Stop", icon::STOP_CIRCLE))
-                                        .clicked()
-                                    {
-                                        actions.push(Action::StopForward(f.id));
-                                    }
-                                } else if ui.small_button(format!("{} Start", icon::PLAY)).clicked()
-                                {
-                                    actions.push(Action::RestartForward(f.id));
-                                }
-                                let address = f
-                                    .bound_port
-                                    .filter(|_| f.status == PfStatus::Listening)
-                                    .map(|port| format!("localhost:{port}"));
-                                overflow_menu(ui, |ui| {
-                                    if ui
-                                        .add_enabled(
-                                            address.is_some(),
-                                            egui::Button::new(format!(
-                                                "{} Open in browser",
-                                                icon::GLOBE
-                                            )),
-                                        )
-                                        .clicked()
-                                    {
-                                        if let Some(a) = &address {
-                                            ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                                                "http://{a}"
-                                            )));
-                                        }
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            address.is_some(),
-                                            egui::Button::new(format!(
-                                                "{} Copy address",
-                                                icon::COPY
-                                            )),
-                                        )
-                                        .clicked()
-                                    {
-                                        if let Some(a) = &address {
-                                            ui.ctx().copy_text(a.clone());
-                                        }
-                                    }
-                                    ui.separator();
-                                    let remove =
-                                        RichText::new(format!("{} Remove", icon::TRASH)).color(RED);
-                                    if ui.button(remove).clicked() {
-                                        actions.push(Action::RemoveForward(f.id));
-                                    }
-                                });
-                            });
-                        });
-                    });
-            });
-    }
-
-    fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.label(theme::title("Settings"));
-        ui.add_space(12.0);
-        ui.label(theme::label_small("Kubeconfig files"));
-        ui.add_space(4.0);
-
-        let mut open_new = None;
-        let mut use_here = None;
-        let mut remove = None;
-        let current = self.ws().map(|w| w.kubeconfig_path.clone());
-        egui::Grid::new("kubeconfigs")
-            .striped(true)
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                for p in &self.settings.kubeconfigs {
-                    let in_use = self
-                        .workspaces
-                        .iter()
-                        .filter(|w| w.kubeconfig_path == *p)
-                        .count();
-                    let text = RichText::new(display_path(p)).monospace();
-                    ui.label(if in_use > 0 { text.color(GREEN) } else { text });
-                    ui.horizontal(|ui| {
-                        if in_use > 0 {
-                            ui.weak(format!(
-                                "{in_use} tab{}",
-                                if in_use == 1 { "" } else { "s" }
-                            ));
-                        }
-                        if ui.small_button("Open in new tab").clicked() {
-                            open_new = Some(p.clone());
-                        }
-                        if current.as_ref() != Some(p)
-                            && ui.small_button("Use in this tab").clicked()
-                        {
-                            use_here = Some(p.clone());
-                        }
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(p.clone());
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-        ui.add_space(6.0);
-        if ui
-            .button(format!("{} Add kubeconfig…", icon::PLUS))
-            .clicked()
-        {
-            open_new = pick_kubeconfig();
-        }
-        if let Some(p) = open_new {
-            self.add_workspace(p, None, None);
-        }
-        if let Some(p) = use_here {
-            if let Some(ws) = self.workspaces.get_mut(self.active) {
-                ws.load_kubeconfig(p, None, &mut self.settings);
-            }
-        }
-        if let Some(p) = remove {
-            // Forget the file; tabs already using it stay open until closed.
-            self.settings.kubeconfigs.retain(|k| k != &p);
-            self.settings.save();
-        }
-
-        ui.add_space(16.0);
-        if theme::checkbox(
-            ui,
-            &mut self.settings.live_updates,
-            "Live updates (watch lists for changes)",
-        )
-        .changed()
-        {
-            self.settings.save();
-        }
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            ui.weak(format!("Kube UI v{}", update::CURRENT));
-            if ui
-                .small_button(format!("{} What's new", icon::SPARKLE))
-                .clicked()
-            {
-                self.changelog_open = true;
-            }
-        });
-        if let Some(p) = Settings::path() {
-            ui.add_space(8.0);
-            ui.weak(format!("Settings stored in {}", p.display()));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Rendering: logs, windows, toasts
-    // -----------------------------------------------------------------------
-
-    fn set_log_mode(&mut self, mode: LogPanelMode) {
-        if self.settings.log_mode != mode {
-            self.settings.log_mode = mode;
-            self.settings.save();
-        }
-    }
-
-    /// Un-collapses the log panel (opening or picking a log should show it).
-    fn show_logs(&mut self) {
-        if self.settings.log_mode == LogPanelMode::Collapsed {
-            self.set_log_mode(LogPanelMode::Normal);
-        }
-    }
-
-    fn ui_logs(&mut self, ctx: &egui::Context) {
-        let total = self.logs.len() + self.shells.len();
-        if total == 0 {
-            return;
-        }
-        self.active_log = self.active_log.min(total - 1);
-        let n_logs = self.logs.len();
-        let n_shells = self.shells.len();
-        // Split view keeps the last log tab and the last shell tab on screen together.
-        if self.active_log < n_logs {
-            self.split_log = self.active_log;
-        } else {
-            self.split_shell = self.active_log - n_logs;
-        }
-        self.split_log = self.split_log.min(n_logs.saturating_sub(1));
-        self.split_shell = self.split_shell.min(n_shells.saturating_sub(1));
-        let can_split = n_logs > 0 && n_shells > 0;
-        let split = self.settings.log_split && can_split;
-        let mut toggle_split = false;
-        // What the body shows this frame: (log tab, shell tab).
-        let (shown_log, shown_shell) = if split {
-            (Some(self.split_log), Some(self.split_shell))
-        } else if self.active_log < n_logs {
-            (Some(self.active_log), None)
-        } else {
-            (None, Some(self.active_log - n_logs))
-        };
-        let mut reconnect = false;
-        let mut select = None;
-        let mut close = None;
-        let mut close_all = false;
-        let mut new_mode = None;
-        let mut event = None;
-        let mut load_older = false;
-
-        let mode = self.settings.log_mode;
-        // Leave room for the top bar and a bit of the page when expanded.
-        let max_height = (ctx.available_rect().height() - 90.0).max(LOG_MIN_HEIGHT);
-        // Each mode has its own panel id: the fixed-height modes must not overwrite the
-        // size egui remembers for the resizable one, so "restore" returns to it.
-        let panel = match mode {
-            LogPanelMode::Normal => egui::TopBottomPanel::bottom("logs")
-                .resizable(true)
-                .default_height(self.settings.log_height.clamp(LOG_MIN_HEIGHT, max_height))
-                .min_height(LOG_MIN_HEIGHT)
-                .max_height(max_height),
-            LogPanelMode::Expanded => egui::TopBottomPanel::bottom("logs-expanded")
-                .resizable(false)
-                .exact_height(max_height),
-            LogPanelMode::Collapsed => egui::TopBottomPanel::bottom("logs-collapsed")
-                .resizable(false)
-                .exact_height(LOG_COLLAPSED_HEIGHT),
-        };
-
-        // Collapsed, the panel is only the tab strip, so it trims its margins to fit it.
-        let frame = if mode == LogPanelMode::Collapsed {
-            theme::well_frame().inner_margin(egui::Margin::symmetric(14, 6))
-        } else {
-            theme::well_frame()
-        };
-        let panel_response = panel.frame(frame).show(ctx, |ui| {
-            if mode != LogPanelMode::Collapsed {
-                ui.add_space(4.0);
-            }
-            ui.horizontal(|ui| {
-                egui::ScrollArea::horizontal()
-                    .id_salt("log-tabs")
-                    .max_width(ui.available_width() - 140.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let tabs = self
-                                .logs
-                                .iter()
-                                .map(|l| {
-                                    let glyph = if l.previous() {
-                                        icon::CLOCK_COUNTER_CLOCKWISE
-                                    } else if l.is_group() {
-                                        icon::STACK
-                                    } else {
-                                        icon::SCROLL
-                                    };
-                                    (glyph, l.title(), l.hover(), l.live())
-                                })
-                                .chain(self.shells.iter().map(|s| {
-                                    (icon::TERMINAL_WINDOW, s.title(), s.hover(), s.live())
-                                }));
-                            for (i, (glyph, title, hover, live)) in tabs.enumerate() {
-                                let selected = if split {
-                                    Some(i) == shown_log
-                                        || Some(i) == shown_shell.map(|s| s + n_logs)
-                                } else {
-                                    i == self.active_log
-                                };
-                                let label = format!("{glyph}  {title}");
-                                let text = match (selected, live) {
-                                    (true, _) => theme::semibold(label).color(theme::TEXT),
-                                    (false, true) => RichText::new(label).color(theme::TEXT_MUTED),
-                                    (false, false) => RichText::new(label).color(theme::TEXT_FAINT),
-                                };
-                                // A tab holding the title and its close button.
-                                let tab = egui::Frame::new()
-                                    .fill(if selected {
-                                        theme::FIELD
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .stroke(egui::Stroke::new(
-                                        1.0,
-                                        if selected {
-                                            theme::BORDER_STRONG
-                                        } else {
-                                            theme::BORDER
-                                        },
-                                    ))
-                                    .corner_radius(theme::RADIUS)
-                                    .inner_margin(egui::Margin {
-                                        left: 10,
-                                        right: 4,
-                                        top: 3,
-                                        bottom: 3,
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.horizontal(|ui| {
-                                            let title = ui
-                                                .add(egui::Label::new(text).sense(Sense::click()))
-                                                .on_hover_text(format!(
-                                                    "{hover}\nMiddle-click to close"
-                                                ));
-                                            let x = theme::icon_button(ui, icon::X, "Close");
-                                            (title, x)
-                                        })
-                                        .inner
-                                    });
-                                let (title, x) = tab.inner;
-                                if x.clicked() || title.middle_clicked() {
-                                    close = Some(i);
-                                } else if title.clicked() {
-                                    select = Some(i);
-                                }
-                            }
-                        });
-                    });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::icon_button(ui, icon::X_CIRCLE, "Close all tabs").clicked() {
-                        close_all = true;
-                    }
-                    let (glyph, hint, target) = match mode {
-                        LogPanelMode::Expanded => {
-                            (icon::CORNERS_IN, "Restore size", LogPanelMode::Normal)
-                        }
-                        _ => (icon::CORNERS_OUT, "Expand", LogPanelMode::Expanded),
-                    };
-                    if theme::icon_button(ui, glyph, hint).clicked() {
-                        new_mode = Some(target);
-                    }
-                    if can_split {
-                        let hint = if split {
-                            "Show one tab at a time"
-                        } else {
-                            "Split: logs beside the terminal"
-                        };
-                        if theme::icon_toggle(ui, icon::SQUARE_SPLIT_HORIZONTAL, split, hint)
-                            .clicked()
-                        {
-                            toggle_split = true;
-                        }
-                    }
-                    let (glyph, hint, target) = match mode {
-                        LogPanelMode::Collapsed => {
-                            (icon::CARET_UP, "Restore size", LogPanelMode::Normal)
-                        }
-                        _ => (
-                            icon::CARET_DOWN,
-                            "Collapse to bottom",
-                            LogPanelMode::Collapsed,
-                        ),
-                    };
-                    if theme::icon_button(ui, glyph, hint).clicked() {
-                        new_mode = Some(target);
-                    }
-                });
-            });
-            if mode != LogPanelMode::Collapsed {
-                ui.separator();
-                let body = ui.available_rect_before_wrap();
-                let (log_rect, shell_rect) = if split {
-                    // Logs get the wider side; a hairline and a gutter separate the two.
-                    let mid = body.left() + (body.width() * 0.58).round();
-                    ui.painter()
-                        .vline(mid, body.y_range(), egui::Stroke::new(1.0, theme::BORDER));
-                    (
-                        egui::Rect::from_min_max(body.min, egui::pos2(mid - 10.0, body.max.y)),
-                        egui::Rect::from_min_max(egui::pos2(mid + 11.0, body.min.y), body.max),
-                    )
-                } else {
-                    (body, body)
-                };
-                if let Some(log) = shown_log.and_then(|i| self.logs.get_mut(i)) {
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(log_rect)
-                            .id_salt("dock-log"),
-                    );
-                    event = Some(log.ui(&mut child, &mut load_older));
-                }
-                if let Some(shell) = shown_shell.and_then(|i| self.shells.get_mut(i)) {
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(shell_rect)
-                            .id_salt("dock-shell"),
-                    );
-                    reconnect = shell.ui(&mut child);
-                }
-                ui.allocate_rect(body, Sense::hover());
-            }
-        });
-
-        // egui stores a resizable panel's size as whatever its contents occupied, so contents a
-        // few pixels too tall make it creep taller every frame. Only a drag may change the size:
-        // save it when the drag ends, and put any other change back.
-        if mode == LogPanelMode::Normal {
-            let rect = panel_response.response.rect;
-            let height = rect.height();
-            let changed = (height - self.settings.log_height).abs() > 1.0;
-            if ctx.input(|i| i.pointer.any_down()) {
-                self.log_resizing |= changed;
-            } else if self.log_resizing {
-                self.log_resizing = false;
-                self.settings.log_height = height;
-                self.settings.save();
-            } else if changed {
-                let kept = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.max.y - self.settings.log_height),
-                    rect.max,
-                );
-                ctx.data_mut(|d| {
-                    d.insert_persisted(
-                        egui::Id::new("logs"),
-                        egui::containers::panel::PanelState { rect: kept },
-                    )
-                });
-                ctx.request_repaint();
-            }
-        }
-        if let Some(mode) = new_mode {
-            self.set_log_mode(mode);
-        }
-        if toggle_split {
-            self.settings.log_split = !self.settings.log_split;
-            self.settings.save();
-        }
-
-        let handle = self.rt.handle().clone();
-        if let (Some(event), Some(i)) = (event, shown_log) {
-            if event.restart {
-                let id = self.next_id();
-                if let Some(log) = self.logs.get_mut(i) {
-                    log.start(id, &handle, &self.bus);
-                }
-            } else if load_older {
-                if let Some(log) = self.logs.get_mut(i) {
-                    log.load_older(&handle, &self.bus);
-                }
-            }
-        }
-        if let Some(i) = select {
-            self.active_log = i;
-            self.show_logs();
-        }
-        if reconnect {
-            if let Some(shell) = shown_shell.and_then(|i| self.shells.get_mut(i)) {
-                shell.start(&handle, &self.bus);
-            }
-        }
-        if let Some(i) = close {
-            if i < n_logs {
-                self.logs.remove(i);
-            } else {
-                self.shells.remove(i - n_logs);
-            }
-            let total = self.logs.len() + self.shells.len();
-            if self.active_log > i || self.active_log >= total {
-                self.active_log = self.active_log.saturating_sub(1);
-            }
-        }
-        if close_all {
-            self.logs.clear();
-            self.shells.clear();
-        }
-    }
-
-    fn ui_windows(&mut self, ctx: &egui::Context) {
-        // YAML viewer / editor
-        let mut save = None;
-        let mut reload = None;
-        if let Some(y) = self.yaml.as_mut() {
-            let mut open = true;
-            let editing = y.edit.is_some();
-            let dirty = y.create || matches!((&y.edit, &y.text), (Some(e), Some(Ok(t))) if e != t);
-            let mut close_window = false;
-            let title = if dirty && !y.create {
-                format!("{} (edited)", y.title)
-            } else {
-                y.title.clone()
+            let (select, edit, sort) = (shot.select, shot.edit, shot.sort.clone());
+            let timed_out = shot.started.elapsed() > Duration::from_secs(30);
+            let Some(ws) = self.ws_mut() else {
+                return Task::none();
             };
-            egui::Window::new(title)
-                .id(egui::Id::new("yaml-window"))
-                .open(&mut open)
-                .default_size([760.0, 620.0])
-                .resizable(true)
-                .show(ctx, |ui| {
-                    let Some(text) = &y.text else {
-                        ui.spinner();
-                        return;
-                    };
-                    let text = match text {
-                        Err(e) => {
-                            ui.colored_label(RED, e);
-                            return;
-                        }
-                        Ok(t) => t.clone(),
-                    };
-                    ui.horizontal(|ui| {
-                        if editing {
-                            let apply = if y.create {
-                                theme::primary_button(format!("{} Create", icon::PLUS))
-                            } else {
-                                theme::primary_button(format!("{} Apply", icon::FLOPPY_DISK))
-                            };
-                            let can_apply = dirty && !y.saving && y.parse_error.is_none();
-                            if ui.add_enabled(can_apply, apply).on_hover_text("Replace the object with this YAML (⌘S)").clicked() {
-                                save = Some(y.edit.clone().unwrap_or_default());
-                            }
-                            if ui.add_enabled(!y.saving, egui::Button::new("Cancel")).clicked() {
-                                if y.create {
-                                    close_window = true;
-                                }
-                                y.edit = None;
-                                y.save_error = None;
-                                y.parse_error = None;
-                            }
-                            if y.saving {
-                                ui.spinner();
-                            }
-                        } else {
-                            if ui.add(theme::primary_button(format!("{} Edit", icon::PENCIL_SIMPLE))).clicked() {
-                                y.edit = Some(text.clone());
-                                y.edit_started = true;
-                            }
-                            if ui.button(format!("{} Copy", icon::COPY)).clicked() {
-                                ui.ctx().copy_text(text.clone());
-                            }
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if y.create {
-                                ui.weak(format!("Namespace defaults to {}", y.namespace));
-                                return;
-                            }
-                            if ui.add_enabled(!y.saving, egui::Button::new(format!("{} Reload", icon::ARROW_CLOCKWISE)))
-                                .on_hover_text("Fetch the latest version (discards edits)")
-                                .clicked()
-                            {
-                                reload = Some((y.kind, y.namespace.clone(), y.name.clone(), editing));
-                            }
-                        });
-                    });
-                    let editor_id = egui::Id::new("yaml-editor");
-                    let find = &mut self.yaml_find;
-                    let doc = y.edit.as_deref().unwrap_or(&text);
-                    // Shift+Cmd+G first: egui's key matching ignores an extra Shift.
-                    let (cmd_f, cmd_shift_g, cmd_g) = ui.input_mut(|i| {
-                        (
-                            i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
-                            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::G),
-                            i.consume_key(egui::Modifiers::COMMAND, egui::Key::G),
-                        )
-                    });
-                    if cmd_f {
-                        find.open(ui.ctx(), editor_id, doc);
-                    }
-                    if find.open && (cmd_g || cmd_shift_g) {
-                        find.step(cmd_shift_g);
-                    }
-                    if find.open {
-                        ui.add_space(4.0);
-                        find.bar(ui, editor_id, doc);
-                    }
-                    if editing && text.contains("app.kubernetes.io/managed-by: Helm") {
-                        ui.add_space(4.0);
-                        ui.colored_label(YELLOW, format!("{} Managed by Helm: the next helm upgrade will overwrite changes made here.", icon::WARNING));
-                    }
-                    if let Some(e) = &y.save_error {
-                        ui.add_space(4.0);
-                        ui.colored_label(RED, e);
-                        if e.contains("modified") || e.contains("Conflict") {
-                            ui.weak("Someone changed it since you opened it. Copy your edits, Reload, and apply them again.");
-                        }
-                    }
-                    if let Some((line, msg)) = editing.then_some(()).and(y.parse_error.as_ref()) {
-                        ui.add_space(4.0);
-                        ui.colored_label(RED, format!("Line {line}: {msg}"));
-                    }
-                    ui.add_space(4.0);
-                    let mut cmd_save = false;
-                    egui::Frame::new().fill(theme::CONTENT).stroke(egui::Stroke::new(1.0, theme::BORDER)).corner_radius(4).show(ui, |ui| {
-                        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| match y.edit.as_mut() {
-                            Some(buffer) => {
-                                let error_line = y.parse_error.as_ref().map(|(l, _)| *l);
-                                if y.edit_started {
-                                    ui.scroll_to_cursor(Some(egui::Align::TOP));
-                                }
-                                let out = code_editor::yaml_editor(ui, editor_id, buffer, error_line, y.edit_started, find);
-                                y.edit_started = false;
-                                if out.changed {
-                                    y.parse_error = yaml_error(buffer);
-                                }
-                                cmd_save = out.save;
-                            }
-                            None => code_editor::yaml_viewer(ui, editor_id, &text, find),
-                        });
-                    });
-                    if cmd_save && dirty && !y.saving && y.parse_error.is_none() {
-                        save = Some(y.edit.clone().unwrap_or_default());
-                    }
-                });
-            if !open || close_window {
-                self.yaml = None;
+            if let Some(sort) = sort {
+                ws.sorts.insert(tab, sort);
             }
+            // `KUBE_UI_SCREENSHOT_FILTER=<regex>` presets the page's filter in regex mode.
+            if let Ok(re) = std::env::var("KUBE_UI_SCREENSHOT_FILTER") {
+                ws.filters.insert(tab, re);
+                ws.filter_regex = true;
+                ws.update_matcher();
+            }
+            if ws.tab != tab {
+                ws.set_tab(tab);
+                return Task::none();
+            }
+            let loaded = ws.client().is_some() && !ws.is_loading() && ws.last_refresh.is_some();
+            if !loaded && !timed_out {
+                return Task::none();
+            }
+            let running = ws
+                .pods
+                .items
+                .iter()
+                .find(|p| p.status == "Running")
+                .cloned();
+            let first = ws.first_row(tab);
+            if select {
+                if let Some(sel) = first.clone() {
+                    ws.select(sel);
+                }
+            }
+            if let Some(sel) = first.filter(|_| edit) {
+                tasks.push(self.apply(Action::EditYaml(sel.kind, sel.namespace, sel.name)));
+            }
+            // `KUBE_UI_SCREENSHOT_FIND=<text>` opens the YAML window's find bar with that query.
+            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_FIND") {
+                self.find.preset(q);
+            }
+            // `KUBE_UI_SCREENSHOT_ENV=<text>` presets the drawer's env search.
+            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_ENV") {
+                self.env_filter = q;
+                if let Some(ws) = self.ws_mut() {
+                    ws.drawer_tab = DrawerTab::Containers;
+                }
+            }
+            if std::env::var_os("KUBE_UI_SCREENSHOT_CREATE").is_some() {
+                if let Some(kind) = tab.kinds().first().copied() {
+                    tasks.push(self.apply(Action::Create(kind)));
+                }
+            }
+            if let Some(pod) =
+                running.filter(|_| self.screenshot.as_ref().is_some_and(|s| s.shell.is_some()))
+            {
+                tasks.push(self.apply(Action::Shell(pod, None)));
+            }
+            if let Some(shot) = self.screenshot.as_mut() {
+                shot.staged = Some(Instant::now());
+            }
+            return Task::batch(tasks);
         }
-        if let Some(yaml) = save {
-            if let Some(y) = self.yaml.as_mut() {
-                y.saving = true;
-                y.save_error = None;
-                let (title, ws, kind, ns, name) = (
-                    y.title.clone(),
-                    y.ws,
-                    y.kind,
-                    y.namespace.clone(),
-                    y.name.clone(),
-                );
-                let client = self
-                    .workspaces
-                    .iter()
-                    .find(|w| w.id == ws)
-                    .and_then(Workspace::client);
-                let bus = self.bus.clone();
-                match client {
-                    Some(client) if y.create => {
-                        self.rt.spawn(async move {
-                            let result = kube_ops::create_yaml(client, ns, yaml)
-                                .await
-                                .map_err(err_string);
-                            bus.send(Msg::YamlCreated { title, result });
-                        });
-                    }
-                    Some(client) => {
-                        self.rt.spawn(async move {
-                            let result = kube_ops::apply_yaml(client, kind, ns, name, yaml)
-                                .await
-                                .map_err(err_string);
-                            bus.send(Msg::YamlApplied { title, result });
-                        });
-                    }
-                    None => {
-                        y.saving = false;
-                        y.save_error = Some("That cluster tab is no longer connected.".into());
+        if shot.staged.is_none() {
+            let first_pod = self.ws().and_then(|w| w.pods.items.first().cloned());
+            let timed_out = shot.started.elapsed() > Duration::from_secs(20);
+            if first_pod.is_none() && !timed_out {
+                return Task::none();
+            }
+            if let Some(pod) = first_pod {
+                tasks.push(self.apply(Action::Select(Selected {
+                    kind: Kind::Pod,
+                    namespace: pod.namespace.clone(),
+                    name: pod.name.clone(),
+                })));
+                // `KUBE_UI_SCREENSHOT_PREVIOUS=1` opens the previous run's logs instead.
+                let previous = std::env::var_os("KUBE_UI_SCREENSHOT_PREVIOUS").is_some();
+                tasks.push(self.apply(Action::OpenLogs(pod, None, previous)));
+                if let Some(re) = self.screenshot.as_ref().and_then(|s| s.log_regex.clone()) {
+                    if let Some(log) = self.logs.last_mut() {
+                        log.set_filter(re, true);
                     }
                 }
             }
-        }
-        if let Some((kind, ns, name, editing)) = reload {
-            self.open_yaml(kind, ns, name);
-            if let Some(y) = self.yaml.as_mut() {
-                y.edit_on_load = editing;
+            // `KUBE_UI_SCREENSHOT_LOGS_COLLAPSED=1` shows the log panel folded to its tab strip.
+            if std::env::var_os("KUBE_UI_SCREENSHOT_LOGS_COLLAPSED").is_some() {
+                self.settings.log_mode = LogPanelMode::Collapsed;
             }
-        }
-
-        changelog::show(ctx, &mut self.changelog_open);
-
-        // Port-forward dialog
-        let mut start = None;
-        if let Some(d) = self.pf_dialog.as_mut() {
-            let mut open = true;
-            let mut cancel = false;
-            egui::Window::new("Start port forward")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    egui::Grid::new("pf-grid")
-                        .num_columns(2)
-                        .spacing([12.0, 10.0])
-                        .show(ui, |ui| {
-                            ui.label("Cluster");
-                            ui.label(&d.context);
-                            ui.end_row();
-
-                            ui.label("Target");
-                            ui.label(theme::semibold(format!(
-                                "{}/{}",
-                                d.namespace,
-                                d.target.label()
-                            )));
-                            ui.end_row();
-
-                            ui.label("Remote port");
-                            ui.horizontal(|ui| {
-                                for p in &d.ports {
-                                    ui.selectable_value(&mut d.remote_port, *p, p.to_string());
-                                }
-                                ui.add(egui::DragValue::new(&mut d.remote_port).range(1..=65535));
-                            });
-                            ui.end_row();
-
-                            ui.label("Local port");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut d.local_port).range(0..=65535));
-                                ui.weak("0 = random");
-                            });
-                            ui.end_row();
-                        });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(theme::primary_button(format!(
-                                "{} Start forward",
-                                icon::PLAY
-                            )))
-                            .clicked()
-                        {
-                            start = Some(SavedForward {
-                                kubeconfig: d.kubeconfig.clone(),
-                                context: d.context.clone(),
-                                namespace: d.namespace.clone(),
-                                target: d.target.clone(),
-                                remote_port: d.remote_port,
-                                local_port: d.local_port,
-                                active: false,
-                            });
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if !open || cancel || start.is_some() {
-                self.pf_dialog = None;
+            if let Some(shot) = self.screenshot.as_mut() {
+                shot.staged = Some(Instant::now());
             }
+            return Task::batch(tasks);
         }
-        if let Some(spec) = start {
-            let id = self.add_forward(spec);
-            self.start_forward(id);
-            if let Some(ws) = self.ws_mut() {
-                ws.set_tab(Tab::Forwards);
-            }
-        }
-
-        // Delete confirmation
-        if let Some((ws, kind, ns, name)) = self.confirm_delete.clone() {
-            let mut decided = None;
-            let label = kind.label();
-            egui::Window::new(format!("Delete {label}?"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("Delete {label} {ns}/{name}?"));
-                    let note = match kind {
-                        Kind::Pod => {
-                            "If it's managed by a controller, a replacement will be created."
-                        }
-                        Kind::Service => "Traffic to it stops right away.",
-                        Kind::CronJob => "Its jobs and their pods are deleted too.",
-                        _ => "Its pods are deleted too. This can't be undone.",
-                    };
-                    ui.weak(note);
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(theme::danger_button(format!(
-                                "{} Delete {label}",
-                                icon::TRASH
-                            )))
-                            .clicked()
-                        {
-                            decided = Some(true);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            decided = Some(false);
-                        }
-                    });
-                });
-            match decided {
-                Some(true) => {
-                    self.confirm_delete = None;
-                    if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws) {
-                        w.close_drawer();
+        // Type the shell command once the session is up, then give it time to print.
+        if let Some(cmd) = self.screenshot.as_ref().and_then(|s| s.shell.clone()) {
+            match self.shells.last_mut() {
+                Some(sh) if sh.status == shell::ShellStatus::Open => {
+                    sh.type_text(&format!("{cmd}\r"));
+                    if let Some(s) = self.screenshot.as_mut() {
+                        s.shell = None;
+                        s.staged = Some(Instant::now());
                     }
-                    self.run_change(
-                        Some(ws),
-                        format!("Deleted {} {name}", label.to_lowercase()),
-                        move |c| kube_ops::delete(c, kind, ns, name),
-                    );
                 }
-                Some(false) => self.confirm_delete = None,
-                None => {}
+                _ => return Task::none(),
             }
         }
-    }
-
-    fn ui_toasts(&mut self, ctx: &egui::Context) {
-        self.toasts.retain(|t| t.at.elapsed() < TOAST_FOR);
-        if self.toasts.is_empty() {
-            return;
-        }
-        egui::Area::new(egui::Id::new("toasts"))
-            .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                for t in &self.toasts {
-                    theme::card_frame().show(ui, |ui| {
-                        let (color, glyph) = if t.error {
-                            (RED, icon::WARNING_CIRCLE)
-                        } else {
-                            (GREEN, icon::CHECK_CIRCLE)
-                        };
-                        ui.horizontal_top(|ui| {
-                            ui.label(RichText::new(glyph).size(16.0).color(color));
-                            ui.add(
-                                egui::Label::new(RichText::new(&t.text).color(theme::TEXT)).wrap(),
-                            );
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-            });
-        ctx.request_repaint_after(Duration::from_millis(500));
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_messages();
-        self.track_window(ctx);
-
-        if self.workspaces.is_empty() {
-            self.ui_onboarding(ctx);
-            self.ui_toasts(ctx);
-            self.save_workspaces();
-            return;
-        }
-        self.active = self.active.min(self.workspaces.len() - 1);
-        self.tab_number_shortcuts(ctx);
-
-        // Only the front tab watches its list; background tabs catch up when shown.
-        let live = self.settings.live_updates;
-        let active = self.active;
-        for (i, ws) in self.workspaces.iter_mut().enumerate() {
-            if i == active {
-                ws.sync_watch(live);
-            } else {
-                ws.pause_watch();
-            }
-        }
-        let tab = self.ws().map(|w| w.tab).unwrap_or(Tab::Pods);
-        if let Some(ws) = self.ws_mut() {
-            if live && ws.client().is_some() {
-                ws.poll_details(DETAILS_EVERY);
-                ctx.request_repaint_after(DETAILS_EVERY);
-            }
-        }
-        if tab.is_list() || tab == Tab::Overview {
-            // Ages are computed when drawn; keep the seconds ticking.
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
-        if tab == Tab::Forwards && !self.forwards.is_empty() {
-            // Keep connection counts fresh.
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
-
-        let mut actions = Vec::new();
-        self.ui_top_bar(ctx);
-        self.ui_sidebar(ctx);
-        self.ui_logs(ctx);
-        if self.yaml.is_some()
-            && self.yaml_find.open
-            && self.yaml_find.field_focused
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        let Some(shot) = self.screenshot.as_mut() else {
+            return Task::none();
+        };
+        if !shot.requested
+            && shot
+                .staged
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(3))
         {
-            // Esc in the YAML find field closes the bar, not the drawer behind the window.
-            self.yaml_find.close(ctx, egui::Id::new("yaml-editor"));
-        }
-        if tab.is_list() {
-            if let Some(ws) = self.workspaces.get_mut(self.active) {
-                ws.ui_drawer(ctx, &mut actions);
+            if let Some(id) = self.window {
+                shot.requested = true;
+                return window::screenshot(id).map(Message::Screenshot);
             }
         }
-
-        egui::CentralPanel::default()
-            .frame(theme::content_frame())
-            .show(ctx, |ui| match tab {
-                Tab::Forwards => self.ui_forwards(ui, &mut actions),
-                Tab::Settings => self.ui_settings(ui),
-                _ => {
-                    if let Some(ws) = self.workspaces.get_mut(self.active) {
-                        match tab {
-                            Tab::Overview => ws.ui_overview(ui, &mut actions),
-                            Tab::Pods => ws.ui_pods(ui, &mut actions),
-                            Tab::Services => ws.ui_services(ui, &mut actions),
-                            Tab::Workload(kind) => ws.ui_workloads(ui, kind, &mut actions),
-                            _ => ws.ui_deployments(ui, &mut actions),
-                        }
-                    }
-                }
-            });
-        for a in actions {
-            self.apply(a);
-        }
-
-        self.ui_windows(ctx);
-        self.ui_toasts(ctx);
-        self.save_workspaces();
-        self.dev_screenshot(ctx);
+        Task::none()
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.window_dirty.take().is_some() {
-            self.settings.save();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Widgets
-// ---------------------------------------------------------------------------
-
-/// A combo-box-looking button with a popup under it. egui's own `ComboBox` wraps its popup
-/// in a scroll area sized from the popup's remembered size, so a popup that first opened small
-/// (namespaces still loading, a context with fewer entries) stayed clipped forever. Here the
-/// content sizes the popup directly. Returns `None` while closed.
-fn dropdown<R>(
-    ui: &mut egui::Ui,
-    id: &str,
-    width: f32,
-    selected_text: &str,
-    add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> Option<R> {
-    let button_id = ui.make_persistent_id(id);
-    let popup_id = button_id.with("popup");
-    let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
-
-    let pad = ui.spacing().button_padding;
-    let icon_w = ui.spacing().icon_width;
-    let gap = ui.spacing().icon_spacing;
-    let galley = egui::WidgetText::from(selected_text).into_galley(
-        ui,
-        Some(egui::TextWrapMode::Truncate),
-        (width - 2.0 * pad.x - gap - icon_w).max(0.0),
-        egui::TextStyle::Button,
-    );
-    let height = (galley.size().y.max(icon_w) + 2.0 * pad.y).max(ui.spacing().interact_size.y);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
-    let response = ui.interact(rect, button_id, Sense::click());
-    if ui.is_rect_visible(rect) {
-        let visuals = if open {
-            &ui.visuals().widgets.open
-        } else {
-            ui.style().interact(&response)
+    fn save_screenshot(&mut self, shot: window::Screenshot) {
+        let Some(dev) = self.screenshot.as_ref() else {
+            return;
         };
-        ui.painter().rect(
-            rect.expand(visuals.expansion),
-            visuals.corner_radius,
-            visuals.weak_bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let inner = rect.shrink2(pad);
-        let icon_rect =
-            Align2::RIGHT_CENTER.align_size_within_rect(egui::Vec2::splat(icon_w), inner);
-        theme::caret(ui, icon_rect.expand(visuals.expansion), visuals, open);
-        let text_rect = Align2::LEFT_CENTER.align_size_within_rect(galley.size(), inner);
-        ui.painter()
-            .galley(text_rect.min, galley, visuals.text_color());
-    }
-
-    egui::Popup::menu(&response)
-        .id(popup_id)
-        .width(width)
-        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            add_contents(ui)
-        })
-        .map(|r| r.inner)
-}
-
-/// A combo box with a search field. Returns the picked value, if any.
-fn searchable_combo(
-    ui: &mut egui::Ui,
-    id: &str,
-    width: f32,
-    selected_text: &str,
-    query: &mut String,
-    options: &[(Option<String>, String)],
-    current: &Option<String>,
-) -> Option<Option<String>> {
-    let mut picked = None;
-    let shown = dropdown(ui, id, width, selected_text, |ui| {
-        ui.set_min_width(width.max(240.0));
-        let edit = ui.add(
-            egui::TextEdit::singleline(query)
-                .hint_text(format!("{} Search…", icon::MAGNIFYING_GLASS))
-                .desired_width(f32::INFINITY),
-        );
-        if !edit.has_focus() && ui.memory(|m| m.focused().is_none()) {
-            edit.request_focus();
+        if let Err(e) = image::save_buffer(
+            &dev.path,
+            &shot.rgba,
+            shot.size.width,
+            shot.size.height,
+            image::ExtendedColorType::Rgba8,
+        ) {
+            eprintln!("screenshot failed: {e}");
         }
-        let q = query.to_lowercase();
-        let matches: Vec<&(Option<String>, String)> = options
-            .iter()
-            .filter(|(_, label)| label.to_lowercase().contains(&q))
-            .collect();
-        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            picked = matches.first().map(|(value, _)| value.clone());
-        }
-        ui.separator();
-        // The list keeps one height while searching: egui popups only offer last frame's
-        // size, so a list that shrank to a few results could never grow back. Sized from all
-        // options (not the matches), capped so long lists scroll.
-        let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-        let list_height = ((options.len()).max(1) as f32 * row).min(340.0);
-        egui::ScrollArea::vertical()
-            .max_height(list_height)
-            .min_scrolled_height(list_height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (value, label) in &matches {
-                    if ui.selectable_label(value == current, label).clicked() {
-                        picked = Some(value.clone());
-                    }
-                }
-                if matches.is_empty() {
-                    ui.weak("No matches");
-                }
-            });
-        if picked.is_some() {
-            ui.close();
-        }
-    });
-    if shown.is_none() || picked.is_some() {
-        query.clear();
-    }
-    picked
-}
-
-/// A "⋯" button that opens a menu of secondary actions. Any click inside closes it.
-/// "ns", "a, b", "4 namespaces" or "All namespaces" (`short` gives "all" for the tab strip).
-fn namespaces_label(selected: &[String], short: bool) -> String {
-    match selected.len() {
-        0 if short => "all".into(),
-        0 => "All namespaces".into(),
-        1 => selected[0].clone(),
-        2 => selected.join(", "),
-        n if short => format!("{n} ns"),
-        n => format!("{n} namespaces"),
-    }
-}
-
-/// Namespace picker with search. Clicking a name selects only that namespace; ticking a
-/// checkbox adds it to (or removes it from) the selection and keeps the list open.
-/// Returns the new selection (empty = all namespaces) when it changed.
-fn namespace_picker(
-    ui: &mut egui::Ui,
-    id: &str,
-    width: f32,
-    query: &mut String,
-    options: &[String],
-    selected: &[String],
-) -> Option<Vec<String>> {
-    let mut picked: Option<Vec<String>> = None;
-    let mut close = false;
-    let shown = dropdown(ui, id, width, &namespaces_label(selected, false), |ui| {
-        ui.set_min_width(width.max(280.0));
-        let edit = ui.add(
-            egui::TextEdit::singleline(query)
-                .hint_text(format!("{} Search…", icon::MAGNIFYING_GLASS))
-                .desired_width(f32::INFINITY),
-        );
-        if !edit.has_focus() && ui.memory(|m| m.focused().is_none()) {
-            edit.request_focus();
-        }
-        let q = query.to_lowercase();
-        let matches: Vec<&String> = options
-            .iter()
-            .filter(|n| n.to_lowercase().contains(&q))
-            .collect();
-        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            if let Some(first) = matches.first() {
-                picked = Some(vec![(*first).clone()]);
-                close = true;
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.weak(RichText::new("Tick to add · click a name to pick only it").small());
-            if selected.len() > 1 && ui.small_button("Clear").clicked() {
-                picked = Some(vec![selected[0].clone()]);
-            }
-        });
-        ui.separator();
-        // The list keeps one height while searching: egui popups only offer last frame's
-        // size, so a list that shrank to a few results could never grow back. Sized from all
-        // options (not the matches), capped so long lists scroll.
-        let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-        let list_height = ((options.len() + 1).max(1) as f32 * row).min(360.0);
-        egui::ScrollArea::vertical()
-            .max_height(list_height)
-            .min_scrolled_height(list_height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if q.is_empty()
-                    && ui
-                        .selectable_label(selected.is_empty(), "All namespaces")
-                        .clicked()
-                {
-                    picked = Some(Vec::new());
-                    close = true;
-                }
-                for ns in &matches {
-                    ui.horizontal(|ui| {
-                        let mut checked = selected.contains(ns);
-                        if theme::checkbox(ui, &mut checked, "")
-                            .on_hover_text("Add to selection")
-                            .changed()
-                        {
-                            let mut next: Vec<String> = selected.to_vec();
-                            if checked {
-                                next.push((*ns).clone());
-                            } else {
-                                next.retain(|n| n != *ns);
-                            }
-                            // Unticking the last one keeps it rather than jumping to "all".
-                            if !next.is_empty() {
-                                picked = Some(next);
-                            }
-                        }
-                        let only = selected.len() == 1 && selected[0] == **ns;
-                        // Full-width so the whole row is clickable; the empty `right_text`
-                        // inserts a flexible gap, which left-aligns the name.
-                        let label = egui::Button::selectable(only, ns.as_str())
-                            .right_text("")
-                            .min_size(egui::vec2(ui.available_width(), 0.0));
-                        if ui.add(label).clicked() {
-                            picked = Some(vec![(*ns).clone()]);
-                            close = true;
-                        }
-                    });
-                }
-                if matches.is_empty() {
-                    ui.weak("No matches");
-                }
-            });
-        if close {
-            ui.close();
-        }
-    });
-    if shown.is_none() || close {
-        query.clear();
-    }
-    picked
-}
-
-fn overflow_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    // Framed like the secondary buttons it usually sits beside, so it reads as a control.
-    let resp = ui.button(icon::DOTS_THREE).on_hover_text("More actions");
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(180.0);
-        add_contents(ui);
-    });
-}
-
-fn sub_section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(8.0);
-    ui.label(theme::label_small(title));
-}
-
-fn code_block(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .fill(ui.visuals().extreme_bg_color)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::same(6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(text).monospace().small()).wrap());
-        });
-}
-
-/// Shows a value in monospace, wrapping, with long values cut short (full value on hover).
-fn value_label(ui: &mut egui::Ui, value: &str) {
-    let color = ui.visuals().text_color();
-    value_label_in(ui, value, color);
-}
-
-/// `value_label` in a given colour (env values use the editor's string green).
-fn value_label_in(ui: &mut egui::Ui, value: &str, color: egui::Color32) {
-    const MAX: usize = 400;
-    if value.is_empty() {
-        ui.weak("(empty)");
-    } else if value.chars().count() > MAX {
-        let short: String = value.chars().take(MAX).collect();
-        ui.add(
-            egui::Label::new(RichText::new(format!("{short}…")).monospace().color(color)).wrap(),
-        )
-        .on_hover_text(value);
-    } else {
-        ui.add(egui::Label::new(RichText::new(value).monospace().color(color)).wrap());
-    }
-}
-
-/// Case-insensitive env filter on the name, value and where it comes from.
-fn env_matches(filter: &str, name: &str, value: Option<&str>, source: Option<&str>) -> bool {
-    filter.is_empty()
-        || [Some(name), value, source]
-            .into_iter()
-            .flatten()
-            .any(|s| s.to_lowercase().contains(filter))
-}
-
-fn env_item(ui: &mut egui::Ui, name: &str, value: Option<&str>, source: Option<&str>) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(name).monospace().strong());
-        if let Some(s) = source {
-            ui.weak(RichText::new(s).small());
-        }
-    });
-    match value {
-        Some(v) => value_label_in(ui, v, theme::SYNTAX_STRING),
-        None => {
-            ui.weak("set at runtime");
-        }
-    }
-}
-
-fn resources_grid(
-    ui: &mut egui::Ui,
-    id: &str,
-    requests: &[(String, String)],
-    limits: &[(String, String)],
-) {
-    let mut names: Vec<&String> = requests
-        .iter()
-        .chain(limits.iter())
-        .map(|(k, _)| k)
-        .collect();
-    names.sort();
-    names.dedup();
-    let find = |list: &[(String, String)], name: &str| {
-        list.iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "-".into())
-    };
-    egui::Grid::new(id)
-        .num_columns(3)
-        .spacing([24.0, 4.0])
-        .show(ui, |ui| {
-            ui.weak("");
-            ui.weak("Request");
-            ui.weak("Limit");
-            ui.end_row();
-            for name in names {
-                ui.label(name.as_str());
-                ui.monospace(find(requests, name));
-                ui.monospace(find(limits, name));
-                ui.end_row();
-            }
-        });
-}
-
-fn conditions(ui: &mut egui::Ui, list: &[details::Condition]) {
-    if list.is_empty() {
-        return;
-    }
-    section(ui, "Conditions");
-    for c in list {
-        ui.horizontal_wrapped(|ui| {
-            dot(ui, if c.ok { GREEN } else { YELLOW });
-            let resp = ui.label(&c.type_);
-            if !c.message.is_empty() {
-                resp.on_hover_text(&c.message);
-            }
-            if !c.reason.is_empty() {
-                ui.weak(&c.reason);
-            }
-        });
-    }
-}
-
-fn annotations(ui: &mut egui::Ui, id: &str, list: &[(String, String)]) {
-    if list.is_empty() {
-        return;
-    }
-    ui.add_space(10.0);
-    egui::CollapsingHeader::new(theme::label_small(format!("Annotations ({})", list.len())))
-        .id_salt(id)
-        .show(ui, |ui| {
-            for (k, v) in list {
-                ui.label(RichText::new(k).small().weak());
-                value_label(ui, v);
-                ui.add_space(4.0);
-            }
-        });
-}
-
-/// Quotes a command-line word for display when it contains spaces or shell metacharacters.
-fn shell_quote(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c))
-    {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
-fn dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(16.0);
-    ui.label(theme::label_small(title));
-    ui.add_space(4.0);
-}
-
-/// A resource name that fits its cell: Kubernetes names differ at the end (the
-/// ReplicaSet hash and pod suffix), so shorten from the middle and keep the tail.
-/// The full name shows on hover.
-fn name_cell(ui: &mut egui::Ui, name: &str) {
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let char_width = ui.fonts_mut(|f| f.glyph_width(&font, 'm')).max(1.0);
-    let fits = ((ui.available_width() - 4.0) / char_width).floor().max(8.0) as usize;
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= fits {
-        ui.label(mono(name));
-        return;
-    }
-    let tail = (fits / 3).clamp(5, 16);
-    let head = fits.saturating_sub(tail + 1);
-    let short: String = chars[..head]
-        .iter()
-        .chain(['…'].iter())
-        .chain(chars[chars.len() - tail..].iter())
-        .collect();
-    ui.label(mono(short)).on_hover_text(name);
-}
-
-/// Names and data cells: JetBrains Mono, which also gives tabular figures.
-fn mono(text: impl Into<String>) -> RichText {
-    RichText::new(text).monospace().color(theme::TEXT)
-}
-
-fn mono_muted(text: impl Into<String>) -> RichText {
-    RichText::new(text).monospace().color(theme::TEXT_MUTED)
-}
-
-/// Restarts on a fixed severity ramp: none, tinted amber, filled red at five or more.
-fn restarts_badge(ui: &mut egui::Ui, restarts: i32) {
-    match restarts {
-        0 => {
-            ui.label(mono("0").color(theme::TEXT_FAINT));
-        }
-        1..=4 => {
-            theme::badge(ui, &restarts.to_string(), theme::WARN, false);
-        }
-        _ => {
-            theme::badge(ui, &restarts.to_string(), theme::BAD, true);
-        }
-    }
-}
-
-fn details_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]) {
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing([16.0, 7.0])
-        .min_col_width(110.0)
-        .show(ui, |ui| {
-            for (key, value) in rows {
-                ui.label(RichText::new(*key).color(theme::TEXT_MUTED));
-                let value = if value.is_empty() { "-" } else { value };
-                ui.add(egui::Label::new(mono(value)).truncate())
-                    .on_hover_text(value);
-                ui.end_row();
-            }
-        });
-}
-
-fn tags(ui: &mut egui::Ui, items: impl Iterator<Item = String>) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for item in items {
-            tag(ui, &item);
-        }
-    });
-}
-
-/// A pill-shaped label. Its size is measured up front so a wrapping layout moves the
-/// whole tag to the next row instead of squeezing the text into the leftover space.
-/// Only text longer than a full row wraps inside the tag. Click copies it.
-fn tag(ui: &mut egui::Ui, text: &str) {
-    let padding = egui::vec2(6.0, 2.0);
-    let wrap_width = (ui.max_rect().width() - 2.0 * padding.x).max(40.0);
-    let galley = egui::WidgetText::from(RichText::new(text).small().monospace()).into_galley(
-        ui,
-        Some(egui::TextWrapMode::Wrap),
-        wrap_width,
-        egui::TextStyle::Small,
-    );
-    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::click());
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.visuals();
-        let fill = if response.hovered() {
-            visuals.widgets.hovered.weak_bg_fill
-        } else {
-            visuals.faint_bg_color
-        };
-        ui.painter().rect(
-            rect,
-            4.0,
-            fill,
-            visuals.widgets.noninteractive.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        ui.painter()
-            .galley(rect.min + padding, galley, visuals.text_color());
-    }
-    if response.on_hover_text("Click to copy").clicked() {
-        ui.ctx().copy_text(text.to_string());
+        std::process::exit(0);
     }
 }
 
@@ -3765,42 +2725,6 @@ fn sort_rows<T>(rows: &mut [&T], sort: Option<&Sort>, key: impl Fn(&T, &str) -> 
     });
 }
 
-/// A clickable column header: click to sort ascending, again for descending, again to clear.
-fn sort_header(ui: &mut egui::Ui, label: &str, sort: Option<&Sort>, clicked: &mut Option<String>) {
-    let active = sort.filter(|s| s.col == label);
-    let text = match active {
-        Some(s) => format!(
-            "{label} {}",
-            if s.asc {
-                icon::CARET_UP
-            } else {
-                icon::CARET_DOWN
-            }
-        ),
-        None => label.to_string(),
-    };
-    let color = if active.is_some() {
-        theme::TEXT
-    } else {
-        theme::TEXT_MUTED
-    };
-    let resp = ui
-        .add(
-            egui::Label::new(theme::label_small(text).color(color))
-                .sense(Sense::click())
-                .selectable(false),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hint = match active {
-        Some(s) if s.asc => format!("Sorted by {label}, ascending. Click for descending."),
-        Some(_) => format!("Sorted by {label}, descending. Click to clear."),
-        None => format!("Sort by {label}"),
-    };
-    if resp.on_hover_text(hint).clicked() {
-        *clicked = Some(label.to_string());
-    }
-}
-
 fn tab_label(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => "Overview",
@@ -3813,7 +2737,7 @@ fn tab_label(tab: Tab) -> &'static str {
     }
 }
 
-fn health_color(h: Health) -> Color32 {
+fn health_color(h: Health) -> Color {
     match h {
         Health::Ok => GREEN,
         Health::Progress => YELLOW,
@@ -3826,13 +2750,47 @@ fn count<T>(s: &ListState<T>) -> Option<usize> {
     s.loaded.then_some(s.items.len())
 }
 
-fn status_color(status: &str) -> Color32 {
+fn status_color(status: &str) -> Color {
     match status {
         "Running" | "Succeeded" | "Completed" => GREEN,
         "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" | "Waiting" => YELLOW,
         s if s.starts_with("Init:") => YELLOW,
         _ => RED,
     }
+}
+
+/// "ns", "a, b", "4 namespaces" or "All namespaces" (`short` gives "all" for the tab strip).
+fn namespaces_label(selected: &[String], short: bool) -> String {
+    match selected.len() {
+        0 if short => "all".into(),
+        0 => "All namespaces".into(),
+        1 => selected[0].clone(),
+        2 => selected.join(", "),
+        n if short => format!("{n} ns"),
+        n => format!("{n} namespaces"),
+    }
+}
+
+/// Quotes a command-line word for display when it contains spaces or shell metacharacters.
+fn shell_quote(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Case-insensitive env filter on the name, value and where it comes from.
+fn env_matches(filter: &str, name: &str, value: Option<&str>, source: Option<&str>) -> bool {
+    filter.is_empty()
+        || [Some(name), value, source]
+            .into_iter()
+            .flatten()
+            .any(|s| s.to_lowercase().contains(filter))
 }
 
 fn default_kubeconfig() -> Option<PathBuf> {
@@ -3874,6 +2832,20 @@ fn display_path(p: &Path) -> String {
     p.display().to_string()
 }
 
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = result {
+        eprintln!("could not open {url}: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3894,4 +2866,14 @@ mod tests {
         assert_eq!(cmp_keys(&SortKey::Num(5), &SortKey::text("x")), Less);
         assert_eq!(cmp_keys(&SortKey::Num(2), &SortKey::Num(10)), Less);
     }
+}
+
+/// The app's text font (Inter).
+pub fn theme_font() -> iced::Font {
+    theme::INTER
+}
+
+/// Font files the app needs loaded.
+pub fn fonts() -> [&'static [u8]; 4] {
+    theme::fonts()
 }

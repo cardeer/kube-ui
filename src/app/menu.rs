@@ -1,7 +1,7 @@
 //! The native macOS menu bar. Items that need the app send a [`MenuCommand`] through the
 //! message bus; window and app-level items (Hide, Minimize, Full Screen…) are handled by AppKit.
 //!
-//! Menu shortcuts reach AppKit before egui sees the key, so none of them may reuse a key the
+//! Menu shortcuts reach AppKit before iced sees the key, so none of them may reuse a key the
 //! app handles itself: ⌘F/⌘G/⌘⇧G (find), ⌘S and ⌘/ (YAML editor), and the text-editing keys.
 
 use muda::{
@@ -69,7 +69,7 @@ impl MenuBar {
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::show_all(None),
                 &PredefinedMenuItem::separator(),
-                // Our own item rather than AppKit's, so eframe shuts down normally.
+                // Our own item rather than AppKit's, so the app saves its state and exits normally.
                 &item(MenuCommand::Quit, "Quit Kube UI", key(cmd, Code::KeyQ)),
             ],
         )

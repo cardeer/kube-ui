@@ -5,6 +5,10 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Changed
+- The interface is rebuilt on iced 0.14 (from egui). Everything works as before; long lists,
+  logs and the terminal draw only what's on screen.
+
 ### Added
 - Native macOS menu bar. The Kube UI menu has About, Check for Updates…, What's New and
   Settings… (⌘,). There's also a Window menu and a Help menu with links to GitHub and the

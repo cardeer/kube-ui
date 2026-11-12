@@ -3,36 +3,33 @@ mod details;
 mod kube_ops;
 mod settings;
 
-use eframe::egui;
-
-const MIN_WINDOW_SIZE: [f32; 2] = [1120.0, 600.0];
-
-fn main() -> eframe::Result {
+fn main() -> iced::Result {
     inherit_shell_path();
     // Reopen at the size the window had last time.
     let saved = settings::Settings::load();
+    let min = app::MIN_WINDOW_SIZE;
     let size = saved
         .window_size
-        .map(|[w, h]| [w.max(MIN_WINDOW_SIZE[0]), h.max(MIN_WINDOW_SIZE[1])])
-        .unwrap_or([1360.0, 860.0]);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Kube UI")
-            .with_inner_size(size)
-            .with_maximized(saved.window_maximized)
-            .with_min_inner_size(MIN_WINDOW_SIZE)
-            // eframe otherwise replaces the Dock icon with the egui logo while running.
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
-                    .expect("bundled icon is a valid PNG"),
-            ),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Kube UI",
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+        .map(|[w, h]| iced::Size::new(w.max(min.width), h.max(min.height)))
+        .unwrap_or(iced::Size::new(1360.0, 860.0));
+    let mut app = iced::application(app::App::new, app::App::update, app::App::view)
+        .title(app::App::title)
+        .theme(app::App::theme)
+        .subscription(app::App::subscription)
+        .window(iced::window::Settings {
+            size,
+            min_size: Some(min),
+            icon: iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None)
+                .ok(),
+            ..Default::default()
+        })
+        .exit_on_close_request(false)
+        .antialiasing(true)
+        .default_font(app::theme_font());
+    for font in app::fonts() {
+        app = app.font(font);
+    }
+    app.run()
 }
 
 /// Apps launched from Finder get a minimal PATH, so kubeconfig exec plugins
