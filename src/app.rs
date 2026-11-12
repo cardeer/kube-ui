@@ -528,11 +528,16 @@ struct Popup {
     query: String,
 }
 
-/// An edge being dragged to resize a panel.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// An edge being dragged to resize a panel or a table column.
+#[derive(Clone, PartialEq, Debug)]
 pub enum Drag {
     Drawer,
     Dock,
+    /// A table column (its saved-width key) and its width when the drag began.
+    Column {
+        key: String,
+        start: f32,
+    },
 }
 
 /// Messages from the UI.
@@ -591,6 +596,8 @@ pub enum Message {
     EnvFilter(String),
     ToggleSection(String),
     DragStart(Drag),
+    /// Back to a column's default width.
+    ResetColumn(String),
 
     // Generic
     Copy(String),
@@ -668,6 +675,8 @@ pub struct App {
     changelog_open: bool,
     popup: Option<Popup>,
     drag: Option<Drag>,
+    /// Where the pointer was when the drag began.
+    drag_origin: Point,
     drawer_width: f32,
     /// The pointer is over this row of the current list.
     hovered_row: Option<usize>,
@@ -746,6 +755,7 @@ impl App {
             changelog_open: false,
             popup: None,
             drag: None,
+            drag_origin: Point::ORIGIN,
             drawer_width: 460.0,
             hovered_row: None,
             env_filter: String::new(),
@@ -947,12 +957,12 @@ impl App {
             Message::CloseRequested => return self.quit(),
             Message::CursorMoved(p) => {
                 self.cursor = p;
-                if let Some(drag) = self.drag {
+                if let Some(drag) = self.drag.clone() {
                     self.drag_to(drag, p);
                 }
             }
             Message::MouseReleased => {
-                if self.drag.take() == Some(Drag::Dock) {
+                if matches!(self.drag.take(), Some(Drag::Dock | Drag::Column { .. })) {
                     self.settings.save();
                 }
             }
@@ -1122,7 +1132,15 @@ impl App {
                     self.toggled_sections.insert(key);
                 }
             }
-            Message::DragStart(drag) => self.drag = Some(drag),
+            Message::DragStart(drag) => {
+                self.drag = Some(drag);
+                self.drag_origin = self.cursor;
+            }
+            Message::ResetColumn(key) => {
+                if self.settings.column_widths.remove(&key).is_some() {
+                    self.settings.save();
+                }
+            }
 
             Message::Copy(text) => return iced::clipboard::write(text),
             Message::OpenUrl(url) => {
@@ -1310,6 +1328,10 @@ impl App {
             Drag::Drawer => {
                 let max = (self.window_size.width - NAV_WIDTH - 360.0).max(DRAWER_MIN_WIDTH);
                 self.drawer_width = (self.window_size.width - p.x).clamp(DRAWER_MIN_WIDTH, max);
+            }
+            Drag::Column { key, start } => {
+                let w = (start + p.x - self.drag_origin.x).clamp(table::MIN_COL_WIDTH, 1600.0);
+                self.settings.column_widths.insert(key, w.round());
             }
             Drag::Dock => {
                 let max = self.dock_max_height();

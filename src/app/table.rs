@@ -1,15 +1,20 @@
 //! Resource tables: a sortable header and rows drawn only where they're visible, so lists
 //! of thousands of pods stay quick. Wide tables scroll sideways instead of clipping columns.
 
+use std::collections::BTreeMap;
+
 use iced::{
     Element, Length, Size,
     widget::{Space, column, container, mouse_area, responsive, row, scrollable, text},
 };
 
-use super::{Message, ROW_HEIGHT, Sort, icons as icon, theme};
+use super::{Drag, Message, ROW_HEIGHT, Sort, icons as icon, theme};
 
 const HEADER_HEIGHT: f32 = 26.0;
 const CELL_PAD: f32 = 8.0;
+/// The grab area at the right edge of each header cell.
+const HANDLE_W: f32 = 7.0;
+pub const MIN_COL_WIDTH: f32 = 40.0;
 
 pub enum Width {
     Fixed(f32),
@@ -50,8 +55,12 @@ pub struct Table<'a, F> {
     pub id: &'static str,
     pub cols: Vec<Col>,
     pub sort: Option<&'a Sort>,
-    /// The page whose sort a header click changes.
+    /// The page whose sort a header click changes; also keys its saved column widths.
     pub tab: super::Tab,
+    /// Headers sort the rows when clicked.
+    pub sortable: bool,
+    /// Column widths the user dragged, keyed `"<page>/<column>"`.
+    pub widths: &'a BTreeMap<String, f32>,
     pub len: usize,
     /// The body's scroll offset from the last scroll event.
     pub scroll: f32,
@@ -69,35 +78,43 @@ where
     }
 
     fn layout(&self, size: Size) -> Element<'a, Message> {
-        let fixed: f32 = self
+        // A column the user resized keeps that width.
+        let cols: Vec<Width> = self
             .cols
             .iter()
-            .map(|c| match c.width {
-                Width::Fixed(w) => w,
+            .map(|c| match self.widths.get(&width_key(self.tab, &c.title)) {
+                Some(w) => Width::Fixed(*w),
+                None => match c.width {
+                    Width::Fixed(w) => Width::Fixed(w),
+                    Width::Fill(m) => Width::Fill(m),
+                },
+            })
+            .collect();
+        let fixed: f32 = cols
+            .iter()
+            .map(|c| match c {
+                Width::Fixed(w) => *w,
                 Width::Fill(_) => 0.0,
             })
             .sum();
-        let fill_min: f32 = self
-            .cols
+        let fill_min: f32 = cols
             .iter()
-            .map(|c| match c.width {
-                Width::Fill(m) => m,
+            .map(|c| match c {
+                Width::Fill(m) => *m,
                 Width::Fixed(_) => 0.0,
             })
             .sum();
-        let fills = self
-            .cols
+        let fills = cols
             .iter()
-            .filter(|c| matches!(c.width, Width::Fill(_)))
+            .filter(|c| matches!(c, Width::Fill(_)))
             .count()
             .max(1) as f32;
         let total = size.width.max(fixed + fill_min).floor();
         let spare = (total - fixed - fill_min).max(0.0) / fills;
-        let widths: Vec<f32> = self
-            .cols
+        let widths: Vec<f32> = cols
             .iter()
-            .map(|c| match c.width {
-                Width::Fixed(w) => w,
+            .map(|c| match c {
+                Width::Fixed(w) => *w,
                 Width::Fill(m) => m + spare,
             })
             .collect();
@@ -107,7 +124,7 @@ where
             .cols
             .iter()
             .zip(&widths)
-            .map(|(c, w)| sort_header(&c.title, self.sort, self.tab, *w)))
+            .map(|(c, w)| self.header_cell(&c.title, *w)))
         .height(HEADER_HEIGHT)
         .width(total);
 
@@ -191,56 +208,86 @@ where
     }
 }
 
-/// A clickable column header: click to sort ascending, again for descending, again to clear.
-fn sort_header<'a>(
-    label: &str,
-    sort: Option<&Sort>,
-    tab: super::Tab,
-    width: f32,
-) -> Element<'a, Message> {
-    let active = sort.filter(|s| s.col == label);
-    let color = if active.is_some() {
-        theme::TEXT
-    } else {
-        theme::TEXT_MUTED
-    };
-    let mut content = row![theme::label_small(label.to_string()).color(color)]
+impl<F> Table<'_, F> {
+    /// A column header: click to sort ascending, again for descending, again to clear.
+    /// Its right edge drags to resize the column; double-click it to reset.
+    fn header_cell<'b>(&self, label: &str, width: f32) -> Element<'b, Message> {
+        let active = self.sort.filter(|s| s.col == label);
+        let color = if active.is_some() {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        };
+        let mut content = row![
+            theme::label_small(label.to_string())
+                .color(color)
+                .wrapping(text::Wrapping::None)
+        ]
         .spacing(4)
         .align_y(iced::Center);
-    if let Some(s) = active {
-        content = content.push(
-            text(if s.asc {
-                icon::CARET_UP
-            } else {
-                icon::CARET_DOWN
-            })
-            .font(theme::ICONS)
-            .size(11.0)
-            .color(color),
+        if let Some(s) = active {
+            content = content.push(
+                text(if s.asc {
+                    icon::CARET_UP
+                } else {
+                    icon::CARET_DOWN
+                })
+                .font(theme::ICONS)
+                .size(11.0)
+                .color(color),
+            );
+        }
+        let title: Element<'b, Message> = if label.is_empty() || !self.sortable {
+            content.into()
+        } else {
+            let hint = match active {
+                Some(s) if s.asc => format!("Sorted by {label}, ascending. Click for descending."),
+                Some(_) => format!("Sorted by {label}, descending. Click to clear."),
+                None => format!("Sort by {label}"),
+            };
+            theme::tip(
+                mouse_area(content)
+                    .on_press(Message::Sort(self.tab, label.to_string()))
+                    .interaction(iced::mouse::Interaction::Pointer),
+                hint,
+            )
+        };
+        let key = width_key(self.tab, label);
+        let handle = theme::tip(
+            mouse_area(
+                container(
+                    container(Space::new().width(1).height(14))
+                        .style(theme::fill(theme::BORDER_STRONG)),
+                )
+                .center(Length::Fill)
+                .width(HANDLE_W),
+            )
+            .on_press(Message::DragStart(Drag::Column {
+                key: key.clone(),
+                start: width,
+            }))
+            .on_double_click(Message::ResetColumn(key))
+            .interaction(iced::mouse::Interaction::ResizingHorizontally),
+            "Drag to resize · double-click to reset",
         );
-    }
-    let hint = match active {
-        Some(s) if s.asc => format!("Sorted by {label}, ascending. Click for descending."),
-        Some(_) => format!("Sorted by {label}, descending. Click to clear."),
-        None => format!("Sort by {label}"),
-    };
-    let cell: Element<'a, Message> = if label.is_empty() {
-        Space::new().into()
-    } else {
-        theme::tip(
-            mouse_area(content)
-                .on_press(Message::Sort(tab, label.to_string()))
-                .interaction(iced::mouse::Interaction::Pointer),
-            hint,
-        )
-    };
-    container(cell)
+        row![
+            container(title)
+                .width(Length::Fill)
+                .height(HEADER_HEIGHT)
+                .padding([0.0, CELL_PAD])
+                .center_y(HEADER_HEIGHT)
+                .clip(true),
+            handle,
+        ]
         .width(width)
         .height(HEADER_HEIGHT)
-        .padding([0.0, CELL_PAD])
-        .center_y(HEADER_HEIGHT)
-        .clip(true)
         .into()
+    }
+}
+
+/// Where a column's dragged width is saved.
+pub fn width_key(tab: super::Tab, col: &str) -> String {
+    format!("{}/{col}", tab.key())
 }
 
 /// A resource name that fits its cell: Kubernetes names differ at the end (the ReplicaSet

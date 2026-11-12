@@ -15,6 +15,8 @@ pub(in crate::app) struct ViewCtx<'a> {
     pub env_filter: &'a str,
     pub toggled: &'a HashSet<String>,
     pub drawer_width: f32,
+    /// Table column widths the user dragged.
+    pub widths: &'a BTreeMap<String, f32>,
 }
 
 impl ViewCtx<'_> {
@@ -200,6 +202,8 @@ impl Workspace {
                 cols,
                 sort,
                 tab: Tab::Pods,
+                sortable: true,
+                widths: ctx.widths,
                 len: rows.len(),
                 scroll: self.list_scroll,
                 hovered: ctx.hovered,
@@ -224,10 +228,20 @@ impl Workspace {
                         theme::mono_muted(p.age()).into(),
                     ];
                     if show_ns {
-                        cells.push(theme::mono_muted(p.namespace.as_str()).into());
+                        cells.push(table::truncated(
+                            &p.namespace.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     if show_node {
-                        cells.push(theme::mono_muted(p.node.as_str()).into());
+                        cells.push(table::truncated(
+                            &p.node.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     Row {
                         cells,
@@ -281,6 +295,8 @@ impl Workspace {
                 cols,
                 sort,
                 tab: Tab::Services,
+                sortable: true,
+                widths: ctx.widths,
                 len: rows.len(),
                 scroll: self.list_scroll,
                 hovered: ctx.hovered,
@@ -288,16 +304,26 @@ impl Workspace {
                     let s: &SvcRow = rows[i];
                     let mut cells: Vec<El<'a>> = vec![
                         table::name_cell(&s.name, w[0]),
-                        theme::muted(s.kind.as_str()).into(),
+                        table::truncated(&s.kind, w[1], 7.6, theme::muted),
                         table::truncated(&s.ports_label(), w[2], 7.5, theme::mono),
                         theme::mono_muted(s.cluster_ip.as_str()).into(),
                         theme::mono_muted(s.age()).into(),
                     ];
                     if show_ns {
-                        cells.push(theme::mono_muted(s.namespace.as_str()).into());
+                        cells.push(table::truncated(
+                            &s.namespace.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     if show_external {
-                        cells.push(theme::mono_muted(s.external.as_str()).into());
+                        cells.push(table::truncated(
+                            &s.external.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     Row {
                         cells,
@@ -351,6 +377,8 @@ impl Workspace {
                 cols,
                 sort,
                 tab: Tab::Deployments,
+                sortable: true,
+                widths: ctx.widths,
                 len: rows.len(),
                 scroll: self.list_scroll,
                 hovered: ctx.hovered,
@@ -371,7 +399,12 @@ impl Workspace {
                         theme::mono_muted(d.age()).into(),
                     ];
                     if show_ns {
-                        cells.push(theme::mono_muted(d.namespace.as_str()).into());
+                        cells.push(table::truncated(
+                            &d.namespace.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     Row {
                         cells,
@@ -433,6 +466,8 @@ impl Workspace {
                 cols,
                 sort,
                 tab: Tab::Workload(kind),
+                sortable: true,
+                widths: ctx.widths,
                 len: rows.len(),
                 scroll: self.list_scroll,
                 hovered: ctx.hovered,
@@ -466,9 +501,19 @@ impl Workspace {
                             table::truncated(&value, width, 7.5, theme::mono_muted)
                         });
                     }
-                    cells.push(theme::mono_muted(r.age()).into());
+                    cells.push(table::truncated(
+                        &r.age(),
+                        w[cells.len()],
+                        7.5,
+                        theme::mono_muted,
+                    ));
                     if show_ns {
-                        cells.push(theme::mono_muted(r.namespace.as_str()).into());
+                        cells.push(table::truncated(
+                            &r.namespace.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     Row {
                         cells,
@@ -643,6 +688,8 @@ impl Workspace {
                 cols,
                 sort,
                 tab: Tab::Overview,
+                sortable: true,
+                widths: ctx.widths,
                 len: problems.len(),
                 scroll: self.list_scroll,
                 hovered: ctx.hovered,
@@ -652,7 +699,7 @@ impl Workspace {
                     let color = health_color(*health);
                     let mut cells: Vec<El<'a>> = vec![
                         table::name_cell(name, w[0]),
-                        theme::muted(kind.label()).into(),
+                        table::truncated(kind.label(), w[1], 7.6, theme::muted),
                         row![
                             theme::dot(color),
                             table::truncated(status, w[2] - 14.0, 7.6, move |s| {
@@ -664,7 +711,12 @@ impl Workspace {
                         .into(),
                     ];
                     if show_ns {
-                        cells.push(theme::mono_muted(*ns).into());
+                        cells.push(table::truncated(
+                            &*ns,
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
                     }
                     Row {
                         cells,
