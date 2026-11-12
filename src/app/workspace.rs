@@ -1767,6 +1767,11 @@ impl Workspace {
         }
     }
 
+    /// The detail drawer is showing something.
+    pub(super) fn has_drawer(&self) -> bool {
+        self.selected.is_some()
+    }
+
     pub(super) fn close_drawer(&mut self) {
         self.selected = None;
         self.details = None;

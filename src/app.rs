@@ -2,6 +2,8 @@ mod changelog;
 mod code_editor;
 mod filter;
 mod logs;
+#[cfg(target_os = "macos")]
+mod menu;
 mod shell;
 mod theme;
 mod update;
@@ -159,6 +161,9 @@ enum Msg {
         text: String,
         error: bool,
     },
+    /// An item in the native menu bar was chosen.
+    #[cfg(target_os = "macos")]
+    Menu(menu::MenuCommand),
     /// The latest release tag from GitHub; `manual` when the user asked (reports "up to date").
     UpdateChecked {
         result: Result<String, String>,
@@ -499,6 +504,11 @@ pub struct App {
     update_result: Option<Receiver<Result<(), String>>>,
     /// The "What's new" window is showing.
     changelog_open: bool,
+    /// The native menu bar; kept so its items stay alive.
+    #[cfg(target_os = "macos")]
+    _menu_bar: Option<menu::MenuBar>,
+    /// Open the "+" new-tab menu on the next frame (File › New Tab).
+    open_new_tab_menu: bool,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
@@ -564,6 +574,9 @@ impl App {
             update: update::UpdateState::Idle,
             update_result: None,
             changelog_open: false,
+            #[cfg(target_os = "macos")]
+            _menu_bar: None,
+            open_new_tab_menu: false,
             next_id: 1,
             window_dirty: None,
             log_resizing: false,
@@ -641,6 +654,10 @@ impl App {
             }
         }
         app.active = active.min(app.workspaces.len().saturating_sub(1));
+        #[cfg(target_os = "macos")]
+        {
+            app._menu_bar = menu::MenuBar::install(app.bus.clone());
+        }
 
         // Bring back saved forwards; resume the ones that were running when the app closed.
         for spec in app.settings.forwards.clone() {
@@ -663,10 +680,136 @@ impl App {
     // Updates
     // -----------------------------------------------------------------------
 
+    #[cfg(target_os = "macos")]
+    fn menu_command(&mut self, cmd: menu::MenuCommand) {
+        use menu::MenuCommand;
+        match cmd {
+            MenuCommand::CheckForUpdates => match &self.update {
+                update::UpdateState::Available(tag) => self.toast(
+                    format!("Kube UI {tag} is available. Use Update in the top bar."),
+                    false,
+                ),
+                update::UpdateState::Installed(tag) => self.toast(
+                    format!("{tag} is installed. Restart Kube UI to finish."),
+                    false,
+                ),
+                _ => self.check_for_updates(true),
+            },
+            MenuCommand::WhatsNew => self.changelog_open = true,
+            MenuCommand::Settings => match self.ws_mut() {
+                Some(ws) => ws.set_tab(Tab::Settings),
+                None => self.toast("Add a cluster to open Settings.", false),
+            },
+            MenuCommand::Quit => self.bus.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuCommand::NewTab if !self.workspaces.is_empty() => self.open_new_tab_menu = true,
+            MenuCommand::NewTab | MenuCommand::OpenKubeconfig => {
+                if let Some(path) = pick_kubeconfig() {
+                    self.add_workspace(path, None, None);
+                }
+            }
+            MenuCommand::Close => self.close_frontmost(),
+            MenuCommand::Reload => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.refresh();
+                }
+            }
+            MenuCommand::ToggleBottomPanel => {
+                if self.logs.is_empty() && self.shells.is_empty() {
+                    self.toast("No logs or terminals open.", false);
+                } else if self.settings.log_mode == LogPanelMode::Collapsed {
+                    self.set_log_mode(LogPanelMode::Normal);
+                } else {
+                    self.set_log_mode(LogPanelMode::Collapsed);
+                }
+            }
+            MenuCommand::Go(tab) => {
+                if let Some(ws) = self.ws_mut() {
+                    ws.set_tab(tab);
+                }
+            }
+            MenuCommand::NextTab => self.cycle_workspace(1),
+            MenuCommand::PreviousTab => self.cycle_workspace(-1),
+            MenuCommand::OpenGitHub => self.bus.ctx.open_url(egui::OpenUrl::new_tab(format!(
+                "https://github.com/{}",
+                update::REPO
+            ))),
+            MenuCommand::OpenUpdateLog => {
+                let path = update::log_path();
+                if !path.exists() {
+                    self.toast("No update log yet.", false);
+                } else if std::process::Command::new("open")
+                    .arg(&path)
+                    .spawn()
+                    .is_err()
+                {
+                    self.toast(format!("Update log: {}", display_path(&path)), false);
+                }
+            }
+        }
+    }
+
+    /// ⌘W: closes the innermost thing showing: the YAML window, "What's new", the detail
+    /// drawer, then the cluster tab (never the last one).
+    #[cfg(target_os = "macos")]
+    fn close_frontmost(&mut self) {
+        if let Some(y) = &self.yaml {
+            let dirty = y.create || matches!((&y.edit, &y.text), (Some(e), Some(Ok(t))) if e != t);
+            if dirty {
+                self.toast(
+                    "This YAML has unapplied changes. Apply them or close the window with ×.",
+                    false,
+                );
+            } else {
+                self.yaml = None;
+            }
+        } else if self.changelog_open {
+            self.changelog_open = false;
+        } else if let Some(ws) = self.ws_mut().filter(|ws| ws.has_drawer()) {
+            ws.close_drawer();
+        } else if self.workspaces.len() > 1 {
+            self.close_workspace(self.active);
+        }
+    }
+
+    /// Moves to the next (`1`) or previous (`-1`) cluster tab, wrapping around.
+    #[cfg(target_os = "macos")]
+    fn cycle_workspace(&mut self, step: isize) {
+        let n = self.workspaces.len() as isize;
+        if n > 1 {
+            self.activate_workspace((self.active as isize + step).rem_euclid(n) as usize);
+        }
+    }
+
+    /// ⌘1…⌘8 pick a cluster tab and ⌘9 the last one, as in browsers.
+    fn tab_number_shortcuts(&mut self, ctx: &egui::Context) {
+        const KEYS: [egui::Key; 9] = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        let pressed = ctx.input_mut(|i| {
+            KEYS.iter()
+                .position(|k| i.consume_key(egui::Modifiers::COMMAND, *k))
+        });
+        match pressed {
+            Some(8) => self.activate_workspace(self.workspaces.len().saturating_sub(1)),
+            Some(i) => self.activate_workspace(i),
+            None => {}
+        }
+    }
+
     fn check_for_updates(&mut self, manual: bool) {
         if matches!(
             self.update,
-            update::UpdateState::Checking { .. } | update::UpdateState::Installing(_)
+            update::UpdateState::Checking { .. }
+                | update::UpdateState::Installing(_)
+                | update::UpdateState::Installed(_)
         ) {
             return;
         }
@@ -795,6 +938,10 @@ impl App {
                     self.start_update(tag);
                 }
             }
+            // On macOS, checking and "What's new" live in the menu bar instead.
+            #[cfg(target_os = "macos")]
+            _ => {}
+            #[cfg(not(target_os = "macos"))]
             state => {
                 let hint = match state {
                     update::UpdateState::UpToDate => {
@@ -1196,6 +1343,8 @@ impl App {
                 }
                 Msg::Toast { text, error } => self.toast(text, error),
                 Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
+                #[cfg(target_os = "macos")]
+                Msg::Menu(cmd) => self.menu_command(cmd),
                 _ => {}
             }
         }
@@ -1778,12 +1927,21 @@ impl App {
                                 });
                             });
                     }
-                    theme::icon_menu(ui, icon::PLUS, "Open another cluster in a new tab", |ui| {
-                        if let Some(t) = self.new_tab_menu(ui) {
-                            new_tab = Some(t);
-                            ui.close();
-                        }
-                    });
+                    let plus = theme::icon_menu(
+                        ui,
+                        icon::PLUS,
+                        "Open another cluster in a new tab (⌘T)",
+                        |ui| {
+                            if let Some(t) = self.new_tab_menu(ui) {
+                                new_tab = Some(t);
+                                ui.close();
+                            }
+                        },
+                    );
+                    if std::mem::take(&mut self.open_new_tab_menu) {
+                        egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&plus));
+                        ui.ctx().request_repaint();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
                         self.ui_update_control(ui);
@@ -2915,6 +3073,7 @@ impl eframe::App for App {
             return;
         }
         self.active = self.active.min(self.workspaces.len() - 1);
+        self.tab_number_shortcuts(ctx);
 
         // Only the front tab watches its list; background tabs catch up when shown.
         let live = self.settings.live_updates;

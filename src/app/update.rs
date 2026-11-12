@@ -10,7 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-const REPO: &str = "cardeer/kube-ui";
+pub const REPO: &str = "cardeer/kube-ui";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default)]
@@ -27,7 +27,8 @@ pub enum UpdateState {
     /// The installer finished but this process is still running (it couldn't quit us):
     /// the new version starts on the next launch.
     Installed(String),
-    Failed(String),
+    // Only shown in the top bar's hover text, which macOS replaces with the menu bar.
+    Failed(#[cfg_attr(target_os = "macos", allow(dead_code))] String),
 }
 
 /// The latest release's tag, e.g. `v0.2.0`.

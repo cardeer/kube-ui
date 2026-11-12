@@ -5,6 +5,25 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Native macOS menu bar. The Kube UI menu has About, Check for Updates…, What's New and
+  Settings… (⌘,). There's also a Window menu and a Help menu with links to GitHub and the
+  update log.
+- Keyboard shortcuts:
+  - ⌘T new tab, ⌘O open a kubeconfig.
+  - ⌘W closes the YAML window, then the detail drawer, then the cluster tab.
+  - ⌘R reload, ⌘J show or hide logs and terminals.
+  - ⌥⌘1–5 go to Overview, Pods, Deployments, Services and Port Forwards.
+  - ⌘⇧] and ⌘⇧[ switch cluster tabs. ⌘1–8 pick a tab and ⌘9 the last one.
+
+### Changed
+- On macOS, "Check for updates" and the version link moved from the top bar to the Kube UI
+  menu. The top bar still shows Update, Installing and Restart when one applies.
+
+### Fixed
+- Namespace and context pickers no longer stay cut off after first opening while the
+  list was still loading or short.
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
