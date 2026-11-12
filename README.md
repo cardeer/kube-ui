@@ -1,6 +1,6 @@
 # Kube UI
 
-A native Kubernetes desktop UI written in Rust ([egui](https://github.com/emilk/egui) + [kube-rs](https://kube.rs)).
+A native Kubernetes desktop UI written in Rust ([iced](https://iced.rs) + [kube-rs](https://kube.rs)).
 
 ```bash
 cargo run --release

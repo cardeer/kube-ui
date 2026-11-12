@@ -1,884 +1,1052 @@
-//! Visual system: colour tokens, fonts, egui widget styling and a few custom-drawn
-//! controls. A dark developer tool in the Lens manner: three neutral layers, hairline
-//! borders, one blue accent for selection/focus/primary action, state colours for state only.
+//! Visual system: colour tokens, fonts, widget styles and the app's own small controls.
+//! A dark developer tool in the Lens manner: three neutral layers, hairline borders, one
+//! blue accent for selection/focus/primary action, state colours for state only.
 
-use std::sync::Arc;
-
-use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Response,
-    RichText, Sense, Shadow, Stroke, TextStyle, Vec2,
+use iced::{
+    Background, Border, Color, Element, Font, Length, Padding, Shadow, Theme, Vector,
+    font::Weight,
+    widget::{
+        Space, button, column, container, mouse_area, row, rule, scrollable, stack, text,
+        text_editor, text_input, tooltip,
+    },
 };
-use egui_phosphor::regular as icon;
+
+use super::icons as icon;
 
 // ---------------------------------------------------------------------------
 // Tokens
 // ---------------------------------------------------------------------------
 
 /// Window chrome: top bar, nav rail.
-pub const CHROME: Color32 = Color32::from_rgb(0x10, 0x12, 0x16);
+pub const CHROME: Color = Color::from_rgb8(0x10, 0x12, 0x16);
 /// Main content ground.
-pub const CONTENT: Color32 = Color32::from_rgb(0x15, 0x17, 0x1c);
+pub const CONTENT: Color = Color::from_rgb8(0x15, 0x17, 0x1c);
 /// Drawer, dialogs, menus, toasts.
-pub const RAISED: Color32 = Color32::from_rgb(0x1b, 0x1e, 0x25);
+pub const RAISED: Color = Color::from_rgb8(0x1b, 0x1e, 0x25);
 /// Log well, slightly below the content.
-pub const WELL: Color32 = Color32::from_rgb(0x0e, 0x10, 0x14);
+pub const WELL: Color = Color::from_rgb8(0x0e, 0x10, 0x14);
 /// Text fields and resting controls.
-pub const FIELD: Color32 = Color32::from_rgb(0x1f, 0x23, 0x2b);
-pub const FIELD_HOVER: Color32 = Color32::from_rgb(0x27, 0x2c, 0x36);
-pub const FIELD_ACTIVE: Color32 = Color32::from_rgb(0x2e, 0x34, 0x41);
+pub const FIELD: Color = Color::from_rgb8(0x1f, 0x23, 0x2b);
+pub const FIELD_HOVER: Color = Color::from_rgb8(0x27, 0x2c, 0x36);
+pub const FIELD_ACTIVE: Color = Color::from_rgb8(0x2e, 0x34, 0x41);
 /// Alternate table rows.
-pub const STRIPE: Color32 = Color32::from_rgb(0x19, 0x1c, 0x22);
+pub const STRIPE: Color = Color::from_rgb8(0x19, 0x1c, 0x22);
 
-pub const BORDER: Color32 = Color32::from_rgb(0x26, 0x2a, 0x33);
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x34, 0x3a, 0x47);
+pub const BORDER: Color = Color::from_rgb8(0x26, 0x2a, 0x33);
+pub const BORDER_STRONG: Color = Color::from_rgb8(0x34, 0x3a, 0x47);
 
-pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe8, 0xee);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9a, 0xa1, 0xb1);
+pub const TEXT: Color = Color::from_rgb8(0xe6, 0xe8, 0xee);
+pub const TEXT_MUTED: Color = Color::from_rgb8(0x9a, 0xa1, 0xb1);
 /// Hints and disabled text; still at least 4.5:1 on the content ground.
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x7c, 0x84, 0x96);
+pub const TEXT_FAINT: Color = Color::from_rgb8(0x7c, 0x84, 0x96);
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x4c, 0x8d, 0xff);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x66, 0x9f, 0xff);
+pub const ACCENT: Color = Color::from_rgb8(0x4c, 0x8d, 0xff);
+pub const ACCENT_HOVER: Color = Color::from_rgb8(0x66, 0x9f, 0xff);
 /// Selected-row / selected-item fill.
-pub const ACCENT_BG: Color32 = Color32::from_rgb(0x1d, 0x2a, 0x45);
+pub const ACCENT_BG: Color = Color::from_rgb8(0x1d, 0x2a, 0x45);
 /// Text on an accent-tinted fill.
-pub const ACCENT_TEXT: Color32 = Color32::from_rgb(0xcf, 0xdf, 0xff);
+pub const ACCENT_TEXT: Color = Color::from_rgb8(0xcf, 0xdf, 0xff);
 
-pub const OK: Color32 = Color32::from_rgb(0x3e, 0xcf, 0x8e);
-pub const WARN: Color32 = Color32::from_rgb(0xf5, 0xa5, 0x24);
-pub const BAD: Color32 = Color32::from_rgb(0xf2, 0x55, 0x5a);
-pub const IDLE: Color32 = Color32::from_rgb(0x6b, 0x72, 0x82);
+pub const OK: Color = Color::from_rgb8(0x3e, 0xcf, 0x8e);
+pub const WARN: Color = Color::from_rgb8(0xf5, 0xa5, 0x24);
+pub const BAD: Color = Color::from_rgb8(0xf2, 0x55, 0x5a);
+pub const IDLE: Color = Color::from_rgb8(0x6b, 0x72, 0x82);
+const DANGER_FILL: Color = Color::from_rgb8(0xc9, 0x3a, 0x40);
 
 /// YAML editor syntax: keys in a soft Signal Blue, strings sage, literals (numbers,
 /// booleans, null) amber, comments Faint Ink. Plain values stay Ink.
-pub const SYNTAX_KEY: Color32 = Color32::from_rgb(0x8f, 0xb8, 0xff);
-pub const SYNTAX_STRING: Color32 = Color32::from_rgb(0xa8, 0xd4, 0x9b);
-pub const SYNTAX_LITERAL: Color32 = Color32::from_rgb(0xe8, 0xb8, 0x6c);
-pub const SYNTAX_COMMENT: Color32 = TEXT_FAINT;
+pub const SYNTAX_KEY: Color = Color::from_rgb8(0x8f, 0xb8, 0xff);
+pub const SYNTAX_STRING: Color = Color::from_rgb8(0xa8, 0xd4, 0x9b);
+pub const SYNTAX_LITERAL: Color = Color::from_rgb8(0xe8, 0xb8, 0x6c);
+pub const SYNTAX_COMMENT: Color = TEXT_FAINT;
 
-pub const RADIUS: u8 = 6;
-pub const RADIUS_SMALL: u8 = 4;
-
-/// Font family for titles, headers and emphasis (egui has no font weights).
-pub fn semibold_family() -> FontFamily {
-    FontFamily::Name("semibold".into())
-}
+pub const RADIUS: f32 = 6.0;
+pub const RADIUS_SMALL: f32 = 4.0;
 
 // ---------------------------------------------------------------------------
-// Install
+// Fonts
 // ---------------------------------------------------------------------------
 
-pub fn install(ctx: &egui::Context) {
-    install_fonts(ctx);
-    ctx.style_mut(|style| {
-        style.text_styles = [
-            (
-                TextStyle::Small,
-                FontId::new(11.5, FontFamily::Proportional),
-            ),
-            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-            (
-                TextStyle::Button,
-                FontId::new(13.5, FontFamily::Proportional),
-            ),
-            (TextStyle::Heading, FontId::new(18.0, semibold_family())),
-            (
-                TextStyle::Monospace,
-                FontId::new(12.5, FontFamily::Monospace),
-            ),
-        ]
-        .into();
+pub const INTER: Font = Font::with_name("Inter");
+pub const SEMIBOLD: Font = Font {
+    weight: Weight::Semibold,
+    ..Font::with_name("Inter")
+};
+pub const MONO: Font = Font::with_name("JetBrains Mono");
+pub const ICONS: Font = Font::with_name("Phosphor");
 
-        let s = &mut style.spacing;
-        s.item_spacing = Vec2::new(8.0, 6.0);
-        s.button_padding = Vec2::new(10.0, 5.0);
-        s.interact_size = Vec2::new(36.0, 26.0);
-        s.menu_margin = Margin::same(6);
-        s.window_margin = Margin::same(16);
-        s.icon_width = 15.0;
-        s.icon_width_inner = 9.0;
-        s.combo_height = 320.0;
-        s.scroll = egui::style::ScrollStyle::floating();
-        s.scroll.bar_width = 8.0;
-        s.scroll.floating_width = 3.0;
+pub const BODY: f32 = 13.5;
+pub const SMALL: f32 = 11.5;
+pub const MONO_SIZE: f32 = 12.5;
 
-        // Labels must not swallow clicks meant for table rows.
-        style.interaction.selectable_labels = false;
-
-        style.visuals = visuals();
-    });
-}
-
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    let mut add = |name: &str, bytes: &'static [u8]| {
-        fonts
-            .font_data
-            .insert(name.into(), Arc::new(FontData::from_static(bytes)));
-    };
-    add(
-        "inter",
+/// Font files to load at startup.
+pub fn fonts() -> [&'static [u8]; 4] {
+    [
         include_bytes!("../../assets/fonts/Inter-Regular.ttf"),
-    );
-    add(
-        "inter-semibold",
         include_bytes!("../../assets/fonts/Inter-SemiBold.ttf"),
-    );
-    add(
-        "jetbrains-mono",
         include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"),
-    );
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-
-    // egui's bundled fonts stay as fallbacks for glyphs ours lack.
-    let defaults = |family: FontFamily| fonts.families.get(&family).cloned().unwrap_or_default();
-    let proportional_fallback: Vec<String> = defaults(FontFamily::Proportional)
-        .into_iter()
-        .filter(|f| f != "phosphor")
-        .collect();
-    let mono_fallback = defaults(FontFamily::Monospace);
-
-    // The embedded text fonts were subset to drop their private-use glyphs (Inter ships
-    // hundreds), so Phosphor's icons in that range are never shadowed. See assets/fonts.
-    let chain = |first: &str, rest: &[String]| {
-        let mut v = vec![first.to_string(), "phosphor".to_string()];
-        v.extend(rest.iter().cloned());
-        v
-    };
-    fonts.families.insert(
-        FontFamily::Proportional,
-        chain("inter", &proportional_fallback),
-    );
-    fonts.families.insert(
-        semibold_family(),
-        chain("inter-semibold", &proportional_fallback),
-    );
-    fonts.families.insert(
-        FontFamily::Monospace,
-        chain("jetbrains-mono", &mono_fallback),
-    );
-    ctx.set_fonts(fonts);
+        include_bytes!("../../assets/fonts/Phosphor.ttf"),
+    ]
 }
 
-fn visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    // Controls take the small radius: egui also uses it for checkboxes, where 6px on a
-    // 15px box reads as a radio button.
-    let r = CornerRadius::same(RADIUS_SMALL);
-    let hairline = |c| Stroke::new(1.0, c);
+pub fn theme() -> Theme {
+    Theme::custom(
+        "Kube UI",
+        iced::theme::Palette {
+            background: CONTENT,
+            text: TEXT,
+            primary: ACCENT,
+            success: OK,
+            warning: WARN,
+            danger: BAD,
+        },
+    )
+}
 
-    v.panel_fill = CONTENT;
-    v.window_fill = RAISED;
-    v.window_stroke = hairline(BORDER_STRONG);
-    v.window_corner_radius = CornerRadius::same(10);
-    v.window_shadow = Shadow {
-        offset: [0, 10],
-        blur: 28,
-        spread: 0,
-        color: Color32::from_black_alpha(130),
-    };
-    v.popup_shadow = Shadow {
-        offset: [0, 6],
-        blur: 18,
-        spread: 0,
-        color: Color32::from_black_alpha(120),
-    };
-    v.menu_corner_radius = CornerRadius::same(8);
-    v.window_highlight_topmost = false;
+/// `color` at `factor` opacity.
+pub fn alpha(color: Color, factor: f32) -> Color {
+    color.scale_alpha(factor)
+}
 
-    v.faint_bg_color = STRIPE;
-    v.extreme_bg_color = CHROME;
-    v.text_edit_bg_color = Some(CHROME);
-    v.code_bg_color = WELL;
-    v.hyperlink_color = ACCENT_HOVER;
-    v.warn_fg_color = WARN;
-    v.error_fg_color = BAD;
-    v.weak_text_color = Some(TEXT_MUTED);
-    v.override_text_color = None;
+fn border(color: Color, radius: f32) -> Border {
+    Border {
+        color,
+        width: 1.0,
+        radius: radius.into(),
+    }
+}
 
-    v.selection.bg_fill = ACCENT_BG;
-    v.selection.stroke = hairline(ACCENT_TEXT);
-    v.text_cursor.stroke = Stroke::new(1.5, ACCENT_HOVER);
-
-    v.collapsing_header_frame = false;
-    v.indent_has_left_vline = false;
-    v.striped = true;
-    v.slider_trailing_fill = true;
-    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
-    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
-
-    let w = &mut v.widgets;
-    w.noninteractive.bg_fill = RAISED;
-    w.noninteractive.weak_bg_fill = RAISED;
-    w.noninteractive.bg_stroke = hairline(BORDER);
-    w.noninteractive.fg_stroke = hairline(TEXT);
-    w.noninteractive.corner_radius = r;
-
-    w.inactive.bg_fill = FIELD;
-    w.inactive.weak_bg_fill = FIELD;
-    w.inactive.bg_stroke = hairline(BORDER);
-    w.inactive.fg_stroke = hairline(TEXT);
-    w.inactive.corner_radius = r;
-    w.inactive.expansion = 0.0;
-
-    w.hovered.bg_fill = FIELD_HOVER;
-    w.hovered.weak_bg_fill = FIELD_HOVER;
-    w.hovered.bg_stroke = hairline(BORDER_STRONG);
-    w.hovered.fg_stroke = hairline(TEXT);
-    w.hovered.corner_radius = r;
-    w.hovered.expansion = 0.0;
-
-    w.active.bg_fill = FIELD_ACTIVE;
-    w.active.weak_bg_fill = FIELD_ACTIVE;
-    w.active.bg_stroke = hairline(ACCENT);
-    w.active.fg_stroke = hairline(TEXT);
-    w.active.corner_radius = r;
-    w.active.expansion = 0.0;
-
-    w.open.bg_fill = FIELD_HOVER;
-    w.open.weak_bg_fill = FIELD_HOVER;
-    w.open.bg_stroke = hairline(ACCENT);
-    w.open.fg_stroke = hairline(TEXT);
-    w.open.corner_radius = r;
-    v
+fn shadow(y: f32, blur: f32, a: f32) -> Shadow {
+    Shadow {
+        color: Color::from_rgba(0.0, 0.0, 0.0, a),
+        offset: Vector::new(0.0, y),
+        blur_radius: blur,
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Frames
+// Container styles
 // ---------------------------------------------------------------------------
 
-pub fn chrome_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(CHROME)
-        .inner_margin(Margin::symmetric(14, 0))
+pub fn fill(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(color.into()),
+        text_color: Some(TEXT),
+        ..Default::default()
+    }
 }
 
-pub fn content_frame() -> egui::Frame {
-    egui::Frame::new().fill(CONTENT).inner_margin(Margin {
-        left: 20,
-        right: 20,
-        top: 16,
-        bottom: 8,
-    })
+pub fn chrome(t: &Theme) -> container::Style {
+    fill(CHROME)(t)
 }
 
-pub fn raised_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(RAISED)
-        .inner_margin(Margin::symmetric(18, 14))
+pub fn content(t: &Theme) -> container::Style {
+    fill(CONTENT)(t)
 }
 
-pub fn well_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(WELL)
-        .inner_margin(Margin::symmetric(14, 8))
+pub fn raised(t: &Theme) -> container::Style {
+    fill(RAISED)(t)
 }
 
-/// Floating card (toasts): raised fill, hairline border, soft offset shadow.
-pub fn card_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(RAISED)
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(14, 10))
-        .shadow(Shadow {
-            offset: [0, 8],
-            blur: 22,
-            spread: 0,
-            color: Color32::from_black_alpha(140),
-        })
+pub fn well(t: &Theme) -> container::Style {
+    fill(WELL)(t)
+}
+
+/// Floating card (toasts, menus, dialogs): raised fill, hairline border, soft shadow.
+pub fn card(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(RAISED.into()),
+        text_color: Some(TEXT),
+        border: border(BORDER_STRONG, 8.0),
+        shadow: shadow(8.0, 22.0, 0.55),
+        ..Default::default()
+    }
+}
+
+pub fn dialog(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(RAISED.into()),
+        text_color: Some(TEXT),
+        border: border(BORDER_STRONG, 10.0),
+        shadow: shadow(10.0, 28.0, 0.5),
+        ..Default::default()
+    }
+}
+
+/// A bordered box (container cards in the drawer, code blocks).
+pub fn boxed(fill: Color, stroke: Color, radius: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(fill.into()),
+        text_color: Some(TEXT),
+        border: border(stroke, radius),
+        ..Default::default()
+    }
+}
+
+pub fn tooltip_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(RAISED.into()),
+        text_color: Some(TEXT),
+        border: border(BORDER_STRONG, RADIUS_SMALL),
+        shadow: shadow(4.0, 12.0, 0.45),
+        ..Default::default()
+    }
+}
+
+pub fn backdrop(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Button styles
+// ---------------------------------------------------------------------------
+
+fn button_base(bg: Option<Color>, fg: Color, stroke: Option<Color>, radius: f32) -> button::Style {
+    button::Style {
+        background: bg.map(Background::from),
+        text_color: fg,
+        border: match stroke {
+            Some(c) => border(c, radius),
+            None => Border {
+                radius: radius.into(),
+                ..Default::default()
+            },
+        },
+        ..Default::default()
+    }
+}
+
+/// The one filled, accent-coloured action in a group.
+pub fn primary(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => button_base(
+            Some(ACCENT_HOVER),
+            Color::WHITE,
+            Some(ACCENT_HOVER),
+            RADIUS_SMALL,
+        ),
+        button::Status::Disabled => button_base(
+            Some(alpha(ACCENT, 0.35)),
+            alpha(Color::WHITE, 0.55),
+            Some(alpha(ACCENT, 0.35)),
+            RADIUS_SMALL,
+        ),
+        button::Status::Active => {
+            button_base(Some(ACCENT), Color::WHITE, Some(ACCENT_HOVER), RADIUS_SMALL)
+        }
+    }
+}
+
+pub fn danger(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            button_base(Some(BAD), Color::WHITE, Some(BAD), RADIUS_SMALL)
+        }
+        _ => button_base(Some(DANGER_FILL), Color::WHITE, Some(BAD), RADIUS_SMALL),
+    }
+}
+
+/// Resting control: field fill, hairline border.
+pub fn secondary(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered => {
+            button_base(Some(FIELD_HOVER), TEXT, Some(BORDER_STRONG), RADIUS_SMALL)
+        }
+        button::Status::Pressed => {
+            button_base(Some(FIELD_ACTIVE), TEXT, Some(ACCENT), RADIUS_SMALL)
+        }
+        button::Status::Disabled => button_base(
+            Some(alpha(FIELD, 0.6)),
+            TEXT_FAINT,
+            Some(BORDER),
+            RADIUS_SMALL,
+        ),
+        button::Status::Active => button_base(Some(FIELD), TEXT, Some(BORDER), RADIUS_SMALL),
+    }
+}
+
+/// Frameless; a fill only on hover.
+pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            button_base(Some(FIELD_HOVER), TEXT, None, RADIUS_SMALL)
+        }
+        button::Status::Disabled => button_base(None, alpha(TEXT_MUTED, 0.5), None, RADIUS_SMALL),
+        button::Status::Active => button_base(None, TEXT_MUTED, None, RADIUS_SMALL),
+    }
+}
+
+/// [`ghost`] that stays lit (Selection Navy, accent hairline) while `on`.
+pub fn toggled(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |t, status| {
+        if on {
+            button_base(Some(ACCENT_BG), ACCENT_TEXT, Some(ACCENT), RADIUS_SMALL)
+        } else {
+            ghost(t, status)
+        }
+    }
+}
+
+/// A row in a menu or a dropdown list; `selected` keeps it tinted.
+pub fn menu_item(selected: bool, color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| match status {
+        button::Status::Hovered | button::Status::Pressed => button_base(
+            Some(FIELD_HOVER),
+            if selected { ACCENT_TEXT } else { color },
+            None,
+            RADIUS_SMALL,
+        ),
+        button::Status::Disabled => button_base(None, TEXT_FAINT, None, RADIUS_SMALL),
+        button::Status::Active if selected => {
+            button_base(Some(ACCENT_BG), ACCENT_TEXT, None, RADIUS_SMALL)
+        }
+        button::Status::Active => button_base(None, color, None, RADIUS_SMALL),
+    }
+}
+
+/// Plain clickable text (links, tab titles).
+pub fn link(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let c = match status {
+            button::Status::Hovered | button::Status::Pressed => ACCENT_HOVER,
+            _ => color,
+        };
+        button_base(None, c, None, 0.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inputs, scrollbars, editor
+// ---------------------------------------------------------------------------
+
+pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let stroke = match status {
+        text_input::Status::Focused { .. } => ACCENT,
+        text_input::Status::Hovered => BORDER_STRONG,
+        _ => BORDER,
+    };
+    text_input::Style {
+        background: CHROME.into(),
+        border: border(stroke, RADIUS_SMALL),
+        icon: TEXT_FAINT,
+        placeholder: TEXT_FAINT,
+        value: TEXT,
+        selection: alpha(ACCENT, 0.4),
+    }
+}
+
+pub fn scrollbar(_: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let (hovered_y, hovered_x) = match status {
+        scrollable::Status::Hovered {
+            is_vertical_scrollbar_hovered: y,
+            is_horizontal_scrollbar_hovered: x,
+            ..
+        } => (y, x),
+        scrollable::Status::Dragged {
+            is_vertical_scrollbar_dragged: y,
+            is_horizontal_scrollbar_dragged: x,
+            ..
+        } => (y, x),
+        scrollable::Status::Active { .. } => (false, false),
+    };
+    let rail = |hot: bool| scrollable::Rail {
+        background: None,
+        border: Border::default(),
+        scroller: scrollable::Scroller {
+            background: (if hot { TEXT_FAINT } else { BORDER_STRONG }).into(),
+            border: Border {
+                radius: 3.0.into(),
+                ..Default::default()
+            },
+        },
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail(hovered_y),
+        horizontal_rail: rail(hovered_x),
+        gap: None,
+        auto_scroll: scrollable::AutoScroll {
+            background: RAISED.into(),
+            border: border(BORDER_STRONG, 12.0),
+            shadow: Shadow::default(),
+            icon: TEXT,
+        },
+    }
+}
+
+/// A thin vertical scrollbar, as used throughout.
+pub fn thin() -> scrollable::Direction {
+    scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(6).scroller_width(6))
+}
+
+pub fn thin_both() -> scrollable::Direction {
+    let bar = scrollable::Scrollbar::new().width(6).scroller_width(6);
+    scrollable::Direction::Both {
+        vertical: bar,
+        horizontal: bar,
+    }
+}
+
+pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let _ = status;
+    text_editor::Style {
+        background: Color::TRANSPARENT.into(),
+        border: Border::default(),
+        placeholder: TEXT_FAINT,
+        value: TEXT,
+        selection: alpha(ACCENT, 0.4),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------------
 
-pub fn semibold(text: impl Into<String>) -> RichText {
-    RichText::new(text).family(semibold_family())
+pub fn txt<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(BODY).color(TEXT)
 }
 
-pub fn title(text: impl Into<String>) -> RichText {
-    RichText::new(text)
-        .family(semibold_family())
-        .size(19.0)
-        .color(TEXT)
+pub fn muted<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(BODY).color(TEXT_MUTED)
+}
+
+pub fn faint<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(BODY).color(TEXT_FAINT)
+}
+
+pub fn small<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(SMALL).color(TEXT_MUTED)
+}
+
+pub fn semibold<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(BODY).font(SEMIBOLD).color(TEXT)
+}
+
+pub fn mono<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(MONO_SIZE).font(MONO).color(TEXT)
+}
+
+pub fn mono_muted<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    mono(s).color(TEXT_MUTED)
+}
+
+pub fn colored<'a>(s: impl text::IntoFragment<'a>, color: Color) -> text::Text<'a> {
+    text(s).size(BODY).color(color)
+}
+
+pub fn title<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(19.0).font(SEMIBOLD).color(TEXT)
 }
 
 /// Small semibold muted label for table headers and panel sections.
-pub fn label_small(text: impl Into<String>) -> RichText {
-    RichText::new(text)
-        .family(semibold_family())
-        .size(12.0)
+pub fn label_small<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(12.0).font(SEMIBOLD).color(TEXT_MUTED)
+}
+
+pub fn icon<'a>(glyph: &'a str) -> text::Text<'a> {
+    text(glyph)
+        .font(ICONS)
+        .size(14.0)
         .color(TEXT_MUTED)
+        .line_height(1.0)
+}
+
+/// An icon and a label, as a button's content.
+pub fn icon_label<'a, M: 'a>(glyph: &'a str, label: impl text::IntoFragment<'a>) -> Element<'a, M> {
+    row![
+        text(glyph).font(ICONS).size(14.0).line_height(1.0),
+        text(label).size(BODY)
+    ]
+    .spacing(6)
+    .align_y(iced::Center)
+    .into()
+}
+
+pub fn space<'a, M: 'a>(px: f32) -> Element<'a, M> {
+    Space::new().width(px).height(px).into()
+}
+
+pub fn vspace<'a, M: 'a>(px: f32) -> Element<'a, M> {
+    Space::new().height(px).into()
+}
+
+pub fn hspace<'a, M: 'a>(px: f32) -> Element<'a, M> {
+    Space::new().width(px).into()
+}
+
+pub fn fill_space<'a, M: 'a>() -> Element<'a, M> {
+    Space::new().width(Length::Fill).into()
+}
+
+pub fn hline<'a, M: 'a>() -> Element<'a, M> {
+    rule::horizontal(1)
+        .style(|_| rule::Style {
+            color: BORDER,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
+        })
+        .into()
+}
+
+pub fn vline<'a, M: 'a>(height: f32) -> Element<'a, M> {
+    container(rule::vertical(1).style(|_| rule::Style {
+        color: BORDER_STRONG,
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
+    }))
+    .height(height)
+    .into()
+}
+
+/// A filled status dot.
+pub fn dot<'a, M: 'a>(color: Color) -> Element<'a, M> {
+    container(Space::new().width(8).height(8))
+        .style(move |_| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Wraps `content` in a hover tooltip.
+pub fn tip<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    hint: impl Into<String>,
+) -> Element<'a, M> {
+    let hint: String = hint.into();
+    if hint.is_empty() {
+        return content.into();
+    }
+    tooltip(
+        content,
+        container(text(hint).size(12.5).color(TEXT))
+            .padding([5, 8])
+            .max_width(420)
+            .style(tooltip_style),
+        tooltip::Position::Bottom,
+    )
+    .gap(4)
+    .delay(std::time::Duration::from_millis(400))
+    .into()
 }
 
 // ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
 
-/// The one filled, accent-coloured action in a group.
-pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text)
-            .family(semibold_family())
-            .color(Color32::WHITE),
-    )
-    .fill(ACCENT)
-    .stroke(Stroke::new(1.0, ACCENT_HOVER))
+const BUTTON_PAD: Padding = Padding {
+    top: 5.0,
+    bottom: 5.0,
+    left: 10.0,
+    right: 10.0,
+};
+
+const SMALL_PAD: Padding = Padding {
+    top: 2.0,
+    bottom: 2.0,
+    left: 7.0,
+    right: 7.0,
+};
+
+fn labelled<'a, M: 'a>(
+    glyph: Option<&'a str>,
+    label: String,
+    font: Font,
+    size: f32,
+) -> Element<'a, M> {
+    match glyph {
+        Some(g) => row![
+            text(g).font(ICONS).size(size + 0.5).line_height(1.0),
+            text(label).size(size).font(font)
+        ]
+        .spacing(6)
+        .align_y(iced::Center)
+        .into(),
+        None => text(label).size(size).font(font).into(),
+    }
 }
 
-pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text)
-            .family(semibold_family())
-            .color(Color32::WHITE),
-    )
-    .fill(Color32::from_rgb(0xc9, 0x3a, 0x40))
-    .stroke(Stroke::new(1.0, BAD))
+/// The one filled, accent-coloured action in a group. `None` disables it.
+pub fn primary_button<'a, M: Clone + 'a>(
+    glyph: Option<&'a str>,
+    label: impl Into<String>,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    button(labelled(glyph, label.into(), SEMIBOLD, BODY))
+        .padding(BUTTON_PAD)
+        .style(primary)
+        .on_press_maybe(on_press)
+        .into()
+}
+
+pub fn danger_button<'a, M: Clone + 'a>(
+    glyph: Option<&'a str>,
+    label: impl Into<String>,
+    on_press: M,
+) -> Element<'a, M> {
+    button(labelled(glyph, label.into(), SEMIBOLD, BODY))
+        .padding(BUTTON_PAD)
+        .style(danger)
+        .on_press(on_press)
+        .into()
+}
+
+pub fn secondary_button<'a, M: Clone + 'a>(
+    glyph: Option<&'a str>,
+    label: impl Into<String>,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    button(labelled(glyph, label.into(), INTER, BODY))
+        .padding(BUTTON_PAD)
+        .style(secondary)
+        .on_press_maybe(on_press)
+        .into()
+}
+
+pub fn small_button<'a, M: Clone + 'a>(
+    glyph: Option<&'a str>,
+    label: impl Into<String>,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    button(labelled(glyph, label.into(), INTER, 12.5))
+        .padding(SMALL_PAD)
+        .style(secondary)
+        .on_press_maybe(on_press)
+        .into()
 }
 
 /// Frameless icon button that only shows a fill on hover.
-pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> Response {
-    let size = Vec2::splat(24.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        if resp.hovered() {
-            p.rect_filled(rect, CornerRadius::same(RADIUS_SMALL), FIELD_HOVER);
-        }
-        let color = if resp.hovered() { TEXT } else { TEXT_MUTED };
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(14.0),
-            color,
-        );
-    }
-    resp.on_hover_text(hint)
+pub fn icon_button<'a, M: Clone + 'a>(
+    glyph: &'a str,
+    hint: &str,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    tip(
+        button(container(text(glyph).font(ICONS).size(14.0).line_height(1.0)).center(Length::Fill))
+            .width(24)
+            .height(24)
+            .padding(0)
+            .style(ghost)
+            .on_press_maybe(on_press),
+        hint,
+    )
 }
 
-/// [`icon_button`] that stays lit (Selection Navy, accent hairline) while `on`.
-pub fn icon_toggle(ui: &mut egui::Ui, glyph: &str, on: bool, hint: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        let radius = CornerRadius::same(RADIUS_SMALL);
-        if on {
-            p.rect_filled(rect, radius, ACCENT_BG);
-            p.rect_stroke(
-                rect,
-                radius,
-                Stroke::new(1.0, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-        } else if resp.hovered() {
-            p.rect_filled(rect, radius, FIELD_HOVER);
-        }
-        let color = if on {
-            ACCENT_TEXT
-        } else if resp.hovered() {
-            TEXT
-        } else {
-            TEXT_MUTED
-        };
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(14.0),
-            color,
-        );
-    }
-    resp.on_hover_text(hint)
+/// [`icon_button`] that stays lit while `on`.
+pub fn icon_toggle<'a, M: Clone + 'a>(
+    glyph: &'a str,
+    on: bool,
+    hint: &str,
+    on_press: M,
+) -> Element<'a, M> {
+    tip(
+        button(container(text(glyph).font(ICONS).size(14.0).line_height(1.0)).center(Length::Fill))
+            .width(24)
+            .height(24)
+            .padding(0)
+            .style(toggled(on))
+            .on_press(on_press),
+        hint,
+    )
 }
 
 /// Small on/off text toggle (e.g. `.*` for regex), sized to sit beside an icon button.
-pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Response {
-    let font = FontId::monospace(13.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font.clone(), TEXT);
-    let size = Vec2::new((galley.size().x + 12.0).max(24.0), 24.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        let radius = CornerRadius::same(RADIUS_SMALL);
-        if on {
-            p.rect_filled(rect, radius, ACCENT_BG);
-            p.rect_stroke(
-                rect,
-                radius,
-                Stroke::new(1.0, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-        } else if resp.hovered() {
-            p.rect_filled(rect, radius, FIELD_HOVER);
-        }
-        let color = if on {
-            ACCENT_TEXT
-        } else if resp.hovered() {
-            TEXT
-        } else {
-            TEXT_MUTED
-        };
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font,
-            color,
-        );
-    }
-    resp.on_hover_text(hint)
+pub fn toggle_button<'a, M: Clone + 'a>(
+    label: &'a str,
+    on: bool,
+    hint: &str,
+    on_press: M,
+) -> Element<'a, M> {
+    tip(
+        button(
+            container(text(label).font(MONO).size(13.0).line_height(1.0)).center_y(Length::Fill),
+        )
+        .height(24)
+        .padding([0, 6])
+        .style(toggled(on))
+        .on_press(on_press),
+        hint,
+    )
 }
 
 /// A small segmented control: one bordered strip, the chosen segment filled.
-/// Returns the index clicked when it differs from `selected`.
-pub fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: usize, hint: &str) -> Option<usize> {
-    let font = FontId::proportional(12.5);
-    let bold = FontId::new(12.5, semibold_family());
-    let widths: Vec<f32> = labels
-        .iter()
-        .map(|l| {
-            ui.painter()
-                .layout_no_wrap(l.to_string(), bold.clone(), TEXT)
-                .size()
-                .x
-                + 18.0
-        })
-        .collect();
-    let size = Vec2::new(widths.iter().sum::<f32>() + 4.0, 24.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    let mut clicked = None;
-    let radius = CornerRadius::same(RADIUS_SMALL);
-    ui.painter().rect_filled(rect, radius, CHROME);
-    ui.painter().rect_stroke(
-        rect,
-        radius,
-        Stroke::new(1.0, BORDER),
-        egui::StrokeKind::Inside,
-    );
-    let mut x = rect.left() + 2.0;
-    for (i, (label, w)) in labels.iter().zip(&widths).enumerate() {
-        let seg =
-            egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), Vec2::new(*w, size.y - 4.0));
-        x += w;
-        let r = ui.interact(seg, resp.id.with(i), Sense::click());
+pub fn segmented<'a, M: Clone + 'a>(
+    labels: &[&'a str],
+    selected: usize,
+    hint: &str,
+    on_select: impl Fn(usize) -> M,
+) -> Element<'a, M> {
+    let segments = labels.iter().enumerate().map(|(i, label)| {
         let on = i == selected;
-        let p = ui.painter();
-        if on {
-            p.rect_filled(
-                seg,
-                CornerRadius::same(RADIUS_SMALL.saturating_sub(1)),
-                FIELD_ACTIVE,
-            );
-        } else if r.hovered() {
-            p.rect_filled(
-                seg,
-                CornerRadius::same(RADIUS_SMALL.saturating_sub(1)),
-                FIELD_HOVER,
-            );
-        }
-        let (f, color) = if on {
-            (bold.clone(), TEXT)
-        } else {
-            (font.clone(), if r.hovered() { TEXT } else { TEXT_MUTED })
-        };
-        p.text(seg.center(), egui::Align2::CENTER_CENTER, *label, f, color);
-        if r.on_hover_text(hint).clicked() && !on {
-            clicked = Some(i);
-        }
-    }
-    clicked
+        button(
+            container(
+                text(*label)
+                    .size(12.5)
+                    .font(if on { SEMIBOLD } else { INTER })
+                    .line_height(1.0),
+            )
+            .center_y(Length::Fill),
+        )
+        .height(20)
+        .padding([0, 9])
+        .style(move |_, status| {
+            let fill = match (on, status) {
+                (true, _) => Some(FIELD_ACTIVE),
+                (false, button::Status::Hovered | button::Status::Pressed) => Some(FIELD_HOVER),
+                _ => None,
+            };
+            let fg = if on || matches!(status, button::Status::Hovered) {
+                TEXT
+            } else {
+                TEXT_MUTED
+            };
+            button_base(fill, fg, None, RADIUS_SMALL - 1.0)
+        })
+        .on_press_maybe((!on).then(|| on_select(i)))
+        .into()
+    });
+    tip(
+        container(row(segments))
+            .padding(2)
+            .style(boxed(CHROME, BORDER, RADIUS_SMALL)),
+        hint,
+    )
 }
 
-/// Left navigation entry: icon, label, optional count; accent-tinted when selected.
-pub fn nav_item(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    label: &str,
-    count: Option<usize>,
-    selected: bool,
-) -> Response {
-    nav_item_badge(ui, glyph, label, plain_count(count), selected)
+/// Search field with a leading magnifier, as used for list filters.
+pub fn search_field<'a, M: Clone + 'a>(
+    value: &str,
+    hint: &str,
+    width: f32,
+    on_input: impl Fn(String) -> M + 'a,
+) -> text_input::TextInput<'a, M> {
+    text_input(hint, value)
+        .on_input(on_input)
+        .icon(text_input::Icon {
+            font: ICONS,
+            code_point: icon::MAGNIFYING_GLASS.chars().next().unwrap_or(' '),
+            size: Some(13.0.into()),
+            spacing: 6.0,
+            side: text_input::Side::Left,
+        })
+        .size(BODY)
+        .padding([5, 8])
+        .width(width)
+        .style(input)
+}
+
+/// Checkbox drawn in the app's vocabulary: a 15px square, accent-filled with a check when on.
+pub fn checkbox<'a, M: Clone + 'a>(value: bool, label: &'a str, on_toggle: M) -> Element<'a, M> {
+    let mark = container(if value {
+        Element::from(
+            text(icon::CHECK)
+                .font(ICONS)
+                .size(11.0)
+                .color(Color::WHITE)
+                .line_height(1.0),
+        )
+    } else {
+        Space::new().into()
+    })
+    .center(15)
+    .style(move |_| container::Style {
+        background: Some((if value { ACCENT } else { FIELD }).into()),
+        border: Border {
+            color: if value { ACCENT } else { BORDER_STRONG },
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..Default::default()
+    });
+    let content: Element<'a, M> = if label.is_empty() {
+        mark.into()
+    } else {
+        row![
+            mark,
+            text(label)
+                .size(BODY)
+                .color(if value { TEXT } else { TEXT_MUTED })
+        ]
+        .spacing(7)
+        .align_y(iced::Center)
+        .into()
+    };
+    mouse_area(container(content).center_y(22))
+        .on_press(on_toggle)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
+/// Small tinted pill, e.g. a kind label or a restart count.
+pub fn badge<'a, M: 'a>(label: impl Into<String>, color: Color, filled: bool) -> Element<'a, M> {
+    container(
+        text(label.into())
+            .size(SMALL)
+            .font(SEMIBOLD)
+            .color(if filled { Color::WHITE } else { color }),
+    )
+    .padding([1, 6])
+    .style(move |_| container::Style {
+        background: Some((if filled { color } else { alpha(color, 0.16) }).into()),
+        border: Border {
+            radius: RADIUS_SMALL.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 /// A right-aligned nav count: text, and a colour for when the item isn't selected
 /// (`None` = Faint Ink; a state colour only when the number reports state).
-pub type NavBadge = Option<(String, Option<Color32>)>;
+pub type NavBadge = Option<(String, Option<Color>)>;
 
-fn plain_count(count: Option<usize>) -> NavBadge {
-    count.filter(|n| *n > 0).map(|n| (n.to_string(), None))
-}
-
-fn paint_nav_badge(p: &egui::Painter, rect: egui::Rect, badge: &NavBadge, selected: bool) {
-    if let Some((text, color)) = badge {
-        let color = match (selected, color) {
-            (_, Some(c)) => *c,
-            (true, None) => ACCENT_TEXT,
-            (false, None) => TEXT_FAINT,
-        };
-        p.text(
-            egui::pos2(rect.right() - 10.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            FontId::proportional(12.0),
-            color,
-        );
+fn nav_badge<'a, M: 'a>(badge: NavBadge, selected: bool) -> Element<'a, M> {
+    match badge {
+        Some((label, color)) => {
+            let color = match (selected, color) {
+                (_, Some(c)) => c,
+                (true, None) => ACCENT_TEXT,
+                (false, None) => TEXT_FAINT,
+            };
+            text(label).size(12.0).color(color).into()
+        }
+        None => Space::new().into(),
     }
 }
 
-/// [`nav_item`] with a custom count (see [`NavBadge`]).
-pub fn nav_item_badge(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    label: &str,
+fn nav_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let (fill, fg) = if selected {
+            (Some(ACCENT_BG), ACCENT_TEXT)
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed => (Some(FIELD), TEXT),
+                _ => (None, TEXT_MUTED),
+            }
+        };
+        button_base(fill, fg, None, RADIUS)
+    }
+}
+
+/// Left navigation entry: icon, label, optional count; accent-tinted when selected.
+pub fn nav_item<'a, M: Clone + 'a>(
+    glyph: &'a str,
+    label: &'a str,
     badge: NavBadge,
     selected: bool,
-) -> Response {
-    let height = 32.0;
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        let fill = if selected {
-            ACCENT_BG
-        } else if resp.hovered() {
-            FIELD
-        } else {
-            Color32::TRANSPARENT
-        };
-        p.rect_filled(rect, CornerRadius::same(RADIUS), fill);
-        let (icon_color, text_color) = if selected {
-            (ACCENT_HOVER, ACCENT_TEXT)
-        } else if resp.hovered() {
-            (TEXT, TEXT)
-        } else {
-            (TEXT_MUTED, TEXT_MUTED)
-        };
-        let y = rect.center().y;
-        p.text(
-            egui::pos2(rect.left() + 12.0, y),
-            egui::Align2::LEFT_CENTER,
-            glyph,
-            FontId::proportional(16.0),
-            icon_color,
-        );
-        let font = if selected {
-            FontId::new(13.5, semibold_family())
-        } else {
-            FontId::proportional(13.5)
-        };
-        p.text(
-            egui::pos2(rect.left() + 38.0, y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            font,
-            text_color,
-        );
-        paint_nav_badge(p, rect, &badge, selected);
-    }
-    resp
+    on_press: M,
+) -> Element<'a, M> {
+    button(
+        row![
+            text(glyph).font(ICONS).size(16.0).line_height(1.0),
+            text(label)
+                .size(BODY)
+                .font(if selected { SEMIBOLD } else { INTER }),
+            fill_space(),
+            nav_badge(badge, selected),
+        ]
+        .spacing(10)
+        .height(Length::Fill)
+        .align_y(iced::Center),
+    )
+    .width(Length::Fill)
+    .height(32)
+    .padding([0, 10])
+    .style(nav_style(selected))
+    .on_press(on_press)
+    .into()
 }
 
 /// Collapsible sidebar group header: caret, glyph, label. `marked` highlights the
 /// header when it's closed over the current page.
-pub fn nav_group(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    label: &str,
+pub fn nav_group<'a, M: Clone + 'a>(
+    glyph: &'a str,
+    label: &'a str,
     open: bool,
     marked: bool,
-) -> Response {
-    let height = 32.0;
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        let fill = if marked {
-            ACCENT_BG
-        } else if resp.hovered() {
-            FIELD
-        } else {
-            Color32::TRANSPARENT
-        };
-        p.rect_filled(rect, CornerRadius::same(RADIUS), fill);
-        let color = if marked {
-            ACCENT_TEXT
-        } else if resp.hovered() {
-            TEXT
-        } else {
-            TEXT_MUTED
-        };
-        let y = rect.center().y;
-        let caret = if open {
-            egui_phosphor::regular::CARET_DOWN
-        } else {
-            egui_phosphor::regular::CARET_RIGHT
-        };
-        p.text(
-            egui::pos2(rect.left() + 6.0, y),
-            egui::Align2::LEFT_CENTER,
-            caret,
-            FontId::proportional(12.0),
-            TEXT_FAINT,
-        );
-        p.text(
-            egui::pos2(rect.left() + 22.0, y),
-            egui::Align2::LEFT_CENTER,
-            glyph,
-            FontId::proportional(16.0),
-            color,
-        );
-        p.text(
-            egui::pos2(rect.left() + 46.0, y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            FontId::new(13.5, semibold_family()),
-            color,
-        );
-    }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    on_press: M,
+) -> Element<'a, M> {
+    button(
+        row![
+            text(if open {
+                icon::CARET_DOWN
+            } else {
+                icon::CARET_RIGHT
+            })
+            .font(ICONS)
+            .size(12.0)
+            .color(TEXT_FAINT)
+            .line_height(1.0),
+            text(glyph).font(ICONS).size(16.0).line_height(1.0),
+            text(label).size(BODY).font(SEMIBOLD),
+        ]
+        .spacing(8)
+        .height(Length::Fill)
+        .align_y(iced::Center),
+    )
+    .width(Length::Fill)
+    .height(32)
+    .padding([0, 6])
+    .style(nav_style(marked))
+    .on_press(on_press)
+    .into()
 }
 
 /// A page inside a sidebar group: text only, hung off a hairline guide under the group glyph.
-pub fn nav_child_badge(
-    ui: &mut egui::Ui,
-    label: &str,
+pub fn nav_child<'a, M: Clone + 'a>(
+    label: &'a str,
     badge: NavBadge,
     selected: bool,
-) -> Response {
-    let height = 30.0;
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        // Guide spans the 2px gap above so consecutive children read as one line.
-        let guide_x = rect.left() + 30.0;
-        p.line_segment(
-            [
-                egui::pos2(guide_x, rect.top() - 2.0),
-                egui::pos2(guide_x, rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, BORDER_STRONG),
-        );
-        let item = egui::Rect::from_min_max(egui::pos2(rect.left() + 36.0, rect.top()), rect.max);
-        let fill = if selected {
-            ACCENT_BG
-        } else if resp.hovered() {
-            FIELD
-        } else {
-            Color32::TRANSPARENT
-        };
-        p.rect_filled(item, CornerRadius::same(RADIUS), fill);
-        if selected {
-            // The guide lights up beside the current page.
-            p.line_segment(
-                [
-                    egui::pos2(guide_x, rect.top() + 6.0),
-                    egui::pos2(guide_x, rect.bottom() - 6.0),
-                ],
-                egui::Stroke::new(2.0, ACCENT),
-            );
-        }
-        let text_color = if selected {
-            ACCENT_TEXT
-        } else if resp.hovered() {
-            TEXT
-        } else {
-            TEXT_MUTED
-        };
-        let font = if selected {
-            FontId::new(13.5, semibold_family())
-        } else {
-            FontId::proportional(13.5)
-        };
-        let y = rect.center().y;
-        p.text(
-            egui::pos2(item.left() + 10.0, y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            font,
-            text_color,
-        );
-        paint_nav_badge(p, rect, &badge, selected);
-    }
-    resp
-}
-
-/// Underlined tab strip (drawer sections). Returns the clicked index.
-pub fn underline_tabs(ui: &mut egui::Ui, labels: &[String], selected: usize) -> Option<usize> {
-    let mut clicked = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 18.0;
-        for (i, label) in labels.iter().enumerate() {
-            let active = i == selected;
-            let text = if active {
-                RichText::new(label).family(semibold_family()).color(TEXT)
-            } else {
-                RichText::new(label).color(TEXT_MUTED)
-            };
-            let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
-            let resp = if resp.hovered() && !active {
-                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-            } else {
-                resp
-            };
-            if active {
-                let r = resp.rect;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(r.left(), r.bottom() + 7.0),
-                        egui::pos2(r.right(), r.bottom() + 7.0),
-                    ],
-                    Stroke::new(2.0, ACCENT),
-                );
-            }
-            if resp.clicked() {
-                clicked = Some(i);
-            }
-        }
-    });
-    ui.add_space(6.0);
-    let rect = ui.max_rect();
-    let y = ui.cursor().top();
-    ui.painter().line_segment(
-        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-        Stroke::new(1.0, BORDER),
-    );
-    ui.add_space(10.0);
-    clicked
-}
-
-/// Small tinted pill, e.g. a kind label or a restart count.
-pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) -> Response {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        FontId::new(11.5, semibold_family()),
-        if filled { Color32::WHITE } else { color },
-    );
-    let size = galley.size() + Vec2::new(12.0, 4.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let fill = if filled {
-            color
-        } else {
-            color.gamma_multiply(0.16)
-        };
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(RADIUS_SMALL), fill);
-        ui.painter()
-            .galley(rect.center() - galley.size() / 2.0, galley, color);
-    }
-    resp
-}
-
-/// Search field with a leading magnifier, as used for list filters.
-pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> Response {
-    ui.add(
-        egui::TextEdit::singleline(text)
-            .hint_text(
-                RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS)).color(TEXT_FAINT),
-            )
-            .desired_width(width)
-            .margin(Margin::symmetric(8, 5)),
-    )
-}
-
-/// Dropdown caret for every combo box (replaces egui's filled triangle).
-pub fn caret(ui: &egui::Ui, rect: egui::Rect, _visuals: &egui::style::WidgetVisuals, open: bool) {
-    let glyph = if open {
-        icon::CARET_UP
-    } else {
-        icon::CARET_DOWN
+    on_press: M,
+) -> Element<'a, M> {
+    // One continuous hairline through every child row (each row includes the 2px gap
+    // between items); the current page lights it up with an accent stroke on the same axis.
+    let line = |width: f32, color: Color| {
+        container(Space::new().width(width).height(Length::Fill)).style(fill(color))
     };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        FontId::proportional(13.0),
-        TEXT_MUTED,
-    );
-}
-
-/// Checkbox drawn in the app's vocabulary: a 15px square, accent-filled with a check when on.
-pub fn checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> Response {
-    let font = FontId::proportional(13.5);
-    let text_color = if *value { TEXT } else { TEXT_MUTED };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, text_color);
-    let box_size = 15.0;
-    let gap = if label.is_empty() { 0.0 } else { 7.0 };
-    let size = Vec2::new(
-        box_size + gap + galley.size().x,
-        box_size.max(galley.size().y).max(22.0),
-    );
-    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.clicked() {
-        *value = !*value;
-        resp.mark_changed();
-    }
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        let b = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.center().y - box_size / 2.0),
-            Vec2::splat(box_size),
-        );
-        if *value {
-            p.rect_filled(
-                b,
-                CornerRadius::same(3),
-                if resp.hovered() { ACCENT_HOVER } else { ACCENT },
-            );
-            p.text(
-                b.center(),
-                egui::Align2::CENTER_CENTER,
-                icon::CHECK,
-                FontId::proportional(11.5),
-                Color32::WHITE,
-            );
-        } else {
-            p.rect_filled(
-                b,
-                CornerRadius::same(3),
-                if resp.hovered() { FIELD_HOVER } else { FIELD },
-            );
-            p.rect_stroke(
-                b,
-                CornerRadius::same(3),
-                Stroke::new(
-                    1.0,
-                    if resp.hovered() {
-                        BORDER_STRONG
-                    } else {
-                        BORDER_STRONG.gamma_multiply(0.85)
-                    },
-                ),
-                egui::StrokeKind::Inside,
-            );
-        }
-        p.galley(
-            egui::pos2(b.right() + gap, rect.center().y - galley.size().y / 2.0),
-            galley,
-            text_color,
+    let mut guide = stack![container(line(1.0, BORDER_STRONG)).center_x(Length::Fill)];
+    if selected {
+        guide = guide.push(
+            container(line(2.0, ACCENT))
+                .padding([7, 0])
+                .center_x(Length::Fill),
         );
     }
-    resp
+    row![
+        hspace(28.0),
+        container(guide).width(4).height(Length::Fill),
+        hspace(4.0),
+        container(
+            button(
+                row![
+                    text(label)
+                        .size(BODY)
+                        .font(if selected { SEMIBOLD } else { INTER }),
+                    fill_space(),
+                    nav_badge(badge, selected),
+                ]
+                .height(Length::Fill)
+                .align_y(iced::Center),
+            )
+            .width(Length::Fill)
+            .height(30)
+            .padding([0, 10])
+            .style(nav_style(selected))
+            .on_press(on_press),
+        )
+        .padding([1, 0]),
+    ]
+    .height(32)
+    .into()
 }
 
-/// Frameless icon button that opens a menu.
-pub fn icon_menu(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    hint: &str,
-    add_contents: impl FnOnce(&mut egui::Ui),
-) -> Response {
-    let resp = icon_button(ui, glyph, hint);
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(180.0);
-        add_contents(ui);
+/// Underlined tab strip (drawer sections).
+pub fn underline_tabs<'a, M: Clone + 'a>(
+    labels: Vec<String>,
+    selected: usize,
+    on_select: impl Fn(usize) -> M,
+) -> Element<'a, M> {
+    let tabs = labels.into_iter().enumerate().map(|(i, label)| {
+        let active = i == selected;
+        let underline = container(Space::new().height(2).width(Length::Fill)).style(move |_| {
+            container::Style {
+                background: active.then_some(ACCENT.into()),
+                ..Default::default()
+            }
+        });
+        column![
+            button(
+                text(label)
+                    .size(BODY)
+                    .font(if active { SEMIBOLD } else { INTER })
+                    .color(if active { TEXT } else { TEXT_MUTED })
+            )
+            .padding([0, 0])
+            .style(link(if active { TEXT } else { TEXT_MUTED }))
+            .on_press(on_select(i)),
+            vspace(6.0),
+            underline,
+        ]
+        .width(Length::Shrink)
+        .into()
     });
-    resp
+    column![row(tabs).spacing(18), hline(), vspace(10.0)].into()
+}
+
+/// The ground of a dropdown trigger: field fill, caret on the right.
+pub fn dropdown_button<'a, M: Clone + 'a>(
+    label: impl Into<String>,
+    width: f32,
+    open: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    button(
+        row![
+            text(label.into())
+                .size(BODY)
+                .wrapping(text::Wrapping::None)
+                .width(Length::Fill),
+            text(if open {
+                icon::CARET_UP
+            } else {
+                icon::CARET_DOWN
+            })
+            .font(ICONS)
+            .size(13.0)
+            .color(TEXT_MUTED)
+            .line_height(1.0),
+        ]
+        .spacing(6)
+        .align_y(iced::Center),
+    )
+    .width(width)
+    .padding(BUTTON_PAD)
+    .style(move |t, status| {
+        if open {
+            button_base(Some(FIELD_HOVER), TEXT, Some(ACCENT), RADIUS_SMALL)
+        } else {
+            secondary(t, status)
+        }
+    })
+    .on_press(on_press)
+    .into()
+}
+
+/// A menu entry: optional icon, label, full width.
+pub fn menu_entry<'a, M: Clone + 'a>(
+    glyph: Option<&'a str>,
+    label: impl Into<String>,
+    color: Color,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    button(labelled(glyph, label.into(), INTER, BODY))
+        .width(Length::Fill)
+        .padding([5, 8])
+        .style(menu_item(false, color))
+        .on_press_maybe(on_press)
+        .into()
+}
+
+/// A selectable list row (dropdown options).
+pub fn option_entry<'a, M: Clone + 'a>(
+    label: impl Into<String>,
+    selected: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    button(text(label.into()).size(BODY).wrapping(text::Wrapping::None))
+        .width(Length::Fill)
+        .padding([5, 8])
+        .style(menu_item(selected, TEXT))
+        .on_press(on_press)
+        .into()
 }

@@ -1,26 +1,34 @@
 //! Log tabs. A tab streams one pod, or every pod behind a selector/controller merged into
 //! one timeline (each line tagged with its pod), like `stern`.
 
-use egui::text::{LayoutJob, TextFormat};
+use iced::{
+    Element, Length, Task,
+    widget::{
+        self, Space, button, column, container, operation, rich_text, row, scrollable, span, text,
+    },
+};
 
 use super::filter::Matcher;
 
 use super::*;
 
 /// Distinct, readable-on-dark colors for telling pods apart.
-const PALETTE: [Color32; 8] = [
-    Color32::from_rgb(110, 165, 240),
-    Color32::from_rgb(120, 200, 130),
-    Color32::from_rgb(230, 170, 90),
-    Color32::from_rgb(200, 130, 230),
-    Color32::from_rgb(90, 200, 200),
-    Color32::from_rgb(235, 120, 150),
-    Color32::from_rgb(190, 200, 100),
-    Color32::from_rgb(160, 150, 240),
+const PALETTE: [Color; 8] = [
+    Color::from_rgb8(110, 165, 240),
+    Color::from_rgb8(120, 200, 130),
+    Color::from_rgb8(230, 170, 90),
+    Color::from_rgb8(200, 130, 230),
+    Color::from_rgb8(90, 200, 200),
+    Color::from_rgb8(235, 120, 150),
+    Color::from_rgb8(190, 200, 100),
+    Color::from_rgb8(160, 150, 240),
 ];
 
-#[derive(Clone, PartialEq)]
-pub(super) enum LogTarget {
+/// Row pitch of the log lines: about 1.35 line height for the 12.5px mono.
+const LINE: f32 = 17.0;
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum LogTarget {
     Pod(String),
     /// Every pod matching a label selector, e.g. a deployment's or service's.
     Selector {
@@ -41,11 +49,31 @@ impl LogTarget {
     }
 }
 
+/// What the user did in a log tab.
+#[derive(Clone, Debug)]
+pub enum LogMsg {
+    SetContainer(String),
+    SetTail(i64),
+    ToggleTimestamps,
+    ToggleFollow,
+    SetPrevious(bool),
+    Filter(String),
+    ToggleRegex,
+    Restart,
+    Copy,
+    Clear,
+    ToggleSource(usize),
+    ShowAll,
+    LoadOlder,
+    /// The lines scrolled: (offset, viewport height, content height).
+    Scrolled(f32, f32, f32),
+}
+
 struct Source {
     pod: String,
     /// Short tag shown before each line (the pod name's last segment).
     short: String,
-    color: Color32,
+    color: Color,
     handle: Option<JoinHandle<()>>,
     streaming: bool,
     status: Option<String>,
@@ -59,20 +87,36 @@ struct ViewLine {
     /// `line.text` has ANSI escapes removed; their colours live in `spans`.
     line: LogLine,
     spans: Vec<Span>,
+    /// The colour of plain text on this line (red for errors, amber for warnings).
+    tint: Color,
 }
 
 /// A run of `line.text` (byte range) with the colour an ANSI SGR code gave it.
 #[derive(Debug, PartialEq)]
 struct Span {
     range: std::ops::Range<usize>,
-    color: Option<Color32>,
+    color: Option<Color>,
 }
 
 impl ViewLine {
     fn new(src: usize, mut line: LogLine) -> Self {
         let (text, spans) = parse_ansi(&line.text);
         line.text = text;
-        Self { src, line, spans }
+        let lower = line.text.to_lowercase();
+        let tint = if lower.contains("error") || lower.contains("fatal") || lower.contains("panic")
+        {
+            RED
+        } else if lower.contains("warn") {
+            YELLOW
+        } else {
+            theme::TEXT
+        };
+        Self {
+            src,
+            line,
+            spans,
+            tint,
+        }
     }
 }
 
@@ -186,9 +230,9 @@ pub(super) struct LogView {
     clients: Clients,
     namespace: String,
     target: LogTarget,
-    containers: Vec<String>,
-    container: String,
-    tail: i64,
+    pub(super) containers: Vec<String>,
+    pub(super) container: String,
+    pub(super) tail: i64,
     timestamps: bool,
     /// Show the run before the last restart (`kubectl logs --previous`).
     previous: bool,
@@ -204,14 +248,21 @@ pub(super) struct LogView {
     resolving: bool,
     error: Option<String>,
     lines: VecDeque<ViewLine>,
+    /// Indices of the lines that pass the filter and pod chips; `None` when all do.
+    shown: Option<Vec<usize>>,
     older: Older,
     older_pending: usize,
     older_found: bool,
     tasks: Vec<JoinHandle<()>>,
-    /// Scroll position and row pitch from the last frame, used to keep the view
-    /// steady when older lines are prepended.
-    scroll_offset: f32,
-    row_pitch: f32,
+    scroll_id: widget::Id,
+    /// The line view's scroll state from its last scroll event.
+    offset: f32,
+    view_h: f32,
+    /// Scrolled to the end: new lines keep it there while following.
+    at_bottom: bool,
+    /// Lines arrived since the last update.
+    new_lines: bool,
+    /// Older lines were prepended: scroll by this much to keep the view steady.
     pending_offset: Option<f32>,
 }
 
@@ -219,12 +270,6 @@ impl Drop for LogView {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// What the user asked for in the log toolbar this frame.
-#[derive(Default)]
-pub(super) struct LogUi {
-    pub(super) restart: bool,
 }
 
 impl LogView {
@@ -263,12 +308,16 @@ impl LogView {
             resolving: false,
             error: None,
             lines: VecDeque::new(),
+            shown: None,
             older: Older::Idle,
             older_pending: 0,
             older_found: false,
             tasks: Vec::new(),
-            scroll_offset: 0.0,
-            row_pitch: 0.0,
+            scroll_id: widget::Id::unique(),
+            offset: 0.0,
+            view_h: 0.0,
+            at_bottom: true,
+            new_lines: false,
             pending_offset: None,
         }
     }
@@ -277,6 +326,8 @@ impl LogView {
     pub(super) fn set_filter(&mut self, filter: String, regex: bool) {
         self.filter = filter;
         self.regex = regex;
+        self.matcher.update(&self.filter, self.regex);
+        self.refilter();
     }
 
     pub(super) fn stream_id(&self) -> u64 {
@@ -336,8 +387,10 @@ impl LogView {
         self.stop();
         self.stream_id = stream_id;
         self.lines.clear();
+        self.shown = None;
         self.older = Older::Idle;
         self.error = None;
+        self.at_bottom = true;
         let hidden: HashSet<String> = self
             .sources
             .iter()
@@ -442,7 +495,10 @@ impl LogView {
                     Err(e) => self.error = Some(e),
                 }
             }
-            Msg::LogLine { src, line, .. } => self.insert(ViewLine::new(src, line)),
+            Msg::LogLine { src, line, .. } => {
+                self.insert(ViewLine::new(src, line));
+                self.new_lines = true;
+            }
             Msg::LogEnded { src, error, .. } => {
                 if let Some(s) = self.sources.get_mut(src) {
                     s.streaming = false;
@@ -471,8 +527,8 @@ impl LogView {
                             self.older_found = true;
                         }
                         // Everything fetched is older than what's on screen, so it lands above it.
-                        let base = self.pending_offset.unwrap_or(self.scroll_offset);
-                        self.pending_offset = Some(base + shown as f32 * self.row_pitch);
+                        let base = self.pending_offset.unwrap_or(self.offset);
+                        self.pending_offset = Some(base + shown as f32 * LINE);
                     }
                     Err(e) => {
                         if self.older_pending == 0 {
@@ -492,6 +548,29 @@ impl LogView {
             _ => {}
         }
         None
+    }
+
+    /// After a batch of messages: refilter, keep a followed log at the bottom, and keep
+    /// the view steady when older lines were prepended.
+    pub(super) fn after_update(&mut self) -> Task<Message> {
+        self.refilter();
+        let new_lines = std::mem::take(&mut self.new_lines);
+        if let Some(y) = self.pending_offset.take() {
+            self.offset = y;
+            return operation::scroll_to(
+                self.scroll_id.clone(),
+                operation::AbsoluteOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            );
+        }
+        if self.follow && self.at_bottom && new_lines {
+            // Scrolling by operation reports no scroll event, so track the offset here.
+            self.offset = self.end_offset();
+            return operation::snap_to_end(self.scroll_id.clone());
+        }
+        Task::none()
     }
 
     /// Inserts in timestamp order. Lines usually arrive in order, so this is normally a push;
@@ -522,7 +601,7 @@ impl LogView {
     }
 
     /// Fetches, for every pod, the page of lines just before the oldest line we have.
-    pub(super) fn load_older(&mut self, rt: &Handle, bus: &Bus) {
+    fn load_older(&mut self, rt: &Handle, bus: &Bus) {
         if self.older != Older::Idle || self.sources.is_empty() {
             return;
         }
@@ -566,6 +645,44 @@ impl LogView {
         self.sources.get(vl.src).is_none_or(|s| s.visible) && self.matcher.matches(&vl.line.text)
     }
 
+    /// Recomputes which lines pass the filter and the pod chips.
+    fn refilter(&mut self) {
+        let all_sources = self.sources.iter().all(|s| s.visible);
+        self.shown = if all_sources && !self.matcher.is_active() {
+            None
+        } else {
+            Some(
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| self.visible(l))
+                    .map(|(i, _)| i)
+                    .collect(),
+            )
+        };
+    }
+
+    /// The scroll offset of the last line (the banner row counts too).
+    fn end_offset(&self) -> f32 {
+        let view_h = if self.view_h > 0.0 {
+            self.view_h
+        } else {
+            300.0
+        };
+        ((self.shown_len() + 1) as f32 * LINE - view_h).max(0.0)
+    }
+
+    fn shown_len(&self) -> usize {
+        self.shown.as_ref().map_or(self.lines.len(), Vec::len)
+    }
+
+    fn shown_line(&self, i: usize) -> Option<&ViewLine> {
+        match &self.shown {
+            Some(idx) => idx.get(i).and_then(|j| self.lines.get(*j)),
+            None => self.lines.get(i),
+        }
+    }
+
     fn format_plain(&self, vl: &ViewLine) -> String {
         let mut out = String::new();
         if self.sources.len() > 1 {
@@ -581,183 +698,274 @@ impl LogView {
         out
     }
 
-    // -----------------------------------------------------------------------
-    // Rendering
-    // -----------------------------------------------------------------------
-
-    /// Toolbar, pod chips and the scrolling lines. Returns what the caller must act on.
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui, load_older: &mut bool) -> LogUi {
-        let mut out = LogUi::default();
-
-        ui.horizontal_wrapped(|ui| {
-            if self.containers.len() > 1 {
-                egui::ComboBox::from_id_salt(("log-container", &self.key))
-                    .icon(theme::caret)
-                    .selected_text(&self.container)
-                    .show_ui(ui, |ui| {
-                        for c in self.containers.clone() {
-                            if ui
-                                .selectable_value(&mut self.container, c.clone(), &c)
-                                .changed()
-                            {
-                                out.restart = true;
-                            }
-                        }
-                    });
-            } else {
-                ui.weak(&self.container);
-            }
-            ui.separator();
-            ui.label(RichText::new("Initial lines").color(theme::TEXT_MUTED));
-            let tail_label = |n: i64| {
-                if n == 0 {
-                    "All".to_string()
-                } else {
-                    n.to_string()
-                }
-            };
-            egui::ComboBox::from_id_salt(("log-tail", &self.key))
-                .icon(theme::caret)
-                .width(70.0)
-                .selected_text(tail_label(self.tail))
-                .show_ui(ui, |ui| {
-                    for n in [100, 500, 1000, 5000, 0] {
-                        if ui
-                            .selectable_value(&mut self.tail, n, tail_label(n))
-                            .changed()
-                        {
-                            out.restart = true;
-                        }
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "Lines per pod to start from. Scroll to the top to load older lines.",
-                );
-            ui.add_space(4.0);
-            theme::checkbox(ui, &mut self.timestamps, "Timestamps");
-            theme::checkbox(ui, &mut self.follow, "Auto-scroll");
-            ui.add_space(4.0);
-            let run_hint = "Current run, or the run before the last restart (--previous)";
-            if let Some(i) = theme::segmented(
-                ui,
-                &["Current", "Previous"],
-                self.previous as usize,
-                run_hint,
-            ) {
-                self.previous = i == 1;
-                out.restart = true;
-            }
-            if self.previous {
-                if let Some(exit) = self
-                    .last_exit
-                    .get(&self.container)
-                    .filter(|e| !e.is_empty())
-                {
-                    ui.label(RichText::new(format!("Last run: {exit}")).color(YELLOW));
+    pub(super) fn update(
+        &mut self,
+        msg: LogMsg,
+        next_id: u64,
+        rt: &Handle,
+        bus: &Bus,
+    ) -> Task<Message> {
+        match msg {
+            LogMsg::SetContainer(c) => {
+                if c != self.container {
+                    self.container = c;
+                    self.start(next_id, rt, bus);
                 }
             }
-            ui.add_space(4.0);
-            let hint = if self.regex {
-                "Filter (regex)"
-            } else {
-                "Filter lines"
-            };
-            theme::search_field(ui, &mut self.filter, hint, 200.0);
-            let regex_hint = "Regular expression (case-insensitive)";
-            if theme::toggle_button(ui, ".*", self.regex, regex_hint).clicked() {
+            LogMsg::SetTail(n) => {
+                if n != self.tail {
+                    self.tail = n;
+                    self.start(next_id, rt, bus);
+                }
+            }
+            LogMsg::ToggleTimestamps => self.timestamps = !self.timestamps,
+            LogMsg::ToggleFollow => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.at_bottom = true;
+                    self.offset = self.end_offset();
+                    return operation::snap_to_end(self.scroll_id.clone());
+                }
+            }
+            LogMsg::SetPrevious(previous) => {
+                self.previous = previous;
+                self.start(next_id, rt, bus);
+            }
+            LogMsg::Filter(f) => {
+                self.filter = f;
+                self.matcher.update(&self.filter, self.regex);
+                self.refilter();
+            }
+            LogMsg::ToggleRegex => {
                 self.regex = !self.regex;
+                self.matcher.update(&self.filter, self.regex);
+                self.refilter();
             }
-            self.matcher.update(&self.filter, self.regex);
-            if let Some(err) = &self.matcher.error {
-                ui.label(
-                    RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD),
-                )
-                .on_hover_text(err);
-            }
-            let restart_hint = if self.is_group() {
-                "Restart (also picks up new pods)"
-            } else {
-                "Restart stream"
-            };
-            if theme::icon_button(ui, icon::ARROW_CLOCKWISE, restart_hint).clicked() {
-                out.restart = true;
-            }
-            if theme::icon_button(ui, icon::COPY, "Copy visible lines").clicked() {
-                let text = self
-                    .lines
-                    .iter()
-                    .filter(|l| self.visible(l))
+            LogMsg::Restart => self.start(next_id, rt, bus),
+            LogMsg::Copy => {
+                let text = (0..self.shown_len())
+                    .filter_map(|i| self.shown_line(i))
                     .map(|l| self.format_plain(l))
                     .collect::<Vec<_>>()
                     .join("\n");
-                ui.ctx().copy_text(text);
+                return iced::clipboard::write(text);
             }
-            if theme::icon_button(ui, icon::BROOM, "Clear").clicked() {
+            LogMsg::Clear => {
                 self.lines.clear();
+                self.shown = None;
                 for s in &mut self.sources {
                     s.held = 0;
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Kept short so it never runs over the controls; a stream's message gets its own line below.
-                if self.live() {
-                    ui.colored_label(GREEN, "live");
-                    dot(ui, GREEN);
-                } else if !self.sources.is_empty() {
-                    ui.weak("stopped");
+            LogMsg::ToggleSource(i) => {
+                if let Some(s) = self.sources.get_mut(i) {
+                    s.visible = !s.visible;
                 }
-                ui.weak(format!("{} lines", self.lines.len()));
-            });
-        });
+                self.refilter();
+            }
+            LogMsg::ShowAll => {
+                for s in &mut self.sources {
+                    s.visible = true;
+                }
+                self.refilter();
+            }
+            LogMsg::LoadOlder => self.load_older(rt, bus),
+            LogMsg::Scrolled(offset, view_h, content_h) => {
+                let up = offset < self.offset;
+                self.offset = offset;
+                self.view_h = view_h;
+                self.at_bottom = offset + view_h >= content_h - LINE * 1.5;
+                // Scrolling up into the banner loads the page before.
+                if up && offset <= LINE && self.shown_len() > 0 {
+                    self.load_older(rt, bus);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering
+    // -----------------------------------------------------------------------
+
+    /// Toolbar, pod chips and the scrolling lines. `index` is the tab's place in the dock.
+    pub(super) fn view(&self, index: usize, popup: Option<&PopupKind>) -> Element<'_, Message> {
+        let msg = move |m: LogMsg| Message::Log(index, m);
+        let mut bar = row![].spacing(8).align_y(iced::Center);
+        if self.containers.len() > 1 {
+            let id = format!("log-container-{index}");
+            bar = bar.push(
+                container(theme::dropdown_button(
+                    self.container.clone(),
+                    150.0,
+                    popup == Some(&PopupKind::LogContainer(index)),
+                    Message::OpenPopup(
+                        PopupKind::LogContainer(index),
+                        widget::Id::from(id.clone()),
+                    ),
+                ))
+                .id(id),
+            );
+        } else {
+            bar = bar.push(theme::muted(self.container.clone()));
+        }
+        bar = bar.push(theme::vline(18.0));
+        bar = bar.push(theme::muted("Initial lines"));
+        let tail_id = format!("log-tail-{index}");
+        bar = bar.push(theme::tip(
+            container(theme::dropdown_button(
+                tail_label(self.tail),
+                76.0,
+                popup == Some(&PopupKind::LogTail(index)),
+                Message::OpenPopup(PopupKind::LogTail(index), widget::Id::from(tail_id.clone())),
+            ))
+            .id(tail_id),
+            "Lines per pod to start from. Scroll to the top to load older lines.",
+        ));
+        bar = bar.push(theme::checkbox(
+            self.timestamps,
+            "Timestamps",
+            msg(LogMsg::ToggleTimestamps),
+        ));
+        bar = bar.push(theme::checkbox(
+            self.follow,
+            "Auto-scroll",
+            msg(LogMsg::ToggleFollow),
+        ));
+        bar = bar.push(theme::segmented(
+            &["Current", "Previous"],
+            self.previous as usize,
+            "Current run, or the run before the last restart (--previous)",
+            move |i| msg(LogMsg::SetPrevious(i == 1)),
+        ));
+        if self.previous {
+            if let Some(exit) = self
+                .last_exit
+                .get(&self.container)
+                .filter(|e| !e.is_empty())
+            {
+                bar = bar.push(theme::colored(format!("Last run: {exit}"), YELLOW));
+            }
+        }
+        let hint = if self.regex {
+            "Filter (regex)"
+        } else {
+            "Filter lines"
+        };
+        bar = bar.push(theme::search_field(&self.filter, hint, 200.0, move |f| {
+            msg(LogMsg::Filter(f))
+        }));
+        bar = bar.push(theme::toggle_button(
+            ".*",
+            self.regex,
+            "Regular expression (case-insensitive)",
+            msg(LogMsg::ToggleRegex),
+        ));
+        if let Some(err) = &self.matcher.error {
+            bar = bar.push(theme::tip(
+                theme::icon_label(icon::WARNING, "Invalid regex").map(|m: Message| m),
+                err.clone(),
+            ));
+        }
+        let restart_hint = if self.is_group() {
+            "Restart (also picks up new pods)"
+        } else {
+            "Restart stream"
+        };
+        bar = bar.push(theme::icon_button(
+            icon::ARROW_CLOCKWISE,
+            restart_hint,
+            Some(msg(LogMsg::Restart)),
+        ));
+        bar = bar.push(theme::icon_button(
+            icon::COPY,
+            "Copy visible lines",
+            Some(msg(LogMsg::Copy)),
+        ));
+        bar = bar.push(theme::icon_button(
+            icon::BROOM,
+            "Clear",
+            Some(msg(LogMsg::Clear)),
+        ));
+        // Kept short so it never runs over the controls; a stream's message gets its own line below.
+        let mut status = row![theme::faint(format!("{} lines", self.lines.len()))]
+            .spacing(8)
+            .align_y(iced::Center);
+        if self.live() {
+            status = status.push(
+                row![theme::dot(GREEN), theme::colored("live", GREEN)]
+                    .spacing(5)
+                    .align_y(iced::Center),
+            );
+        } else if !self.sources.is_empty() {
+            status = status.push(theme::faint("stopped"));
+        }
+
+        let mut col = column![
+            row![
+                container(bar.wrap().vertical_spacing(6)).width(Length::Fill),
+                status
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Start)
+        ]
+        .spacing(6);
 
         // Pod chips: click to show/hide a pod's lines.
         if self.is_group() {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if self.resolving {
-                    ui.spinner();
-                    ui.weak("Finding pods…");
+            let mut chips = row![].spacing(4).align_y(iced::Center);
+            if self.resolving {
+                chips = chips.push(theme::faint("Finding pods…"));
+            }
+            if let Some(e) = &self.error {
+                chips = chips.push(theme::colored(e.clone(), RED));
+            }
+            let all_visible = self.sources.iter().all(|s| s.visible);
+            if self.sources.len() > 1 && !all_visible {
+                chips = chips.push(theme::small_button(
+                    None,
+                    "Show all",
+                    Some(msg(LogMsg::ShowAll)),
+                ));
+            }
+            for (i, s) in self.sources.iter().enumerate() {
+                let color = if s.visible {
+                    s.color
+                } else {
+                    theme::TEXT_FAINT
+                };
+                let glyph = if s.streaming {
+                    icon::CIRCLE
+                } else {
+                    icon::WARNING_CIRCLE
+                };
+                let mut hover = s.pod.clone();
+                if let Some(st) = &s.status {
+                    hover.push_str(&format!("\n{st}"));
                 }
-                if let Some(e) = &self.error {
-                    ui.colored_label(RED, e);
-                }
-                let all_visible = self.sources.iter().all(|s| s.visible);
-                if self.sources.len() > 1 && !all_visible && ui.small_button("Show all").clicked() {
-                    for s in &mut self.sources {
-                        s.visible = true;
-                    }
-                }
-                for s in &mut self.sources {
-                    let color = if s.visible {
-                        s.color
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    let glyph = if s.streaming {
-                        icon::CIRCLE
-                    } else {
-                        icon::WARNING_CIRCLE
-                    };
-                    let text = RichText::new(format!("{glyph} {}", s.short))
-                        .color(color)
-                        .monospace();
-                    let mut hover = s.pod.clone();
-                    if let Some(st) = &s.status {
-                        hover.push_str(&format!("\n{st}"));
-                    }
-                    hover.push_str("\nClick to show/hide");
-                    if ui
-                        .add(egui::Button::selectable(s.visible, text))
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
-                        s.visible = !s.visible;
-                    }
-                }
-            });
+                hover.push_str("\nClick to show/hide");
+                let visible = s.visible;
+                chips = chips.push(theme::tip(
+                    button(
+                        row![
+                            text(glyph).font(theme::ICONS).size(11.0).color(color),
+                            text(s.short.clone())
+                                .font(theme::MONO)
+                                .size(theme::MONO_SIZE)
+                                .color(color),
+                        ]
+                        .spacing(4)
+                        .align_y(iced::Center),
+                    )
+                    .padding([2, 6])
+                    .style(theme::menu_item(visible, color))
+                    .on_press(msg(LogMsg::ToggleSource(i))),
+                    hover,
+                ));
+            }
+            col = col.push(chips.wrap());
         } else if let Some(e) = &self.error {
-            ui.colored_label(RED, e);
+            col = col.push(theme::colored(e.clone(), RED));
         } else if let Some(st) = self
             .sources
             .first()
@@ -769,18 +977,31 @@ impl LogView {
             } else {
                 YELLOW
             };
-            ui.add(egui::Label::new(RichText::new(st).color(color)).wrap());
+            col = col.push(theme::colored(st.clone(), color));
         }
-        ui.separator();
+        col = col.push(theme::hline());
+        col = col.push(self.lines_view(index));
+        col.height(Length::Fill).into()
+    }
 
-        let lines: Vec<&ViewLine> = self.lines.iter().filter(|l| self.visible(l)).collect();
-        // Terminal rhythm: about 1.35 line height for the 12.5px mono.
-        ui.spacing_mut().item_spacing.y = 2.0;
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        self.row_pitch = row_h + ui.spacing().item_spacing.y;
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let text_color = ui.visuals().text_color();
-        let weak_color = ui.visuals().weak_text_color();
+    /// The lines, drawn only where they're visible. Row 0 is the "older lines" banner.
+    fn lines_view(&self, index: usize) -> Element<'_, Message> {
+        let total = self.shown_len();
+        if total == 0 && self.live() {
+            return container(theme::faint("Waiting for log lines…"))
+                .height(Length::Fill)
+                .into();
+        }
+        let rows_total = total + 1;
+        let view_h = if self.view_h > 0.0 {
+            self.view_h
+        } else {
+            800.0
+        };
+        // A margin either side covers an offset that is a little out of date.
+        let top = ((self.offset / LINE).floor().max(0.0) as usize).min(rows_total);
+        let first = top.saturating_sub(40);
+        let last = (top + (view_h / LINE).ceil() as usize + 40).min(rows_total);
         let multi = self.sources.len() > 1;
         let tag_width = self
             .sources
@@ -789,90 +1010,79 @@ impl LogView {
             .max()
             .unwrap_or(0);
 
-        let mut area = egui::ScrollArea::both()
-            .auto_shrink(false)
-            .stick_to_bottom(self.follow);
-        if let Some(offset) = self.pending_offset.take() {
-            area = area.vertical_scroll_offset(offset);
-        }
-        // Row 0 is the "older lines" banner; log lines follow.
-        let older = &self.older;
-        let output = area.show_rows(ui, row_h, lines.len() + 1, |ui, range| {
-            ui.style_mut().interaction.selectable_labels = true;
-            for i in range {
-                if i == 0 {
-                    ui.horizontal(|ui| match older {
-                        Older::Loading => {
-                            ui.weak(format!("{} Loading older lines…", icon::SPINNER));
-                        }
-                        Older::Done => {
-                            ui.weak("Beginning of log");
-                        }
-                        Older::Idle => {
-                            if ui
-                                .link(format!("{} Load older lines", icon::ARROW_LINE_UP))
-                                .clicked()
-                            {
-                                *load_older = true;
-                            }
-                        }
-                    });
-                    continue;
-                }
-                let vl = lines[i - 1];
-                let lower = vl.line.text.to_lowercase();
-                let color = if lower.contains("error")
-                    || lower.contains("fatal")
-                    || lower.contains("panic")
-                {
-                    RED
-                } else if lower.contains("warn") {
-                    YELLOW
-                } else {
-                    text_color
-                };
-                let fmt = |color| TextFormat {
-                    font_id: font.clone(),
-                    color,
-                    ..Default::default()
-                };
-                let mut job = LayoutJob::default();
-                if multi {
-                    if let Some(s) = self.sources.get(vl.src) {
-                        job.append(&format!("{:<tag_width$} ", s.short), 0.0, fmt(s.color));
+        let mut col = column![Space::new().height(first as f32 * LINE)];
+        for i in first..last {
+            if i == 0 {
+                let banner: Element<'_, Message> = match self.older {
+                    Older::Loading => theme::faint("Loading older lines…").size(12.5).into(),
+                    Older::Done => theme::faint("Beginning of log").size(12.5).into(),
+                    Older::Idle => {
+                        button(theme::icon_label(icon::ARROW_LINE_UP, "Load older lines"))
+                            .padding(0)
+                            .style(theme::link(theme::ACCENT_HOVER))
+                            .on_press(Message::Log(index, LogMsg::LoadOlder))
+                            .into()
                     }
-                }
-                if self.timestamps && !vl.line.ts.is_empty() {
-                    job.append(&format!("{} ", vl.line.ts), 0.0, fmt(weak_color));
-                }
-                if vl.spans.is_empty() {
-                    job.append(&vl.line.text, 0.0, fmt(color));
-                } else {
-                    for s in &vl.spans {
-                        job.append(
-                            &vl.line.text[s.range.clone()],
-                            0.0,
-                            fmt(s.color.unwrap_or(color)),
-                        );
-                    }
-                }
-                ui.add(egui::Label::new(job).extend());
+                };
+                col = col.push(container(banner).height(LINE).center_y(LINE));
+                continue;
             }
-        });
-        self.scroll_offset = output.state.offset.y;
+            let Some(vl) = self.shown_line(i - 1) else {
+                continue;
+            };
+            let mut spans: Vec<text::Span<'_, ()>> = Vec::new();
+            if multi {
+                if let Some(s) = self.sources.get(vl.src) {
+                    spans.push(span(format!("{:<tag_width$} ", s.short)).color(s.color));
+                }
+            }
+            if self.timestamps && !vl.line.ts.is_empty() {
+                spans.push(span(format!("{} ", vl.line.ts)).color(theme::TEXT_MUTED));
+            }
+            if vl.spans.is_empty() {
+                spans.push(span(vl.line.text.as_str()).color(vl.tint));
+            } else {
+                for s in &vl.spans {
+                    spans.push(
+                        span(&vl.line.text[s.range.clone()]).color(s.color.unwrap_or(vl.tint)),
+                    );
+                }
+            }
+            col = col.push(
+                rich_text(spans)
+                    .font(theme::MONO)
+                    .size(theme::MONO_SIZE)
+                    .line_height(text::LineHeight::Absolute(LINE.into()))
+                    .wrapping(text::Wrapping::None)
+                    .height(LINE),
+            );
+        }
+        col = col.push(Space::new().height((rows_total - last) as f32 * LINE));
+        scrollable(col.width(Length::Shrink))
+            .id(self.scroll_id.clone())
+            .direction(theme::thin_both())
+            .style(theme::scrollbar)
+            .on_scroll(move |v| {
+                Message::Log(
+                    index,
+                    LogMsg::Scrolled(
+                        v.absolute_offset().y,
+                        v.bounds().height,
+                        v.content_bounds().height,
+                    ),
+                )
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+}
 
-        // Auto-load when the user scrolls up into the banner, or when everything fits on screen.
-        let near_top = output.state.offset.y <= self.row_pitch;
-        let fits = output.content_size.y <= output.inner_rect.height();
-        let scrolling_up = ui.rect_contains_pointer(output.inner_rect)
-            && ui.input(|i| i.smooth_scroll_delta.y > 0.0);
-        if near_top && !lines.is_empty() && (scrolling_up || fits) {
-            *load_older = true;
-        }
-        if lines.is_empty() && self.live() {
-            ui.weak("Waiting for log lines…");
-        }
-        out
+pub(super) fn tail_label(n: i64) -> String {
+    if n == 0 {
+        "All".to_string()
+    } else {
+        n.to_string()
     }
 }
 

@@ -1,15 +1,25 @@
 //! Shell tabs: an interactive terminal into a pod's container (`kubectl exec -it`), drawn
-//! from a vt100 screen model and living in the bottom dock next to the log tabs.
+//! from a vt100 screen model on a canvas and living in the bottom dock next to the log tabs.
 
 use std::num::NonZeroU16;
 
-use egui::text::{LayoutJob, TextFormat};
+use iced::{
+    Element, Length, Point, Rectangle, Renderer, Size, Task, Theme,
+    keyboard::{self, Key, key::Named},
+    mouse,
+    widget::{Action as CanvasAction, canvas, column, container, row},
+};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use super::*;
 use crate::kube_ops::ShellInput;
 
 const SCROLLBACK: usize = 5_000;
+/// JetBrains Mono's advance is 0.6em.
+const CHAR_W: f32 = theme::MONO_SIZE * 0.6;
+const LINE_H: f32 = 16.0;
+const PAD_X: f32 = 8.0;
+const PAD_Y: f32 = 6.0;
 
 #[derive(Clone, PartialEq)]
 pub(super) enum ShellStatus {
@@ -17,6 +27,22 @@ pub(super) enum ShellStatus {
     Open,
     /// The shell ended; `Some` holds the reason when it wasn't a clean exit.
     Exited(Option<String>),
+}
+
+/// What the user did in a shell tab.
+#[derive(Clone, Debug)]
+pub enum ShellMsg {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    /// Mouse selection in screen cells: (row, col) anchor and head.
+    Select(Option<((u16, u16), (u16, u16))>),
+    /// Scroll back through history by this many lines (negative: toward the live screen).
+    Scroll(isize),
+    Paste,
+    Pasted(Option<String>),
+    CopySelection,
+    CopyScreen,
+    Reconnect,
 }
 
 pub(super) struct ShellView {
@@ -32,7 +58,6 @@ pub(super) struct ShellView {
     pub(super) status: ShellStatus,
     /// (cols, rows) last sent to the pod.
     size: (u16, u16),
-    /// Mouse selection in screen cells: (row, col) anchor and head.
     selection: Option<((u16, u16), (u16, u16))>,
 }
 
@@ -90,7 +115,7 @@ impl ShellView {
     }
 
     pub(super) fn live(&self) -> bool {
-        self.status != ShellStatus::Exited(None) && !matches!(self.status, ShellStatus::Exited(_))
+        !matches!(self.status, ShellStatus::Exited(_))
     }
 
     /// (Re)connects. Output and the exit arrive on the bus under `self.id`.
@@ -151,171 +176,65 @@ impl ShellView {
         }
     }
 
-    /// Draws the terminal and handles typing. Returns true when the user asks to reconnect.
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut reconnect = false;
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let (char_w, line_h) = ui.fonts_mut(|f| (f.glyph_width(&font, 'm'), f.row_height(&font)));
-        let char_w = char_w.max(1.0);
-        let line_h = line_h.ceil().max(1.0);
-
-        // Status strip.
-        ui.horizontal(|ui| {
-            let (color, text) = match &self.status {
-                ShellStatus::Connecting => (YELLOW, "Connecting…".to_string()),
-                ShellStatus::Open => (
-                    GREEN,
-                    format!("Connected · {}/{}", self.namespace, self.title()),
-                ),
-                ShellStatus::Exited(None) => (theme::IDLE, "Session ended".to_string()),
-                ShellStatus::Exited(Some(e)) => (RED, format!("Session ended: {e}")),
-            };
-            dot(ui, color);
-            ui.add(egui::Label::new(RichText::new(text).color(theme::TEXT_MUTED)).truncate());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    pub(super) fn update(&mut self, msg: ShellMsg, rt: &Handle, bus: &Bus) -> Task<Message> {
+        match msg {
+            ShellMsg::Input(bytes) => {
                 if matches!(self.status, ShellStatus::Exited(_)) {
-                    if ui
-                        .add(theme::primary_button(format!(
-                            "{} Reconnect",
-                            icon::ARROW_CLOCKWISE
-                        )))
-                        .clicked()
-                    {
-                        reconnect = true;
+                    // Enter on an ended session reconnects.
+                    if bytes == b"\r" {
+                        self.start(rt, bus);
+                    }
+                    return Task::none();
+                }
+                self.send(bytes);
+                // Typing jumps back to the live screen and drops any selection.
+                self.parser.screen_mut().set_scrollback(0);
+                self.selection = None;
+            }
+            ShellMsg::Resize(cols, rows) => {
+                if (cols, rows) != self.size {
+                    self.size = (cols, rows);
+                    self.parser.set_size(nz(rows), nz(cols));
+                    if let Some(tx) = &self.tx {
+                        let _ = tx.send(ShellInput::Resize(cols, rows));
                     }
                 }
-                if theme::icon_button(ui, icon::COPY, "Copy the visible screen").clicked() {
-                    ui.ctx().copy_text(self.parser.screen().contents());
-                }
-            });
-        });
-        ui.add_space(4.0);
-
-        // Terminal area.
-        let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
-        let inner = rect.shrink2(egui::vec2(8.0, 6.0));
-        let cols = ((inner.width() / char_w).floor() as u16).clamp(10, 1000);
-        let rows = ((inner.height() / line_h).floor() as u16).clamp(2, 500);
-        if (cols, rows) != self.size {
-            self.size = (cols, rows);
-            self.parser.set_size(nz(rows), nz(cols));
-            if let Some(tx) = &self.tx {
-                let _ = tx.send(ShellInput::Resize(cols, rows));
             }
-        }
-
-        let id = resp.id;
-        if resp.clicked() || resp.drag_started() {
-            ui.memory_mut(|m| m.request_focus(id));
-        }
-        let focused = ui.memory(|m| m.has_focus(id));
-        if focused {
-            // Keep Tab, arrows and Escape for the shell instead of egui's focus navigation.
-            ui.memory_mut(|m| {
-                m.set_focus_lock_filter(
-                    id,
-                    egui::EventFilter {
-                        tab: true,
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        escape: true,
-                    },
-                )
-            });
-        }
-
-        // Mouse: selection by drag (screen cells), wheel scrolls back through history.
-        let cell_at = |pos: egui::Pos2| -> (u16, u16) {
-            let col = ((pos.x - inner.left()) / char_w)
-                .floor()
-                .clamp(0.0, cols as f32 - 1.0) as u16;
-            let row = ((pos.y - inner.top()) / line_h)
-                .floor()
-                .clamp(0.0, rows as f32 - 1.0) as u16;
-            (row, col)
-        };
-        if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let c = cell_at(p);
-                self.selection = Some((c, c));
-            }
-        } else if resp.dragged() {
-            if let (Some(p), Some(sel)) = (resp.interact_pointer_pos(), self.selection.as_mut()) {
-                sel.1 = cell_at(p);
-            }
-        } else if resp.clicked() {
-            self.selection = None;
-        }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0 && !self.parser.screen().alternate_screen() {
-                let lines = (scroll / line_h).round() as isize;
-                let now = self.parser.screen().scrollback() as isize;
-                self.parser
-                    .screen_mut()
-                    .set_scrollback((now + lines).max(0) as usize);
-            }
-        }
-
-        if focused && matches!(self.status, ShellStatus::Open | ShellStatus::Connecting) {
-            self.handle_keys(ui);
-        } else if focused
-            && matches!(self.status, ShellStatus::Exited(_))
-            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-        {
-            reconnect = true;
-        }
-
-        self.paint(ui, rect, inner, &font, char_w, line_h, focused);
-        reconnect
-    }
-
-    fn handle_keys(&mut self, ui: &mut egui::Ui) {
-        let events = ui.input(|i| i.events.clone());
-        let app_cursor = self.parser.screen().application_cursor();
-        let bracketed = self.parser.screen().bracketed_paste();
-        let mut typed = false;
-        for e in events {
-            match e {
-                egui::Event::Text(t) => {
-                    self.send(t.into_bytes());
-                    typed = true;
+            ShellMsg::Select(sel) => self.selection = sel,
+            ShellMsg::Scroll(lines) => {
+                if !self.parser.screen().alternate_screen() {
+                    let now = self.parser.screen().scrollback() as isize;
+                    self.parser
+                        .screen_mut()
+                        .set_scrollback((now + lines).max(0) as usize);
                 }
-                egui::Event::Paste(t) => {
-                    let t = t.replace("\r\n", "\r").replace('\n', "\r");
-                    if bracketed {
-                        self.send(format!("\x1b[200~{t}\x1b[201~"));
-                    } else {
-                        self.send(t);
-                    }
-                    typed = true;
-                }
-                egui::Event::Copy => {
-                    if let Some(text) = self.selected_text() {
-                        ui.ctx().copy_text(text);
-                    }
-                }
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => {
-                    if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
-                        self.send(bytes);
-                        typed = true;
-                    }
-                }
-                _ => {}
             }
+            ShellMsg::Paste => {
+                let id = self.id;
+                return iced::clipboard::read()
+                    .map(move |t| Message::Shell(id, ShellMsg::Pasted(t)));
+            }
+            ShellMsg::Pasted(Some(t)) => {
+                let t = t.replace("\r\n", "\r").replace('\n', "\r");
+                let data = if self.parser.screen().bracketed_paste() {
+                    format!("\x1b[200~{t}\x1b[201~")
+                } else {
+                    t
+                };
+                return self.update(ShellMsg::Input(data.into_bytes()), rt, bus);
+            }
+            ShellMsg::Pasted(None) => {}
+            ShellMsg::CopySelection => {
+                if let Some(text) = self.selected_text() {
+                    return iced::clipboard::write(text);
+                }
+            }
+            ShellMsg::CopyScreen => {
+                return iced::clipboard::write(self.parser.screen().contents());
+            }
+            ShellMsg::Reconnect => self.start(rt, bus),
         }
-        if typed {
-            // Typing jumps back to the live screen and drops any selection.
-            self.parser.screen_mut().set_scrollback(0);
-            self.selection = None;
-        }
+        Task::none()
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -331,32 +250,199 @@ impl ShellView {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint(
+    /// Status strip and terminal.
+    pub(super) fn view(&self) -> Element<'_, Message> {
+        let (color, status) = match &self.status {
+            ShellStatus::Connecting => (YELLOW, "Connecting…".to_string()),
+            ShellStatus::Open => (
+                GREEN,
+                format!("Connected · {}/{}", self.namespace, self.title()),
+            ),
+            ShellStatus::Exited(None) => (theme::IDLE, "Session ended".to_string()),
+            ShellStatus::Exited(Some(e)) => (RED, format!("Session ended: {e}")),
+        };
+        let mut strip = row![
+            theme::dot(color),
+            theme::muted(status).wrapping(iced::widget::text::Wrapping::None),
+            theme::fill_space(),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+        if matches!(self.status, ShellStatus::Exited(_)) {
+            strip = strip.push(theme::primary_button(
+                Some(icon::ARROW_CLOCKWISE),
+                "Reconnect",
+                Some(Message::Shell(self.id, ShellMsg::Reconnect)),
+            ));
+        }
+        strip = strip.push(theme::icon_button(
+            icon::COPY,
+            "Copy the visible screen",
+            Some(Message::Shell(self.id, ShellMsg::CopyScreen)),
+        ));
+        column![
+            container(strip).height(28).center_y(28),
+            canvas(Terminal { view: self })
+                .width(Length::Fill)
+                .height(Length::Fill),
+        ]
+        .spacing(4)
+        .height(Length::Fill)
+        .into()
+    }
+}
+
+/// Canvas program that draws the screen and turns input into shell bytes.
+struct Terminal<'a> {
+    view: &'a ShellView,
+}
+
+#[derive(Default)]
+struct TermState {
+    focused: bool,
+    /// Dragging out a selection from this cell.
+    anchor: Option<(u16, u16)>,
+}
+
+impl Terminal<'_> {
+    fn grid(bounds: Rectangle) -> (u16, u16) {
+        let cols = (((bounds.width - 2.0 * PAD_X) / CHAR_W).floor() as u16).clamp(10, 1000);
+        let rows = (((bounds.height - 2.0 * PAD_Y) / LINE_H).floor() as u16).clamp(2, 500);
+        (cols, rows)
+    }
+
+    fn cell_at(&self, bounds: Rectangle, p: Point) -> (u16, u16) {
+        let (cols, rows) = self.view.size;
+        let col = ((p.x - bounds.x - PAD_X) / CHAR_W)
+            .floor()
+            .clamp(0.0, cols as f32 - 1.0) as u16;
+        let row = ((p.y - bounds.y - PAD_Y) / LINE_H)
+            .floor()
+            .clamp(0.0, rows as f32 - 1.0) as u16;
+        (row, col)
+    }
+
+    fn msg(&self, m: ShellMsg) -> CanvasAction<Message> {
+        CanvasAction::publish(Message::Shell(self.view.id, m))
+    }
+}
+
+impl canvas::Program<Message> for Terminal<'_> {
+    type State = TermState;
+
+    fn update(
         &self,
-        ui: &egui::Ui,
-        rect: egui::Rect,
-        inner: egui::Rect,
-        font: &egui::FontId,
-        char_w: f32,
-        line_h: f32,
-        focused: bool,
-    ) {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme::WELL);
-        let screen = self.parser.screen();
-        let (rows, cols) = (self.size.1, self.size.0);
+        state: &mut TermState,
+        event: &iced::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<CanvasAction<Message>> {
+        // Keep the pod's terminal size matched to the canvas.
+        let grid = Self::grid(bounds);
+        if grid != self.view.size {
+            return Some(self.msg(ShellMsg::Resize(grid.0, grid.1)));
+        }
+        match event {
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                match cursor.position_in(bounds).map(|_| cursor.position()) {
+                    Some(Some(p)) => {
+                        state.focused = true;
+                        let c = self.cell_at(bounds, p);
+                        state.anchor = Some(c);
+                        Some(self.msg(ShellMsg::Select(None)).and_capture())
+                    }
+                    _ => {
+                        state.focused = false;
+                        None
+                    }
+                }
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let anchor = state.anchor?;
+                let head = self.cell_at(bounds, *position);
+                Some(self.msg(ShellMsg::Select(Some((anchor, head)))))
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.anchor = None;
+                None
+            }
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                cursor.position_in(bounds)?;
+                let lines = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => (y * 3.0).round(),
+                    mouse::ScrollDelta::Pixels { y, .. } => (y / LINE_H).round(),
+                } as isize;
+                (lines != 0).then(|| self.msg(ShellMsg::Scroll(lines)).and_capture())
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                text,
+                ..
+            }) if state.focused => {
+                let latin = key.to_latin(*physical_key);
+                if modifiers.command() && !modifiers.control() {
+                    return match latin {
+                        Some('c') => Some(self.msg(ShellMsg::CopySelection).and_capture()),
+                        Some('v') => Some(self.msg(ShellMsg::Paste).and_capture()),
+                        // Other Cmd shortcuts stay with the app.
+                        _ => None,
+                    };
+                }
+                let app_cursor = self.view.parser.screen().application_cursor();
+                let bytes = key_bytes(key, latin, *modifiers, app_cursor).or_else(|| {
+                    text.as_ref()
+                        .filter(|t| t.chars().any(|c| !c.is_control()))
+                        .map(|t| t.as_bytes().to_vec())
+                })?;
+                Some(self.msg(ShellMsg::Input(bytes)).and_capture())
+            }
+            _ => None,
+        }
+    }
+
+    fn draw(
+        &self,
+        state: &TermState,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), theme::WELL);
+        let screen = self.view.parser.screen();
+        let (cols, rows) = self.view.size;
         let sel = self
+            .view
             .selection
             .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         let selected = |r: u16, c: u16| match sel {
             Some((s, e)) if s != e => (r, c) >= s && (r, c) <= e,
             _ => false,
         };
+        let text_at = |frame: &mut canvas::Frame, s: &str, x: f32, y: f32, color: Color| {
+            if s.trim().is_empty() {
+                return;
+            }
+            frame.fill_text(canvas::Text {
+                content: s.to_string(),
+                position: Point::new(x, y),
+                color,
+                size: theme::MONO_SIZE.into(),
+                line_height: iced::widget::text::LineHeight::Absolute(LINE_H.into()),
+                font: theme::MONO,
+                ..Default::default()
+            });
+        };
 
         for r in 0..rows {
-            let y = inner.top() + r as f32 * line_h;
-            let mut job = LayoutJob::default();
+            let y = PAD_Y + r as f32 * LINE_H;
+            // Runs of cells with the same colour share one text draw.
+            let mut run = String::new();
+            let mut run_x = PAD_X;
+            let mut run_color = theme::TEXT;
             let mut c = 0;
             while c < cols {
                 let Some(cell) = screen.cell(r, c) else { break };
@@ -371,10 +457,10 @@ impl ShellView {
                 if cell.inverse() {
                     std::mem::swap(&mut fg, &mut bg);
                     // Default colours have no swatch to swap: use the well and ink explicitly.
-                    if bg == Color32::TRANSPARENT {
+                    if bg == Color::TRANSPARENT {
                         bg = theme::TEXT;
                     }
-                    if fg == Color32::TRANSPARENT {
+                    if fg == Color::TRANSPARENT {
                         fg = theme::WELL;
                     }
                 }
@@ -383,88 +469,102 @@ impl ShellView {
                     fg = theme::ACCENT_TEXT;
                 }
                 if cell.dim() {
-                    fg = fg.gamma_multiply(0.6);
+                    fg = fg.scale_alpha(0.6);
                 }
-                let width = if cell.is_wide() { 2.0 } else { 1.0 };
-                if bg != Color32::TRANSPARENT {
-                    let x = inner.left() + c as f32 * char_w;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(x, y),
-                            egui::vec2(char_w * width, line_h),
-                        ),
-                        0.0,
-                        bg,
+                let wide = cell.is_wide();
+                let x = PAD_X + c as f32 * CHAR_W;
+                let w = if wide { 2.0 } else { 1.0 };
+                if bg != Color::TRANSPARENT {
+                    frame.fill_rectangle(Point::new(x, y), Size::new(CHAR_W * w, LINE_H), bg);
+                }
+                if cell.underline() {
+                    frame.fill_rectangle(
+                        Point::new(x, y + LINE_H - 2.0),
+                        Size::new(CHAR_W * w, 1.0),
+                        fg,
                     );
                 }
-                let text = if cell.has_contents() {
+                let content = if cell.has_contents() {
                     cell.contents()
                 } else {
                     " "
                 };
-                job.append(
-                    text,
-                    0.0,
-                    TextFormat {
-                        font_id: font.clone(),
-                        color: fg,
-                        italics: cell.italic(),
-                        underline: if cell.underline() {
-                            egui::Stroke::new(1.0, fg)
-                        } else {
-                            egui::Stroke::NONE
-                        },
-                        ..Default::default()
-                    },
-                );
-                c += if cell.is_wide() { 2 } else { 1 };
+                if fg != run_color || wide {
+                    text_at(&mut frame, &run, run_x, y, run_color);
+                    run.clear();
+                    run_x = x;
+                    run_color = fg;
+                }
+                run.push_str(content);
+                if wide {
+                    // Wide glyphs are drawn alone so the columns after them stay aligned.
+                    text_at(&mut frame, &run, run_x, y, run_color);
+                    run.clear();
+                    run_x = x + CHAR_W * 2.0;
+                }
+                c += if wide { 2 } else { 1 };
             }
-            job.wrap.max_width = f32::INFINITY;
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(egui::pos2(inner.left(), y), galley, theme::TEXT);
+            text_at(&mut frame, &run, run_x, y, run_color);
         }
 
         // Cursor: a block when focused, an outline otherwise; hidden while scrolled back.
         if !screen.hide_cursor()
             && screen.scrollback() == 0
-            && self.status != ShellStatus::Connecting
+            && self.view.status != ShellStatus::Connecting
         {
             let (r, c) = screen.cursor_position();
-            let cr = egui::Rect::from_min_size(
-                egui::pos2(
-                    inner.left() + c as f32 * char_w,
-                    inner.top() + r as f32 * line_h,
-                ),
-                egui::vec2(char_w, line_h),
-            );
-            if focused {
-                painter.rect_filled(cr, 1.0, theme::ACCENT.gamma_multiply(0.75));
+            let at = Point::new(PAD_X + c as f32 * CHAR_W, PAD_Y + r as f32 * LINE_H);
+            let size = Size::new(CHAR_W, LINE_H);
+            if state.focused {
+                frame.fill_rectangle(at, size, theme::ACCENT.scale_alpha(0.75));
             } else {
-                painter.rect_stroke(
-                    cr,
-                    1.0,
-                    egui::Stroke::new(1.0, theme::TEXT_MUTED),
-                    egui::StrokeKind::Inside,
+                frame.stroke_rectangle(
+                    at,
+                    size,
+                    canvas::Stroke::default()
+                        .with_width(1.0)
+                        .with_color(theme::TEXT_MUTED),
                 );
             }
         }
         if screen.scrollback() > 0 {
-            painter.text(
-                rect.right_top() + egui::vec2(-10.0, 8.0),
-                Align2::RIGHT_TOP,
-                format!("↑ {} lines back · type to return", screen.scrollback()),
-                egui::FontId::proportional(12.0),
-                theme::TEXT_FAINT,
-            );
+            frame.fill_text(canvas::Text {
+                content: format!("↑ {} lines back · type to return", screen.scrollback()),
+                position: Point::new(bounds.width - 10.0, 8.0),
+                color: theme::TEXT_FAINT,
+                size: 12.0.into(),
+                font: theme::INTER,
+                align_x: iced::widget::text::Alignment::Right,
+                ..Default::default()
+            });
+        }
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &TermState,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if cursor.is_over(bounds) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::default()
         }
     }
 }
 
-/// Bytes a key sends to the shell (xterm conventions). Plain characters arrive as text events.
-fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
-    use egui::Key::*;
+/// Bytes a key sends to the shell (xterm conventions). Plain characters come from the
+/// key's text instead.
+fn key_bytes(
+    key: &Key,
+    latin: Option<char>,
+    m: keyboard::Modifiers,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     let arrow = |c: u8| -> Vec<u8> {
-        if m.alt {
+        if m.alt() {
             // Alt+Left/Right: word movement in readline.
             match c {
                 b'D' => b"\x1bb".to_vec(),
@@ -478,64 +578,64 @@ fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec
         }
     };
     // Ctrl+letter → control code (Ctrl+C = 0x03 ...). On macOS, Cmd stays with the app.
-    if m.ctrl && !m.command_only() {
-        let name = key.name();
-        if name.len() == 1 {
-            let ch = name.as_bytes()[0].to_ascii_lowercase();
-            if ch.is_ascii_lowercase() {
-                return Some(vec![ch & 0x1f]);
+    if m.control() {
+        match latin {
+            Some(ch) if ch.is_ascii_alphabetic() => {
+                return Some(vec![ch.to_ascii_lowercase() as u8 & 0x1f]);
             }
-        }
-        match key {
-            OpenBracket => return Some(vec![0x1b]),
-            Backslash => return Some(vec![0x1c]),
-            CloseBracket => return Some(vec![0x1d]),
+            Some('[') => return Some(vec![0x1b]),
+            Some('\\') => return Some(vec![0x1c]),
+            Some(']') => return Some(vec![0x1d]),
             _ => {}
         }
     }
-    Some(match key {
-        Enter => b"\r".to_vec(),
-        Backspace if m.alt => b"\x1b\x7f".to_vec(),
-        Backspace => vec![0x7f],
-        Tab if m.shift => b"\x1b[Z".to_vec(),
-        Tab => b"\t".to_vec(),
-        Escape => vec![0x1b],
-        ArrowUp => arrow(b'A'),
-        ArrowDown => arrow(b'B'),
-        ArrowRight => arrow(b'C'),
-        ArrowLeft => arrow(b'D'),
-        Home => b"\x1b[H".to_vec(),
-        End => b"\x1b[F".to_vec(),
-        PageUp => b"\x1b[5~".to_vec(),
-        PageDown => b"\x1b[6~".to_vec(),
-        Delete => b"\x1b[3~".to_vec(),
-        Insert => b"\x1b[2~".to_vec(),
-        F1 => b"\x1bOP".to_vec(),
-        F2 => b"\x1bOQ".to_vec(),
-        F3 => b"\x1bOR".to_vec(),
-        F4 => b"\x1bOS".to_vec(),
+    let Key::Named(named) = key else {
+        return None;
+    };
+    Some(match named {
+        Named::Enter => b"\r".to_vec(),
+        Named::Backspace if m.alt() => b"\x1b\x7f".to_vec(),
+        Named::Backspace => vec![0x7f],
+        Named::Tab if m.shift() => b"\x1b[Z".to_vec(),
+        Named::Tab => b"\t".to_vec(),
+        Named::Escape => vec![0x1b],
+        Named::ArrowUp => arrow(b'A'),
+        Named::ArrowDown => arrow(b'B'),
+        Named::ArrowRight => arrow(b'C'),
+        Named::ArrowLeft => arrow(b'D'),
+        Named::Home => b"\x1b[H".to_vec(),
+        Named::End => b"\x1b[F".to_vec(),
+        Named::PageUp => b"\x1b[5~".to_vec(),
+        Named::PageDown => b"\x1b[6~".to_vec(),
+        Named::Delete => b"\x1b[3~".to_vec(),
+        Named::Insert => b"\x1b[2~".to_vec(),
+        Named::F1 => b"\x1bOP".to_vec(),
+        Named::F2 => b"\x1bOQ".to_vec(),
+        Named::F3 => b"\x1bOR".to_vec(),
+        Named::F4 => b"\x1bOS".to_vec(),
+        Named::Space => b" ".to_vec(),
         _ => return None,
     })
 }
 
 /// xterm colours mapped onto the app palette. Default background is transparent (the well).
-pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color32 {
-    const ANSI: [Color32; 16] = [
-        Color32::from_rgb(0x2e, 0x34, 0x41), // black
+pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color {
+    const ANSI: [Color; 16] = [
+        Color::from_rgb8(0x2e, 0x34, 0x41), // black
         theme::BAD,
         theme::OK,
         theme::WARN,
         theme::ACCENT,
-        Color32::from_rgb(0xc0, 0x8b, 0xf0), // magenta
-        Color32::from_rgb(0x5f, 0xc8, 0xd4), // cyan
-        theme::TEXT_MUTED,                   // white
-        theme::IDLE,                         // bright black
-        Color32::from_rgb(0xff, 0x7b, 0x7f),
-        Color32::from_rgb(0x6e, 0xe6, 0xaa),
-        Color32::from_rgb(0xff, 0xc5, 0x5c),
+        Color::from_rgb8(0xc0, 0x8b, 0xf0), // magenta
+        Color::from_rgb8(0x5f, 0xc8, 0xd4), // cyan
+        theme::TEXT_MUTED,                  // white
+        theme::IDLE,                        // bright black
+        Color::from_rgb8(0xff, 0x7b, 0x7f),
+        Color::from_rgb8(0x6e, 0xe6, 0xaa),
+        Color::from_rgb8(0xff, 0xc5, 0x5c),
         theme::ACCENT_HOVER,
-        Color32::from_rgb(0xd6, 0xb0, 0xff),
-        Color32::from_rgb(0x8a, 0xe3, 0xec),
+        Color::from_rgb8(0xd6, 0xb0, 0xff),
+        Color::from_rgb8(0x8a, 0xe3, 0xec),
         theme::TEXT,
     ];
     match c {
@@ -543,7 +643,7 @@ pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color32 {
             if fg {
                 theme::TEXT
             } else {
-                Color32::TRANSPARENT
+                Color::TRANSPARENT
             }
         }
         vt100::Color::Idx(i) if i < 16 => {
@@ -554,13 +654,13 @@ pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color32 {
         vt100::Color::Idx(i) if i < 232 => {
             let i = i - 16;
             let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-            Color32::from_rgb(level(i / 36), level((i / 6) % 6), level(i % 6))
+            Color::from_rgb8(level(i / 36), level((i / 6) % 6), level(i % 6))
         }
         vt100::Color::Idx(i) => {
             let v = 8 + (i - 232) * 10;
-            Color32::from_rgb(v, v, v)
+            Color::from_rgb8(v, v, v)
         }
-        vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+        vt100::Color::Rgb(r, g, b) => Color::from_rgb8(r, g, b),
     }
 }
 
@@ -570,33 +670,25 @@ mod tests {
 
     #[test]
     fn control_keys() {
-        let ctrl = egui::Modifiers {
-            ctrl: true,
-            ..Default::default()
-        };
-        assert_eq!(key_bytes(egui::Key::C, ctrl, false), Some(vec![3]));
-        assert_eq!(key_bytes(egui::Key::D, ctrl, false), Some(vec![4]));
-        assert_eq!(
-            key_bytes(egui::Key::Enter, egui::Modifiers::NONE, false),
-            Some(b"\r".to_vec())
-        );
-        assert_eq!(
-            key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, false),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, true),
-            Some(b"\x1bOA".to_vec())
-        );
-        // Plain letters come through text events, not key events.
-        assert_eq!(key_bytes(egui::Key::A, egui::Modifiers::NONE, false), None);
+        let ctrl = keyboard::Modifiers::CTRL;
+        let none = keyboard::Modifiers::empty();
+        let c = Key::Character("c".into());
+        assert_eq!(key_bytes(&c, Some('c'), ctrl, false), Some(vec![3]));
+        assert_eq!(key_bytes(&c, Some('d'), ctrl, false), Some(vec![4]));
+        let enter = Key::Named(Named::Enter);
+        assert_eq!(key_bytes(&enter, None, none, false), Some(b"\r".to_vec()));
+        let up = Key::Named(Named::ArrowUp);
+        assert_eq!(key_bytes(&up, None, none, false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_bytes(&up, None, none, true), Some(b"\x1bOA".to_vec()));
+        // Plain letters come through the key's text, not here.
+        assert_eq!(key_bytes(&c, Some('c'), none, false), None);
     }
 
     #[test]
     fn colours() {
         assert_eq!(
             term_color(vt100::Color::Default, false, false),
-            Color32::TRANSPARENT
+            Color::TRANSPARENT
         );
         assert_eq!(
             term_color(vt100::Color::Idx(1), true, true),
@@ -604,7 +696,7 @@ mod tests {
         );
         assert_eq!(
             term_color(vt100::Color::Rgb(1, 2, 3), true, false),
-            Color32::from_rgb(1, 2, 3)
+            Color::from_rgb8(1, 2, 3)
         );
     }
 }

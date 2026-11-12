@@ -6,9 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 dirs = "7.0.0"
-eframe = "0.33.3"
-egui-phosphor = "0.11"
-egui_extras = "0.33.3"
 futures = "0.3.34"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "logging"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
@@ -23,6 +20,7 @@ serde_yaml = "0.9.34"
 tokio = { version = "1.54.1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 vt100 = "0.18.1"
+iced = { version = "0.14.0", features = ["tokio", "advanced", "canvas", "image", "highlighter", "lazy", "svg", "selector"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.17", default-features = false }

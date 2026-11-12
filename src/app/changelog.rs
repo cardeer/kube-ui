@@ -1,9 +1,11 @@
 //! The "What's new" window: CHANGELOG.md compiled into the app and rendered by release.
 
-use eframe::egui::{self, Align2, RichText};
-use egui_phosphor::regular as icon;
+use iced::{
+    Color, Element, Length, Size,
+    widget::{column, container, row, scrollable, text},
+};
 
-use super::{theme, update};
+use super::{Message, icons as icon, theme, update};
 
 const SOURCE: &str = include_str!("../../CHANGELOG.md");
 
@@ -59,12 +61,12 @@ fn section_items<'a, 'b>(out: &'b mut [Release<'a>]) -> Option<&'b mut Vec<Strin
     out.last_mut()?.sections.last_mut().map(|(_, items)| items)
 }
 
-/// Drops Markdown markers that egui would print literally.
+/// Drops Markdown markers that would print literally.
 fn clean(s: &str) -> String {
     s.replace("**", "").replace('`', "")
 }
 
-fn section_color(heading: &str) -> egui::Color32 {
+fn section_color(heading: &str) -> Color {
     match heading {
         "Added" => theme::OK,
         "Fixed" => theme::ACCENT,
@@ -74,68 +76,79 @@ fn section_color(heading: &str) -> egui::Color32 {
     }
 }
 
-pub fn show(ctx: &egui::Context, open: &mut bool) {
-    if !*open {
-        return;
-    }
+pub fn view<'a>(window: Size) -> Element<'a, Message> {
     let releases = releases();
-    egui::Window::new("What's new")
-        .open(open)
-        .collapsible(false)
-        .resizable(true)
-        .default_size([560.0, 520.0])
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if releases.is_empty() {
-                        ui.weak("No release notes.");
-                    }
-                    for (i, r) in releases.iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(14.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                theme::semibold(format!("v{}", r.version))
-                                    .size(16.0)
-                                    .color(theme::TEXT),
-                            );
-                            if r.version == update::CURRENT {
-                                theme::badge(ui, "installed", theme::OK, false);
-                            }
-                            if let Some(d) = r.date {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(RichText::new(d).color(theme::TEXT_FAINT));
-                                    },
-                                );
-                            }
-                        });
-                        for (heading, items) in &r.sections {
-                            ui.add_space(6.0);
-                            if !heading.is_empty() {
-                                ui.label(
-                                    theme::label_small(*heading).color(section_color(heading)),
-                                );
-                                ui.add_space(2.0);
-                            }
-                            for item in items {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        RichText::new(icon::DOT_OUTLINE).color(theme::TEXT_FAINT),
-                                    );
-                                    ui.label(RichText::new(item).color(theme::TEXT));
-                                });
-                            }
-                        }
-                    }
-                });
-        });
+    let mut col = column![].spacing(4);
+    if releases.is_empty() {
+        col = col.push(theme::faint("No release notes."));
+    }
+    for (i, r) in releases.iter().enumerate() {
+        if i > 0 {
+            col = col.push(theme::vspace(10.0));
+            col = col.push(theme::hline());
+            col = col.push(theme::vspace(8.0));
+        }
+        let mut head = row![
+            text(format!("v{}", r.version))
+                .size(16.0)
+                .font(theme::SEMIBOLD)
+                .color(theme::TEXT)
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+        if r.version == update::CURRENT {
+            head = head.push(theme::badge("installed", theme::OK, false));
+        }
+        if let Some(d) = r.date {
+            head = head.push(theme::fill_space());
+            head = head.push(theme::faint(d));
+        }
+        col = col.push(head);
+        for (heading, items) in &r.sections {
+            col = col.push(theme::vspace(4.0));
+            if !heading.is_empty() {
+                col = col.push(theme::label_small(*heading).color(section_color(heading)));
+            }
+            for item in items {
+                col = col.push(
+                    row![
+                        text(icon::DOT_OUTLINE)
+                            .font(theme::ICONS)
+                            .size(14.0)
+                            .color(theme::TEXT_FAINT),
+                        theme::txt(item.clone()).width(Length::Fill),
+                    ]
+                    .spacing(6),
+                );
+            }
+        }
+    }
+    let width = (window.width - 120.0).clamp(420.0, 600.0);
+    let height = (window.height - 120.0).clamp(300.0, 620.0);
+    container(column![
+        row![
+            text("What's new")
+                .size(15.0)
+                .font(theme::SEMIBOLD)
+                .color(theme::TEXT),
+            theme::fill_space(),
+            theme::icon_button(icon::X, "Close", Some(Message::ShowChangelog(false))),
+        ]
+        .align_y(iced::Center),
+        theme::vspace(8.0),
+        scrollable(container(col).padding(iced::Padding {
+            right: 12.0,
+            ..Default::default()
+        }))
+        .direction(theme::thin())
+        .style(theme::scrollbar)
+        .height(Length::Fill),
+    ])
+    .padding(16)
+    .width(width)
+    .height(height)
+    .style(theme::dialog)
+    .into()
 }
 
 #[cfg(test)]
