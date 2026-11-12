@@ -5,6 +5,17 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-12
+
+### Changed
+- More breathing room in the detail drawer: wider gaps between sections, details rows,
+  conditions and label chips, so they're easier to read.
+- Table rows are taller, with more padding inside each cell.
+
+### Added
+- Copying something (a label, an image, logs, the terminal screen) shows a short
+  "Copied" notification.
+
 ## [1.0.0] - 2026-11-12
 
 ### Changed
