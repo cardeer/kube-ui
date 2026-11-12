@@ -72,11 +72,20 @@ pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
     ctx.style_mut(|style| {
         style.text_styles = [
-            (TextStyle::Small, FontId::new(11.5, FontFamily::Proportional)),
+            (
+                TextStyle::Small,
+                FontId::new(11.5, FontFamily::Proportional),
+            ),
             (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(13.5, FontFamily::Proportional),
+            ),
             (TextStyle::Heading, FontId::new(18.0, semibold_family())),
-            (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+            (
+                TextStyle::Monospace,
+                FontId::new(12.5, FontFamily::Monospace),
+            ),
         ]
         .into();
 
@@ -103,17 +112,30 @@ pub fn install(ctx: &egui::Context) {
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let mut add = |name: &str, bytes: &'static [u8]| {
-        fonts.font_data.insert(name.into(), Arc::new(FontData::from_static(bytes)));
+        fonts
+            .font_data
+            .insert(name.into(), Arc::new(FontData::from_static(bytes)));
     };
-    add("inter", include_bytes!("../../assets/fonts/Inter-Regular.ttf"));
-    add("inter-semibold", include_bytes!("../../assets/fonts/Inter-SemiBold.ttf"));
-    add("jetbrains-mono", include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"));
+    add(
+        "inter",
+        include_bytes!("../../assets/fonts/Inter-Regular.ttf"),
+    );
+    add(
+        "inter-semibold",
+        include_bytes!("../../assets/fonts/Inter-SemiBold.ttf"),
+    );
+    add(
+        "jetbrains-mono",
+        include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"),
+    );
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
     // egui's bundled fonts stay as fallbacks for glyphs ours lack.
     let defaults = |family: FontFamily| fonts.families.get(&family).cloned().unwrap_or_default();
-    let proportional_fallback: Vec<String> =
-        defaults(FontFamily::Proportional).into_iter().filter(|f| f != "phosphor").collect();
+    let proportional_fallback: Vec<String> = defaults(FontFamily::Proportional)
+        .into_iter()
+        .filter(|f| f != "phosphor")
+        .collect();
     let mono_fallback = defaults(FontFamily::Monospace);
 
     // The embedded text fonts were subset to drop their private-use glyphs (Inter ships
@@ -123,9 +145,18 @@ fn install_fonts(ctx: &egui::Context) {
         v.extend(rest.iter().cloned());
         v
     };
-    fonts.families.insert(FontFamily::Proportional, chain("inter", &proportional_fallback));
-    fonts.families.insert(semibold_family(), chain("inter-semibold", &proportional_fallback));
-    fonts.families.insert(FontFamily::Monospace, chain("jetbrains-mono", &mono_fallback));
+    fonts.families.insert(
+        FontFamily::Proportional,
+        chain("inter", &proportional_fallback),
+    );
+    fonts.families.insert(
+        semibold_family(),
+        chain("inter-semibold", &proportional_fallback),
+    );
+    fonts.families.insert(
+        FontFamily::Monospace,
+        chain("jetbrains-mono", &mono_fallback),
+    );
     ctx.set_fonts(fonts);
 }
 
@@ -140,8 +171,18 @@ fn visuals() -> egui::Visuals {
     v.window_fill = RAISED;
     v.window_stroke = hairline(BORDER_STRONG);
     v.window_corner_radius = CornerRadius::same(10);
-    v.window_shadow = Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(130) };
-    v.popup_shadow = Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(120) };
+    v.window_shadow = Shadow {
+        offset: [0, 10],
+        blur: 28,
+        spread: 0,
+        color: Color32::from_black_alpha(130),
+    };
+    v.popup_shadow = Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
     v.menu_corner_radius = CornerRadius::same(8);
     v.window_highlight_topmost = false;
 
@@ -207,19 +248,30 @@ fn visuals() -> egui::Visuals {
 // ---------------------------------------------------------------------------
 
 pub fn chrome_frame() -> egui::Frame {
-    egui::Frame::new().fill(CHROME).inner_margin(Margin::symmetric(14, 0))
+    egui::Frame::new()
+        .fill(CHROME)
+        .inner_margin(Margin::symmetric(14, 0))
 }
 
 pub fn content_frame() -> egui::Frame {
-    egui::Frame::new().fill(CONTENT).inner_margin(Margin { left: 20, right: 20, top: 16, bottom: 8 })
+    egui::Frame::new().fill(CONTENT).inner_margin(Margin {
+        left: 20,
+        right: 20,
+        top: 16,
+        bottom: 8,
+    })
 }
 
 pub fn raised_frame() -> egui::Frame {
-    egui::Frame::new().fill(RAISED).inner_margin(Margin::symmetric(18, 14))
+    egui::Frame::new()
+        .fill(RAISED)
+        .inner_margin(Margin::symmetric(18, 14))
 }
 
 pub fn well_frame() -> egui::Frame {
-    egui::Frame::new().fill(WELL).inner_margin(Margin::symmetric(14, 8))
+    egui::Frame::new()
+        .fill(WELL)
+        .inner_margin(Margin::symmetric(14, 8))
 }
 
 /// Floating card (toasts): raised fill, hairline border, soft offset shadow.
@@ -229,7 +281,12 @@ pub fn card_frame() -> egui::Frame {
         .stroke(Stroke::new(1.0, BORDER_STRONG))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(14, 10))
-        .shadow(Shadow { offset: [0, 8], blur: 22, spread: 0, color: Color32::from_black_alpha(140) })
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 22,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +298,18 @@ pub fn semibold(text: impl Into<String>) -> RichText {
 }
 
 pub fn title(text: impl Into<String>) -> RichText {
-    RichText::new(text).family(semibold_family()).size(19.0).color(TEXT)
+    RichText::new(text)
+        .family(semibold_family())
+        .size(19.0)
+        .color(TEXT)
 }
 
 /// Small semibold muted label for table headers and panel sections.
 pub fn label_small(text: impl Into<String>) -> RichText {
-    RichText::new(text).family(semibold_family()).size(12.0).color(TEXT_MUTED)
+    RichText::new(text)
+        .family(semibold_family())
+        .size(12.0)
+        .color(TEXT_MUTED)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,15 +318,23 @@ pub fn label_small(text: impl Into<String>) -> RichText {
 
 /// The one filled, accent-coloured action in a group.
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).family(semibold_family()).color(Color32::WHITE))
-        .fill(ACCENT)
-        .stroke(Stroke::new(1.0, ACCENT_HOVER))
+    egui::Button::new(
+        RichText::new(text)
+            .family(semibold_family())
+            .color(Color32::WHITE),
+    )
+    .fill(ACCENT)
+    .stroke(Stroke::new(1.0, ACCENT_HOVER))
 }
 
 pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).family(semibold_family()).color(Color32::WHITE))
-        .fill(Color32::from_rgb(0xc9, 0x3a, 0x40))
-        .stroke(Stroke::new(1.0, BAD))
+    egui::Button::new(
+        RichText::new(text)
+            .family(semibold_family())
+            .color(Color32::WHITE),
+    )
+    .fill(Color32::from_rgb(0xc9, 0x3a, 0x40))
+    .stroke(Stroke::new(1.0, BAD))
 }
 
 /// Frameless icon button that only shows a fill on hover.
@@ -276,7 +347,13 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> Response {
             p.rect_filled(rect, CornerRadius::same(RADIUS_SMALL), FIELD_HOVER);
         }
         let color = if resp.hovered() { TEXT } else { TEXT_MUTED };
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(14.0),
+            color,
+        );
     }
     resp.on_hover_text(hint)
 }
@@ -289,12 +366,29 @@ pub fn icon_toggle(ui: &mut egui::Ui, glyph: &str, on: bool, hint: &str) -> Resp
         let radius = CornerRadius::same(RADIUS_SMALL);
         if on {
             p.rect_filled(rect, radius, ACCENT_BG);
-            p.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+            p.rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Inside,
+            );
         } else if resp.hovered() {
             p.rect_filled(rect, radius, FIELD_HOVER);
         }
-        let color = if on { ACCENT_TEXT } else if resp.hovered() { TEXT } else { TEXT_MUTED };
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, FontId::proportional(14.0), color);
+        let color = if on {
+            ACCENT_TEXT
+        } else if resp.hovered() {
+            TEXT
+        } else {
+            TEXT_MUTED
+        };
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(14.0),
+            color,
+        );
     }
     resp.on_hover_text(hint)
 }
@@ -302,7 +396,9 @@ pub fn icon_toggle(ui: &mut egui::Ui, glyph: &str, on: bool, hint: &str) -> Resp
 /// Small on/off text toggle (e.g. `.*` for regex), sized to sit beside an icon button.
 pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Response {
     let font = FontId::monospace(13.0);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), TEXT);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), TEXT);
     let size = Vec2::new((galley.size().x + 12.0).max(24.0), 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
@@ -310,12 +406,29 @@ pub fn toggle_button(ui: &mut egui::Ui, text: &str, on: bool, hint: &str) -> Res
         let radius = CornerRadius::same(RADIUS_SMALL);
         if on {
             p.rect_filled(rect, radius, ACCENT_BG);
-            p.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+            p.rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Inside,
+            );
         } else if resp.hovered() {
             p.rect_filled(rect, radius, FIELD_HOVER);
         }
-        let color = if on { ACCENT_TEXT } else if resp.hovered() { TEXT } else { TEXT_MUTED };
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, color);
+        let color = if on {
+            ACCENT_TEXT
+        } else if resp.hovered() {
+            TEXT
+        } else {
+            TEXT_MUTED
+        };
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            color,
+        );
     }
     resp.on_hover_text(hint)
 }
@@ -327,27 +440,51 @@ pub fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: usize, hint: &str
     let bold = FontId::new(12.5, semibold_family());
     let widths: Vec<f32> = labels
         .iter()
-        .map(|l| ui.painter().layout_no_wrap(l.to_string(), bold.clone(), TEXT).size().x + 18.0)
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.to_string(), bold.clone(), TEXT)
+                .size()
+                .x
+                + 18.0
+        })
         .collect();
     let size = Vec2::new(widths.iter().sum::<f32>() + 4.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let mut clicked = None;
     let radius = CornerRadius::same(RADIUS_SMALL);
     ui.painter().rect_filled(rect, radius, CHROME);
-    ui.painter().rect_stroke(rect, radius, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Inside,
+    );
     let mut x = rect.left() + 2.0;
     for (i, (label, w)) in labels.iter().zip(&widths).enumerate() {
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), Vec2::new(*w, size.y - 4.0));
+        let seg =
+            egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), Vec2::new(*w, size.y - 4.0));
         x += w;
         let r = ui.interact(seg, resp.id.with(i), Sense::click());
         let on = i == selected;
         let p = ui.painter();
         if on {
-            p.rect_filled(seg, CornerRadius::same(RADIUS_SMALL.saturating_sub(1)), FIELD_ACTIVE);
+            p.rect_filled(
+                seg,
+                CornerRadius::same(RADIUS_SMALL.saturating_sub(1)),
+                FIELD_ACTIVE,
+            );
         } else if r.hovered() {
-            p.rect_filled(seg, CornerRadius::same(RADIUS_SMALL.saturating_sub(1)), FIELD_HOVER);
+            p.rect_filled(
+                seg,
+                CornerRadius::same(RADIUS_SMALL.saturating_sub(1)),
+                FIELD_HOVER,
+            );
         }
-        let (f, color) = if on { (bold.clone(), TEXT) } else { (font.clone(), if r.hovered() { TEXT } else { TEXT_MUTED }) };
+        let (f, color) = if on {
+            (bold.clone(), TEXT)
+        } else {
+            (font.clone(), if r.hovered() { TEXT } else { TEXT_MUTED })
+        };
         p.text(seg.center(), egui::Align2::CENTER_CENTER, *label, f, color);
         if r.on_hover_text(hint).clicked() && !on {
             clicked = Some(i);
@@ -357,7 +494,13 @@ pub fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: usize, hint: &str
 }
 
 /// Left navigation entry: icon, label, optional count; accent-tinted when selected.
-pub fn nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, count: Option<usize>, selected: bool) -> Response {
+pub fn nav_item(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    label: &str,
+    count: Option<usize>,
+    selected: bool,
+) -> Response {
     nav_item_badge(ui, glyph, label, plain_count(count), selected)
 }
 
@@ -387,9 +530,16 @@ fn paint_nav_badge(p: &egui::Painter, rect: egui::Rect, badge: &NavBadge, select
 }
 
 /// [`nav_item`] with a custom count (see [`NavBadge`]).
-pub fn nav_item_badge(ui: &mut egui::Ui, glyph: &str, label: &str, badge: NavBadge, selected: bool) -> Response {
+pub fn nav_item_badge(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    label: &str,
+    badge: NavBadge,
+    selected: bool,
+) -> Response {
     let height = 32.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let fill = if selected {
@@ -408,13 +558,25 @@ pub fn nav_item_badge(ui: &mut egui::Ui, glyph: &str, label: &str, badge: NavBad
             (TEXT_MUTED, TEXT_MUTED)
         };
         let y = rect.center().y;
-        p.text(egui::pos2(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, glyph, FontId::proportional(16.0), icon_color);
+        p.text(
+            egui::pos2(rect.left() + 12.0, y),
+            egui::Align2::LEFT_CENTER,
+            glyph,
+            FontId::proportional(16.0),
+            icon_color,
+        );
         let font = if selected {
             FontId::new(13.5, semibold_family())
         } else {
             FontId::proportional(13.5)
         };
-        p.text(egui::pos2(rect.left() + 38.0, y), egui::Align2::LEFT_CENTER, label, font, text_color);
+        p.text(
+            egui::pos2(rect.left() + 38.0, y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font,
+            text_color,
+        );
         paint_nav_badge(p, rect, &badge, selected);
     }
     resp
@@ -422,9 +584,16 @@ pub fn nav_item_badge(ui: &mut egui::Ui, glyph: &str, label: &str, badge: NavBad
 
 /// Collapsible sidebar group header: caret, glyph, label. `marked` highlights the
 /// header when it's closed over the current page.
-pub fn nav_group(ui: &mut egui::Ui, glyph: &str, label: &str, open: bool, marked: bool) -> Response {
+pub fn nav_group(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    label: &str,
+    open: bool,
+    marked: bool,
+) -> Response {
     let height = 32.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let fill = if marked {
@@ -443,9 +612,25 @@ pub fn nav_group(ui: &mut egui::Ui, glyph: &str, label: &str, open: bool, marked
             TEXT_MUTED
         };
         let y = rect.center().y;
-        let caret = if open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
-        p.text(egui::pos2(rect.left() + 6.0, y), egui::Align2::LEFT_CENTER, caret, FontId::proportional(12.0), TEXT_FAINT);
-        p.text(egui::pos2(rect.left() + 22.0, y), egui::Align2::LEFT_CENTER, glyph, FontId::proportional(16.0), color);
+        let caret = if open {
+            egui_phosphor::regular::CARET_DOWN
+        } else {
+            egui_phosphor::regular::CARET_RIGHT
+        };
+        p.text(
+            egui::pos2(rect.left() + 6.0, y),
+            egui::Align2::LEFT_CENTER,
+            caret,
+            FontId::proportional(12.0),
+            TEXT_FAINT,
+        );
+        p.text(
+            egui::pos2(rect.left() + 22.0, y),
+            egui::Align2::LEFT_CENTER,
+            glyph,
+            FontId::proportional(16.0),
+            color,
+        );
         p.text(
             egui::pos2(rect.left() + 46.0, y),
             egui::Align2::LEFT_CENTER,
@@ -458,15 +643,24 @@ pub fn nav_group(ui: &mut egui::Ui, glyph: &str, label: &str, open: bool, marked
 }
 
 /// A page inside a sidebar group: text only, hung off a hairline guide under the group glyph.
-pub fn nav_child_badge(ui: &mut egui::Ui, label: &str, badge: NavBadge, selected: bool) -> Response {
+pub fn nav_child_badge(
+    ui: &mut egui::Ui,
+    label: &str,
+    badge: NavBadge,
+    selected: bool,
+) -> Response {
     let height = 30.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         // Guide spans the 2px gap above so consecutive children read as one line.
         let guide_x = rect.left() + 30.0;
         p.line_segment(
-            [egui::pos2(guide_x, rect.top() - 2.0), egui::pos2(guide_x, rect.bottom())],
+            [
+                egui::pos2(guide_x, rect.top() - 2.0),
+                egui::pos2(guide_x, rect.bottom()),
+            ],
             egui::Stroke::new(1.0, BORDER_STRONG),
         );
         let item = egui::Rect::from_min_max(egui::pos2(rect.left() + 36.0, rect.top()), rect.max);
@@ -481,7 +675,10 @@ pub fn nav_child_badge(ui: &mut egui::Ui, label: &str, badge: NavBadge, selected
         if selected {
             // The guide lights up beside the current page.
             p.line_segment(
-                [egui::pos2(guide_x, rect.top() + 6.0), egui::pos2(guide_x, rect.bottom() - 6.0)],
+                [
+                    egui::pos2(guide_x, rect.top() + 6.0),
+                    egui::pos2(guide_x, rect.bottom() - 6.0),
+                ],
                 egui::Stroke::new(2.0, ACCENT),
             );
         }
@@ -498,7 +695,13 @@ pub fn nav_child_badge(ui: &mut egui::Ui, label: &str, badge: NavBadge, selected
             FontId::proportional(13.5)
         };
         let y = rect.center().y;
-        p.text(egui::pos2(item.left() + 10.0, y), egui::Align2::LEFT_CENTER, label, font, text_color);
+        p.text(
+            egui::pos2(item.left() + 10.0, y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font,
+            text_color,
+        );
         paint_nav_badge(p, rect, &badge, selected);
     }
     resp
@@ -517,11 +720,18 @@ pub fn underline_tabs(ui: &mut egui::Ui, labels: &[String], selected: usize) -> 
                 RichText::new(label).color(TEXT_MUTED)
             };
             let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
-            let resp = if resp.hovered() && !active { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+            let resp = if resp.hovered() && !active {
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            } else {
+                resp
+            };
             if active {
                 let r = resp.rect;
                 ui.painter().line_segment(
-                    [egui::pos2(r.left(), r.bottom() + 7.0), egui::pos2(r.right(), r.bottom() + 7.0)],
+                    [
+                        egui::pos2(r.left(), r.bottom() + 7.0),
+                        egui::pos2(r.right(), r.bottom() + 7.0),
+                    ],
                     Stroke::new(2.0, ACCENT),
                 );
             }
@@ -533,7 +743,10 @@ pub fn underline_tabs(ui: &mut egui::Ui, labels: &[String], selected: usize) -> 
     ui.add_space(6.0);
     let rect = ui.max_rect();
     let y = ui.cursor().top();
-    ui.painter().line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], Stroke::new(1.0, BORDER));
+    ui.painter().line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        Stroke::new(1.0, BORDER),
+    );
     ui.add_space(10.0);
     clicked
 }
@@ -548,9 +761,15 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) -> Res
     let size = galley.size() + Vec2::new(12.0, 4.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
-        let fill = if filled { color } else { color.gamma_multiply(0.16) };
-        ui.painter().rect_filled(rect, CornerRadius::same(RADIUS_SMALL), fill);
-        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+        let fill = if filled {
+            color
+        } else {
+            color.gamma_multiply(0.16)
+        };
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(RADIUS_SMALL), fill);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, color);
     }
     resp
 }
@@ -559,7 +778,9 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32, filled: bool) -> Res
 pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> Response {
     ui.add(
         egui::TextEdit::singleline(text)
-            .hint_text(RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS)).color(TEXT_FAINT))
+            .hint_text(
+                RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS)).color(TEXT_FAINT),
+            )
             .desired_width(width)
             .margin(Margin::symmetric(8, 5)),
     )
@@ -567,18 +788,33 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
 
 /// Dropdown caret for every combo box (replaces egui's filled triangle).
 pub fn caret(ui: &egui::Ui, rect: egui::Rect, _visuals: &egui::style::WidgetVisuals, open: bool) {
-    let glyph = if open { icon::CARET_UP } else { icon::CARET_DOWN };
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, FontId::proportional(13.0), TEXT_MUTED);
+    let glyph = if open {
+        icon::CARET_UP
+    } else {
+        icon::CARET_DOWN
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(13.0),
+        TEXT_MUTED,
+    );
 }
 
 /// Checkbox drawn in the app's vocabulary: a 15px square, accent-filled with a check when on.
 pub fn checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> Response {
     let font = FontId::proportional(13.5);
     let text_color = if *value { TEXT } else { TEXT_MUTED };
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, text_color);
     let box_size = 15.0;
     let gap = if label.is_empty() { 0.0 } else { 7.0 };
-    let size = Vec2::new(box_size + gap + galley.size().x, box_size.max(galley.size().y).max(22.0));
+    let size = Vec2::new(
+        box_size + gap + galley.size().x,
+        box_size.max(galley.size().y).max(22.0),
+    );
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *value = !*value;
@@ -586,26 +822,59 @@ pub fn checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> Response {
     }
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let b = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - box_size / 2.0), Vec2::splat(box_size));
+        let b = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - box_size / 2.0),
+            Vec2::splat(box_size),
+        );
         if *value {
-            p.rect_filled(b, CornerRadius::same(3), if resp.hovered() { ACCENT_HOVER } else { ACCENT });
-            p.text(b.center(), egui::Align2::CENTER_CENTER, icon::CHECK, FontId::proportional(11.5), Color32::WHITE);
+            p.rect_filled(
+                b,
+                CornerRadius::same(3),
+                if resp.hovered() { ACCENT_HOVER } else { ACCENT },
+            );
+            p.text(
+                b.center(),
+                egui::Align2::CENTER_CENTER,
+                icon::CHECK,
+                FontId::proportional(11.5),
+                Color32::WHITE,
+            );
         } else {
-            p.rect_filled(b, CornerRadius::same(3), if resp.hovered() { FIELD_HOVER } else { FIELD });
+            p.rect_filled(
+                b,
+                CornerRadius::same(3),
+                if resp.hovered() { FIELD_HOVER } else { FIELD },
+            );
             p.rect_stroke(
                 b,
                 CornerRadius::same(3),
-                Stroke::new(1.0, if resp.hovered() { BORDER_STRONG } else { BORDER_STRONG.gamma_multiply(0.85) }),
+                Stroke::new(
+                    1.0,
+                    if resp.hovered() {
+                        BORDER_STRONG
+                    } else {
+                        BORDER_STRONG.gamma_multiply(0.85)
+                    },
+                ),
                 egui::StrokeKind::Inside,
             );
         }
-        p.galley(egui::pos2(b.right() + gap, rect.center().y - galley.size().y / 2.0), galley, text_color);
+        p.galley(
+            egui::pos2(b.right() + gap, rect.center().y - galley.size().y / 2.0),
+            galley,
+            text_color,
+        );
     }
     resp
 }
 
 /// Frameless icon button that opens a menu.
-pub fn icon_menu(ui: &mut egui::Ui, glyph: &str, hint: &str, add_contents: impl FnOnce(&mut egui::Ui)) -> Response {
+pub fn icon_menu(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    hint: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> Response {
     let resp = icon_button(ui, glyph, hint);
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(180.0);

@@ -116,7 +116,10 @@ impl Workspace {
 
     /// Short label for the cluster tab strip.
     pub(super) fn title(&self) -> String {
-        let context = self.context.clone().unwrap_or_else(|| file_label(&self.kubeconfig_path));
+        let context = self
+            .context
+            .clone()
+            .unwrap_or_else(|| file_label(&self.kubeconfig_path));
         match &self.conn {
             Conn::Ready(_) => format!("{context} · {}", namespaces_label(&self.selected_ns, true)),
             _ => context,
@@ -141,7 +144,11 @@ impl Workspace {
                 .filter(|(_, v)| !v.is_empty())
                 .map(|(t, v)| (t.key().to_string(), v.clone()))
                 .collect(),
-            sorts: self.sorts.iter().map(|(t, s)| (t.key().to_string(), s.saved())).collect(),
+            sorts: self
+                .sorts
+                .iter()
+                .map(|(t, s)| (t.key().to_string(), s.saved()))
+                .collect(),
             filter_regex: self.filter_regex,
         }
     }
@@ -150,7 +157,12 @@ impl Workspace {
     // Environment switching
     // -----------------------------------------------------------------------
 
-    pub(super) fn load_kubeconfig(&mut self, path: PathBuf, context: Option<String>, settings: &mut Settings) {
+    pub(super) fn load_kubeconfig(
+        &mut self,
+        path: PathBuf,
+        context: Option<String>,
+        settings: &mut Settings,
+    ) {
         self.kubeconfig_path = path.clone();
         match kube_ops::read_kubeconfig(&path) {
             Ok(info) => {
@@ -161,7 +173,13 @@ impl Workspace {
                 let key = path.to_string_lossy().to_string();
                 let context = context
                     .filter(|c| info.contexts.contains(c))
-                    .or_else(|| settings.last_context.get(&key).filter(|c| info.contexts.contains(c)).cloned())
+                    .or_else(|| {
+                        settings
+                            .last_context
+                            .get(&key)
+                            .filter(|c| info.contexts.contains(c))
+                            .cloned()
+                    })
                     .or_else(|| info.current.clone().filter(|c| info.contexts.contains(c)))
                     .or_else(|| info.contexts.first().cloned());
                 self.kubeconfig = Some(info);
@@ -180,9 +198,10 @@ impl Workspace {
     }
 
     pub(super) fn switch_context(&mut self, context: String, settings: &mut Settings) {
-        settings
-            .last_context
-            .insert(self.kubeconfig_path.to_string_lossy().to_string(), context.clone());
+        settings.last_context.insert(
+            self.kubeconfig_path.to_string_lossy().to_string(),
+            context.clone(),
+        );
         settings.save();
 
         self.generation += 1;
@@ -191,17 +210,28 @@ impl Workspace {
         self.namespaces.clear();
         self.clear_lists();
 
-        let (ws, generation, path, bus) = (self.id, self.generation, self.kubeconfig_path.clone(), self.bus.clone());
+        let (ws, generation, path, bus) = (
+            self.id,
+            self.generation,
+            self.kubeconfig_path.clone(),
+            self.bus.clone(),
+        );
         self.rt.spawn(async move {
             let result = async {
                 let (clients, default_ns) = kube_ops::connect(&path, &context).await?;
                 // Listing namespaces may be forbidden; fall back to the context default.
-                let namespaces = kube_ops::list_namespaces(&clients.main).await.unwrap_or_default();
+                let namespaces = kube_ops::list_namespaces(&clients.main)
+                    .await
+                    .unwrap_or_default();
                 Ok((clients, default_ns, namespaces))
             }
             .await
             .map_err(err_string);
-            bus.send(Msg::Connected { ws, generation, result });
+            bus.send(Msg::Connected {
+                ws,
+                generation,
+                result,
+            });
         });
     }
 
@@ -213,7 +243,9 @@ impl Workspace {
             return;
         }
         if let Some(context) = &self.context {
-            settings.last_namespace.insert(context.clone(), namespaces.join(","));
+            settings
+                .last_namespace
+                .insert(context.clone(), namespaces.join(","));
             settings.save();
         }
         self.generation += 1;
@@ -236,7 +268,9 @@ impl Workspace {
 
     pub(super) fn handle(&mut self, msg: Msg, settings: &Settings) {
         match msg {
-            Msg::Connected { generation, result, .. } => {
+            Msg::Connected {
+                generation, result, ..
+            } => {
                 if generation != self.generation {
                     return;
                 }
@@ -247,10 +281,21 @@ impl Workspace {
                         }
                         self.namespaces = namespaces;
                         self.conn = Conn::Ready(clients);
-                        let saved = self.context.as_ref().and_then(|c| settings.last_namespace.get(c)).map(|s| {
-                            s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect::<Vec<_>>()
-                        });
-                        let mut selection = self.restore_ns.take().or(saved).unwrap_or_else(|| vec![default_ns]);
+                        let saved = self
+                            .context
+                            .as_ref()
+                            .and_then(|c| settings.last_namespace.get(c))
+                            .map(|s| {
+                                s.split(',')
+                                    .filter(|n| !n.is_empty())
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            });
+                        let mut selection = self
+                            .restore_ns
+                            .take()
+                            .or(saved)
+                            .unwrap_or_else(|| vec![default_ns]);
                         selection.sort();
                         self.selected_ns = selection;
                         self.refresh();
@@ -258,11 +303,21 @@ impl Workspace {
                     Err(e) => self.conn = Conn::Failed(e),
                 }
             }
-            Msg::Listed { generation, kind, result, warning, .. } => {
+            Msg::Listed {
+                generation,
+                kind,
+                result,
+                warning,
+                ..
+            } => {
                 if generation != self.generation {
                     return;
                 }
-                fn apply<T>(state: &mut ListState<T>, result: Result<Vec<T>, String>, warning: Option<String>) {
+                fn apply<T>(
+                    state: &mut ListState<T>,
+                    result: Result<Vec<T>, String>,
+                    warning: Option<String>,
+                ) {
                     state.loading = false;
                     state.loaded = true;
                     match result {
@@ -276,7 +331,9 @@ impl Workspace {
                 match (kind, result) {
                     (_, Ok(ListData::Pods(v))) => apply(&mut self.pods, Ok(v), warning),
                     (_, Ok(ListData::Services(v))) => apply(&mut self.services, Ok(v), warning),
-                    (_, Ok(ListData::Deployments(v))) => apply(&mut self.deployments, Ok(v), warning),
+                    (_, Ok(ListData::Deployments(v))) => {
+                        apply(&mut self.deployments, Ok(v), warning)
+                    }
                     (Kind::Pod, Err(e)) => apply(&mut self.pods, Err(e), warning),
                     (Kind::Service, Err(e)) => apply(&mut self.services, Err(e), warning),
                     (Kind::Deployment, Err(e)) => apply(&mut self.deployments, Err(e), warning),
@@ -326,7 +383,11 @@ impl Workspace {
         }
         self.close_drawer();
         self.drawer_tab = DrawerTab::Overview;
-        self.selected = Some(Selected { kind: Kind::Pod, namespace, name });
+        self.selected = Some(Selected {
+            kind: Kind::Pod,
+            namespace,
+            name,
+        });
         self.refresh();
     }
 
@@ -338,7 +399,9 @@ impl Workspace {
         }
         let (ws, bus) = (self.id, self.bus.clone());
         self.rt.spawn(async move {
-            let result = details::read_secret(client, ns, name).await.map_err(err_string);
+            let result = details::read_secret(client, ns, name)
+                .await
+                .map_err(err_string);
             bus.send(Msg::Secret { ws, key, result });
         });
     }
@@ -416,7 +479,10 @@ impl Workspace {
             handles.push(self.spawn_list(client.clone(), kind).abort_handle());
         }
         if self.live {
-            self.watch = Some(WatchTask { key: (self.generation, self.tab), handles });
+            self.watch = Some(WatchTask {
+                key: (self.generation, self.tab),
+                handles,
+            });
         }
     }
 
@@ -444,33 +510,59 @@ impl Workspace {
 
     /// Starts loading one list: a watch that runs until aborted when live, else a single list.
     fn spawn_list(&self, client: Client, kind: Kind) -> tokio::task::JoinHandle<()> {
-        let (ws, generation, namespaces, bus, live) =
-            (self.id, self.generation, self.selected_ns.clone(), self.bus.clone(), self.live);
+        let (ws, generation, namespaces, bus, live) = (
+            self.id,
+            self.generation,
+            self.selected_ns.clone(),
+            self.bus.clone(),
+            self.live,
+        );
         let send = move |result: Result<ListData, String>, warning: Option<String>| {
-            bus.send(Msg::Listed { ws, generation, kind, result, warning })
+            bus.send(Msg::Listed {
+                ws,
+                generation,
+                kind,
+                result,
+                warning,
+            })
         };
         self.rt.spawn(async move {
             if live {
                 match kind {
                     Kind::Pod => {
-                        kube_ops::watch_rows(client, namespaces, kube_ops::pod_row, move |rows, errors| {
-                            let (r, w) = snapshot(rows, errors);
-                            send(r.map(ListData::Pods), w)
-                        })
+                        kube_ops::watch_rows(
+                            client,
+                            namespaces,
+                            kube_ops::pod_row,
+                            move |rows, errors| {
+                                let (r, w) = snapshot(rows, errors);
+                                send(r.map(ListData::Pods), w)
+                            },
+                        )
                         .await
                     }
                     Kind::Service => {
-                        kube_ops::watch_rows(client, namespaces, kube_ops::svc_row, move |rows, errors| {
-                            let (r, w) = snapshot(rows, errors);
-                            send(r.map(ListData::Services), w)
-                        })
+                        kube_ops::watch_rows(
+                            client,
+                            namespaces,
+                            kube_ops::svc_row,
+                            move |rows, errors| {
+                                let (r, w) = snapshot(rows, errors);
+                                send(r.map(ListData::Services), w)
+                            },
+                        )
                         .await
                     }
                     Kind::Deployment => {
-                        kube_ops::watch_rows(client, namespaces, kube_ops::deploy_row, move |rows, errors| {
-                            let (r, w) = snapshot(rows, errors);
-                            send(r.map(ListData::Deployments), w)
-                        })
+                        kube_ops::watch_rows(
+                            client,
+                            namespaces,
+                            kube_ops::deploy_row,
+                            move |rows, errors| {
+                                let (r, w) = snapshot(rows, errors);
+                                send(r.map(ListData::Deployments), w)
+                            },
+                        )
                         .await
                     }
                     k => {
@@ -485,19 +577,29 @@ impl Workspace {
             }
             let (result, warning) = match kind {
                 Kind::Pod => {
-                    let (r, w) = list_in(&namespaces, |ns| kube_ops::list_pods(client.clone(), ns)).await;
+                    let (r, w) =
+                        list_in(&namespaces, |ns| kube_ops::list_pods(client.clone(), ns)).await;
                     (r.map(ListData::Pods), w)
                 }
                 Kind::Service => {
-                    let (r, w) = list_in(&namespaces, |ns| kube_ops::list_services(client.clone(), ns)).await;
+                    let (r, w) = list_in(&namespaces, |ns| {
+                        kube_ops::list_services(client.clone(), ns)
+                    })
+                    .await;
                     (r.map(ListData::Services), w)
                 }
                 Kind::Deployment => {
-                    let (r, w) = list_in(&namespaces, |ns| kube_ops::list_deployments(client.clone(), ns)).await;
+                    let (r, w) = list_in(&namespaces, |ns| {
+                        kube_ops::list_deployments(client.clone(), ns)
+                    })
+                    .await;
                     (r.map(ListData::Deployments), w)
                 }
                 k => {
-                    let (r, w) = list_in(&namespaces, |ns| kube_ops::list_workloads(client.clone(), k, ns)).await;
+                    let (r, w) = list_in(&namespaces, |ns| {
+                        kube_ops::list_workloads(client.clone(), k, ns)
+                    })
+                    .await;
                     (r.map(ListData::Workloads), w)
                 }
             };
@@ -508,18 +610,42 @@ impl Workspace {
     /// The first row of a list page, for the dev screenshot.
     pub(super) fn first_row(&self, tab: Tab) -> Option<Selected> {
         let (kind, namespace, name) = match tab {
-            Tab::Pods => self.pods.items.first().map(|r| (Kind::Pod, &r.namespace, &r.name))?,
-            Tab::Services => self.services.items.first().map(|r| (Kind::Service, &r.namespace, &r.name))?,
-            Tab::Deployments => self.deployments.items.first().map(|r| (Kind::Deployment, &r.namespace, &r.name))?,
-            Tab::Workload(k) => self.workload(k).items.first().map(|r| (k, &r.namespace, &r.name))?,
+            Tab::Pods => self
+                .pods
+                .items
+                .first()
+                .map(|r| (Kind::Pod, &r.namespace, &r.name))?,
+            Tab::Services => self
+                .services
+                .items
+                .first()
+                .map(|r| (Kind::Service, &r.namespace, &r.name))?,
+            Tab::Deployments => self
+                .deployments
+                .items
+                .first()
+                .map(|r| (Kind::Deployment, &r.namespace, &r.name))?,
+            Tab::Workload(k) => self
+                .workload(k)
+                .items
+                .first()
+                .map(|r| (k, &r.namespace, &r.name))?,
             _ => return None,
         };
-        Some(Selected { kind, namespace: namespace.clone(), name: name.clone() })
+        Some(Selected {
+            kind,
+            namespace: namespace.clone(),
+            name: name.clone(),
+        })
     }
 
     /// Pods in a failing state (CrashLoopBackOff, ImagePullBackOff, Failed, …).
     pub(super) fn failing_pods(&self) -> usize {
-        self.pods.items.iter().filter(|p| pod_health(&p.status) == Health::Bad).count()
+        self.pods
+            .items
+            .iter()
+            .filter(|p| pod_health(&p.status) == Health::Bad)
+            .count()
     }
 
     pub(super) fn workload(&self, kind: Kind) -> &ListState<WorkRow> {
@@ -531,11 +657,17 @@ impl Workspace {
     }
     /// (Re)loads the drawer's details for the current selection.
     pub(super) fn fetch_details(&mut self) {
-        let Some(sel) = self.selected.clone() else { return };
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
         let Some(client) = self.client() else { return };
         let state = match &mut self.details {
             Some(d) if d.sel == sel => d,
-            slot => slot.insert(DetailsState { sel: sel.clone(), data: None, loading: false }),
+            slot => slot.insert(DetailsState {
+                sel: sel.clone(),
+                data: None,
+                loading: false,
+            }),
         };
         if state.loading {
             return;
@@ -556,41 +688,96 @@ impl Workspace {
     // -----------------------------------------------------------------------
 
     fn ui_filter_bar(&mut self, ui: &mut egui::Ui, title: &str, create_kind: &mut Option<Kind>) {
-        let pattern = self.filters.get(&self.tab).map(String::as_str).unwrap_or("");
+        let pattern = self
+            .filters
+            .get(&self.tab)
+            .map(String::as_str)
+            .unwrap_or("");
         self.matcher.update(pattern, self.filter_regex);
         // "512", or "8 of 512" while a filter narrows the list.
         let (shown, total) = match self.tab {
-            Tab::Pods => (self.pods.items.iter().filter(|p| self.matches(&p.name, &p.namespace)).count(), count(&self.pods)),
-            Tab::Services => (self.services.items.iter().filter(|s| self.matches(&s.name, &s.namespace)).count(), count(&self.services)),
-            Tab::Deployments => (self.deployments.items.iter().filter(|d| self.matches(&d.name, &d.namespace)).count(), count(&self.deployments)),
+            Tab::Pods => (
+                self.pods
+                    .items
+                    .iter()
+                    .filter(|p| self.matches(&p.name, &p.namespace))
+                    .count(),
+                count(&self.pods),
+            ),
+            Tab::Services => (
+                self.services
+                    .items
+                    .iter()
+                    .filter(|s| self.matches(&s.name, &s.namespace))
+                    .count(),
+                count(&self.services),
+            ),
+            Tab::Deployments => (
+                self.deployments
+                    .items
+                    .iter()
+                    .filter(|d| self.matches(&d.name, &d.namespace))
+                    .count(),
+                count(&self.deployments),
+            ),
             Tab::Workload(k) => {
                 let state = self.workload(k);
-                (state.items.iter().filter(|w| self.matches(&w.name, &w.namespace)).count(), count(state))
+                (
+                    state
+                        .items
+                        .iter()
+                        .filter(|w| self.matches(&w.name, &w.namespace))
+                        .count(),
+                    count(state),
+                )
             }
             _ => (0, None),
         };
         ui.horizontal(|ui| {
             ui.label(theme::title(title));
             if let Some(n) = total {
-                let text = if shown < n { format!("{shown} of {n}") } else { n.to_string() };
+                let text = if shown < n {
+                    format!("{shown} of {n}")
+                } else {
+                    n.to_string()
+                };
                 ui.label(RichText::new(text).size(15.0).color(theme::TEXT_FAINT));
             }
             ui.add_space(16.0);
-            let hint = if self.filter_regex { "Regex on name or namespace" } else { "Filter by name or namespace" };
+            let hint = if self.filter_regex {
+                "Regex on name or namespace"
+            } else {
+                "Filter by name or namespace"
+            };
             let filter = self.filters.entry(self.tab).or_default();
             theme::search_field(ui, filter, hint, 300.0);
             let has_text = !filter.is_empty();
-            if theme::toggle_button(ui, ".*", self.filter_regex, "Regular expression (case-insensitive)").clicked() {
+            if theme::toggle_button(
+                ui,
+                ".*",
+                self.filter_regex,
+                "Regular expression (case-insensitive)",
+            )
+            .clicked()
+            {
                 self.filter_regex = !self.filter_regex;
             }
             if has_text && theme::icon_button(ui, icon::X, "Clear filter").clicked() {
                 self.filters.remove(&self.tab);
             }
             if let Some(err) = &self.matcher.error {
-                ui.label(RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD))
-                    .on_hover_text(err);
+                ui.label(
+                    RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD),
+                )
+                .on_hover_text(err);
             }
-            if let Some(kind) = self.tab.kinds().first().copied().filter(|_| self.tab.is_list()) {
+            if let Some(kind) = self
+                .tab
+                .kinds()
+                .first()
+                .copied()
+                .filter(|_| self.tab.is_list())
+            {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let create = theme::primary_button(format!("{} Create", icon::PLUS));
                     if ui
@@ -708,70 +895,85 @@ impl Workspace {
 
         // State first (status, restarts, ready) so it stays visible next to the drawer.
         // Wide tables scroll sideways instead of clipping columns off the edge.
-        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
-            let mut table = Self::table(ui)
-                .column(Column::remainder().at_least(180.0).clip(true))
-                .column(Column::exact(132.0).clip(true))
-                // Room for the header's sort arrow.
-                .column(Column::exact(80.0))
-                .column(Column::exact(64.0))
-                .column(Column::exact(72.0));
-            if show_ns {
-                table = table.column(Column::exact(110.0).clip(true));
-            }
-            if show_node {
-                table = table.column(Column::exact(190.0).clip(true));
-            }
-            table
-                .header(26.0, |mut h| {
-                    for t in ["Name", "Status", "Restarts", "Ready", "Age"] {
-                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                    }
-                    if show_ns {
-                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                    }
-                    if show_node {
-                        h.col(|ui| sort_header(ui, "Node", sort, &mut clicked));
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                        let p = rows[row.index()];
-                        row.set_selected(self.is_selected(Kind::Pod, &p.namespace, &p.name));
-                        row.col(|ui| name_cell(ui, &p.name));
-                        row.col(|ui| {
-                            let color = status_color(&p.status);
-                            dot(ui, color);
-                            // Problems read from across the room: tint anything not healthy.
-                            let text = RichText::new(&p.status);
-                            let text = if color == GREEN { text.color(theme::TEXT) } else { text.color(color) };
-                            // Long reasons (Init:CrashLoopBackOff) end in an ellipsis; hover shows them in full.
-                            ui.add(egui::Label::new(text).truncate()).on_hover_text(&p.status);
-                        });
-                        row.col(|ui| restarts_badge(ui, p.restarts));
-                        row.col(|ui| { ui.label(mono(&p.ready)); });
-                        row.col(|ui| { ui.label(mono_muted(p.age())); });
+        egui::ScrollArea::horizontal()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut table = Self::table(ui)
+                    .column(Column::remainder().at_least(180.0).clip(true))
+                    .column(Column::exact(132.0).clip(true))
+                    // Room for the header's sort arrow.
+                    .column(Column::exact(80.0))
+                    .column(Column::exact(64.0))
+                    .column(Column::exact(72.0));
+                if show_ns {
+                    table = table.column(Column::exact(110.0).clip(true));
+                }
+                if show_node {
+                    table = table.column(Column::exact(190.0).clip(true));
+                }
+                table
+                    .header(26.0, |mut h| {
+                        for t in ["Name", "Status", "Restarts", "Ready", "Age"] {
+                            h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                        }
                         if show_ns {
-                            row.col(|ui| { ui.label(mono_muted(&p.namespace)); });
+                            h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                         }
                         if show_node {
-                            row.col(|ui| { ui.label(mono_muted(&p.node)); });
+                            h.col(|ui| sort_header(ui, "Node", sort, &mut clicked));
                         }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                            let p = rows[row.index()];
+                            row.set_selected(self.is_selected(Kind::Pod, &p.namespace, &p.name));
+                            row.col(|ui| name_cell(ui, &p.name));
+                            row.col(|ui| {
+                                let color = status_color(&p.status);
+                                dot(ui, color);
+                                // Problems read from across the room: tint anything not healthy.
+                                let text = RichText::new(&p.status);
+                                let text = if color == GREEN {
+                                    text.color(theme::TEXT)
+                                } else {
+                                    text.color(color)
+                                };
+                                // Long reasons (Init:CrashLoopBackOff) end in an ellipsis; hover shows them in full.
+                                ui.add(egui::Label::new(text).truncate())
+                                    .on_hover_text(&p.status);
+                            });
+                            row.col(|ui| restarts_badge(ui, p.restarts));
+                            row.col(|ui| {
+                                ui.label(mono(&p.ready));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(p.age()));
+                            });
+                            if show_ns {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&p.namespace));
+                                });
+                            }
+                            if show_node {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&p.node));
+                                });
+                            }
 
-                        let resp = row.response();
-                        if resp.double_clicked() {
-                            actions.push(Action::OpenLogs(p.clone(), None, false));
-                        }
-                        if resp.clicked() {
-                            actions.push(Action::Select(Selected {
-                                kind: Kind::Pod,
-                                namespace: p.namespace.clone(),
-                                name: p.name.clone(),
-                            }));
-                        }
+                            let resp = row.response();
+                            if resp.double_clicked() {
+                                actions.push(Action::OpenLogs(p.clone(), None, false));
+                            }
+                            if resp.clicked() {
+                                actions.push(Action::Select(Selected {
+                                    kind: Kind::Pod,
+                                    namespace: p.namespace.clone(),
+                                    name: p.name.clone(),
+                                }));
+                            }
+                        });
                     });
-                });
-        });
+            });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Pods, col);
         }
@@ -808,56 +1010,74 @@ impl Workspace {
         });
 
         // Wide tables scroll sideways instead of clipping columns off the edge.
-        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
-            let mut table = Self::table(ui)
-                .column(Column::remainder().at_least(180.0).clip(true))
-                .column(Column::exact(96.0))
-                .column(Column::exact(170.0).clip(true))
-                .column(Column::exact(120.0).clip(true))
-                .column(Column::exact(72.0));
-            if show_ns {
-                table = table.column(Column::exact(110.0).clip(true));
-            }
-            if show_external {
-                table = table.column(Column::exact(170.0).clip(true));
-            }
-            table
-                .header(26.0, |mut h| {
-                    for t in ["Name", "Type", "Ports", "Cluster IP", "Age"] {
-                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                    }
-                    if show_ns {
-                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                    }
-                    if show_external {
-                        h.col(|ui| sort_header(ui, "External", sort, &mut clicked));
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                        let s = rows[row.index()];
-                        row.set_selected(self.is_selected(Kind::Service, &s.namespace, &s.name));
-                        row.col(|ui| name_cell(ui, &s.name));
-                        row.col(|ui| { ui.label(RichText::new(&s.kind).color(theme::TEXT_MUTED)); });
-                        row.col(|ui| { ui.label(mono(s.ports_label())); });
-                        row.col(|ui| { ui.label(mono_muted(&s.cluster_ip)); });
-                        row.col(|ui| { ui.label(mono_muted(s.age())); });
+        egui::ScrollArea::horizontal()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut table = Self::table(ui)
+                    .column(Column::remainder().at_least(180.0).clip(true))
+                    .column(Column::exact(96.0))
+                    .column(Column::exact(170.0).clip(true))
+                    .column(Column::exact(120.0).clip(true))
+                    .column(Column::exact(72.0));
+                if show_ns {
+                    table = table.column(Column::exact(110.0).clip(true));
+                }
+                if show_external {
+                    table = table.column(Column::exact(170.0).clip(true));
+                }
+                table
+                    .header(26.0, |mut h| {
+                        for t in ["Name", "Type", "Ports", "Cluster IP", "Age"] {
+                            h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                        }
                         if show_ns {
-                            row.col(|ui| { ui.label(mono_muted(&s.namespace)); });
+                            h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                         }
                         if show_external {
-                            row.col(|ui| { ui.label(mono_muted(&s.external)); });
+                            h.col(|ui| sort_header(ui, "External", sort, &mut clicked));
                         }
-                        if row.response().clicked() {
-                            actions.push(Action::Select(Selected {
-                                kind: Kind::Service,
-                                namespace: s.namespace.clone(),
-                                name: s.name.clone(),
-                            }));
-                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                            let s = rows[row.index()];
+                            row.set_selected(self.is_selected(
+                                Kind::Service,
+                                &s.namespace,
+                                &s.name,
+                            ));
+                            row.col(|ui| name_cell(ui, &s.name));
+                            row.col(|ui| {
+                                ui.label(RichText::new(&s.kind).color(theme::TEXT_MUTED));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono(s.ports_label()));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(&s.cluster_ip));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(s.age()));
+                            });
+                            if show_ns {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&s.namespace));
+                                });
+                            }
+                            if show_external {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&s.external));
+                                });
+                            }
+                            if row.response().clicked() {
+                                actions.push(Action::Select(Selected {
+                                    kind: Kind::Service,
+                                    namespace: s.namespace.clone(),
+                                    name: s.name.clone(),
+                                }));
+                            }
+                        });
                     });
-                });
-        });
+            });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Services, col);
         }
@@ -884,7 +1104,11 @@ impl Workspace {
         let mut clicked = None;
         sort_rows(&mut rows, sort, |d, col| match col {
             // Least ready first when ascending: a fraction, scaled to keep integer keys.
-            "Ready" => SortKey::Num(if d.replicas == 0 { 1_000_000 } else { d.ready as i64 * 1_000_000 / d.replicas as i64 }),
+            "Ready" => SortKey::Num(if d.replicas == 0 {
+                1_000_000
+            } else {
+                d.ready as i64 * 1_000_000 / d.replicas as i64
+            }),
             "Up-to-date" => SortKey::Num(d.updated as i64),
             "Available" => SortKey::Num(d.available as i64),
             "Age" => SortKey::age(d.created.as_ref()),
@@ -893,57 +1117,80 @@ impl Workspace {
         });
 
         // Wide tables scroll sideways instead of clipping columns off the edge.
-        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
-            let mut table = Self::table(ui)
-                .column(Column::remainder().at_least(180.0).clip(true))
-                .column(Column::exact(80.0))
-                .column(Column::exact(102.0))
-                .column(Column::exact(92.0))
-                .column(Column::exact(72.0));
-            if show_ns {
-                table = table.column(Column::exact(110.0).clip(true));
-            }
-            table
-                .header(26.0, |mut h| {
-                    for t in ["Name", "Ready", "Up-to-date", "Available", "Age"] {
-                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                    }
-                    if show_ns {
-                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                        let d = rows[row.index()];
-                        row.set_selected(self.is_selected(Kind::Deployment, &d.namespace, &d.name));
-                        row.col(|ui| name_cell(ui, &d.name));
-                        row.col(|ui| {
-                            let c = if d.ready >= d.replicas { theme::TEXT } else { YELLOW };
-                            ui.label(mono(format!("{}/{}", d.ready, d.replicas)).color(c));
-                        });
-                        row.col(|ui| { ui.label(mono_muted(d.updated.to_string())); });
-                        row.col(|ui| { ui.label(mono_muted(d.available.to_string())); });
-                        row.col(|ui| { ui.label(mono_muted(d.age())); });
+        egui::ScrollArea::horizontal()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut table = Self::table(ui)
+                    .column(Column::remainder().at_least(180.0).clip(true))
+                    .column(Column::exact(80.0))
+                    .column(Column::exact(102.0))
+                    .column(Column::exact(92.0))
+                    .column(Column::exact(72.0));
+                if show_ns {
+                    table = table.column(Column::exact(110.0).clip(true));
+                }
+                table
+                    .header(26.0, |mut h| {
+                        for t in ["Name", "Ready", "Up-to-date", "Available", "Age"] {
+                            h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                        }
                         if show_ns {
-                            row.col(|ui| { ui.label(mono_muted(&d.namespace)); });
+                            h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                         }
-                        if row.response().clicked() {
-                            actions.push(Action::Select(Selected {
-                                kind: Kind::Deployment,
-                                namespace: d.namespace.clone(),
-                                name: d.name.clone(),
-                            }));
-                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                            let d = rows[row.index()];
+                            row.set_selected(self.is_selected(
+                                Kind::Deployment,
+                                &d.namespace,
+                                &d.name,
+                            ));
+                            row.col(|ui| name_cell(ui, &d.name));
+                            row.col(|ui| {
+                                let c = if d.ready >= d.replicas {
+                                    theme::TEXT
+                                } else {
+                                    YELLOW
+                                };
+                                ui.label(mono(format!("{}/{}", d.ready, d.replicas)).color(c));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(d.updated.to_string()));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(d.available.to_string()));
+                            });
+                            row.col(|ui| {
+                                ui.label(mono_muted(d.age()));
+                            });
+                            if show_ns {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&d.namespace));
+                                });
+                            }
+                            if row.response().clicked() {
+                                actions.push(Action::Select(Selected {
+                                    kind: Kind::Deployment,
+                                    namespace: d.namespace.clone(),
+                                    name: d.name.clone(),
+                                }));
+                            }
+                        });
                     });
-                });
-        });
+            });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Deployments, col);
         }
     }
 
     /// Daemon sets, stateful sets, replica sets, replication controllers, jobs, cron jobs.
-    pub(super) fn ui_workloads(&mut self, ui: &mut egui::Ui, kind: Kind, actions: &mut Vec<Action>) {
+    pub(super) fn ui_workloads(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: Kind,
+        actions: &mut Vec<Action>,
+    ) {
         let mut create_kind = None;
         self.ui_filter_bar(ui, kind.plural(), &mut create_kind);
         if let Some(kind) = create_kind {
@@ -954,7 +1201,11 @@ impl Workspace {
             return;
         }
         let show_ns = self.selected_ns.len() != 1;
-        let mut rows: Vec<&WorkRow> = state.items.iter().filter(|w| self.matches(&w.name, &w.namespace)).collect();
+        let mut rows: Vec<&WorkRow> = state
+            .items
+            .iter()
+            .filter(|w| self.matches(&w.name, &w.namespace))
+            .collect();
         let columns = kube_ops::columns(kind);
         let sort = self.sorts.get(&Tab::Workload(kind)).cloned();
         let sort = sort.as_ref();
@@ -963,7 +1214,11 @@ impl Workspace {
             "Age" => SortKey::age(w.created.as_ref()),
             "Namespace" => SortKey::text(&w.namespace),
             "Name" => SortKey::text(&w.name),
-            col => match columns.iter().position(|(t, _)| *t == col).and_then(|i| w.cells.get(i)) {
+            col => match columns
+                .iter()
+                .position(|(t, _)| *t == col)
+                .and_then(|i| w.cells.get(i))
+            {
                 Some(cell) => match cell.seconds() {
                     Some(secs) => SortKey::Num(secs),
                     None => SortKey::text(&cell.text()),
@@ -972,66 +1227,79 @@ impl Workspace {
             },
         });
         // The column that carries the state gets the state colour when unhealthy.
-        let state_col = columns.iter().position(|(t, _)| matches!(*t, "Ready" | "Status"));
+        let state_col = columns
+            .iter()
+            .position(|(t, _)| matches!(*t, "Ready" | "Status"));
 
         // Wide tables scroll sideways instead of clipping columns off the edge.
-        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
-            let mut table = Self::table(ui).column(Column::remainder().at_least(180.0).clip(true));
-            for (_, width) in columns {
-                // Room for the header's sort arrow.
-                table = table.column(Column::exact(*width + 14.0).clip(true));
-            }
-            table = table.column(Column::exact(72.0));
-            if show_ns {
-                table = table.column(Column::exact(110.0).clip(true));
-            }
-            table
-                .header(26.0, |mut h| {
-                    h.col(|ui| sort_header(ui, "Name", sort, &mut clicked));
-                    for (title, _) in columns {
-                        h.col(|ui| sort_header(ui, *title, sort, &mut clicked));
-                    }
-                    h.col(|ui| sort_header(ui, "Age", sort, &mut clicked));
-                    if show_ns {
-                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                        let w = rows[row.index()];
-                        row.set_selected(self.is_selected(kind, &w.namespace, &w.name));
-                        row.col(|ui| name_cell(ui, &w.name));
-                        for (i, cell) in w.cells.iter().enumerate() {
-                            row.col(|ui| {
-                                let text = cell.text();
-                                if Some(i) == state_col {
-                                    let color = health_color(w.health);
-                                    if columns[i].0 == "Status" {
-                                        dot(ui, color);
-                                    }
-                                    let c = if w.health == Health::Ok { theme::TEXT } else { color };
-                                    ui.label(mono(text).color(c));
-                                } else if i == 0 {
-                                    ui.label(mono(text));
-                                } else {
-                                    ui.label(mono_muted(text));
-                                }
-                            });
+        egui::ScrollArea::horizontal()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut table =
+                    Self::table(ui).column(Column::remainder().at_least(180.0).clip(true));
+                for (_, width) in columns {
+                    // Room for the header's sort arrow.
+                    table = table.column(Column::exact(*width + 14.0).clip(true));
+                }
+                table = table.column(Column::exact(72.0));
+                if show_ns {
+                    table = table.column(Column::exact(110.0).clip(true));
+                }
+                table
+                    .header(26.0, |mut h| {
+                        h.col(|ui| sort_header(ui, "Name", sort, &mut clicked));
+                        for (title, _) in columns {
+                            h.col(|ui| sort_header(ui, *title, sort, &mut clicked));
                         }
-                        row.col(|ui| { ui.label(mono_muted(w.age())); });
+                        h.col(|ui| sort_header(ui, "Age", sort, &mut clicked));
                         if show_ns {
-                            row.col(|ui| { ui.label(mono_muted(&w.namespace)); });
+                            h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                         }
-                        if row.response().clicked() {
-                            actions.push(Action::Select(Selected {
-                                kind,
-                                namespace: w.namespace.clone(),
-                                name: w.name.clone(),
-                            }));
-                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, rows.len(), |mut row| {
+                            let w = rows[row.index()];
+                            row.set_selected(self.is_selected(kind, &w.namespace, &w.name));
+                            row.col(|ui| name_cell(ui, &w.name));
+                            for (i, cell) in w.cells.iter().enumerate() {
+                                row.col(|ui| {
+                                    let text = cell.text();
+                                    if Some(i) == state_col {
+                                        let color = health_color(w.health);
+                                        if columns[i].0 == "Status" {
+                                            dot(ui, color);
+                                        }
+                                        let c = if w.health == Health::Ok {
+                                            theme::TEXT
+                                        } else {
+                                            color
+                                        };
+                                        ui.label(mono(text).color(c));
+                                    } else if i == 0 {
+                                        ui.label(mono(text));
+                                    } else {
+                                        ui.label(mono_muted(text));
+                                    }
+                                });
+                            }
+                            row.col(|ui| {
+                                ui.label(mono_muted(w.age()));
+                            });
+                            if show_ns {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(&w.namespace));
+                                });
+                            }
+                            if row.response().clicked() {
+                                actions.push(Action::Select(Selected {
+                                    kind,
+                                    namespace: w.namespace.clone(),
+                                    name: w.name.clone(),
+                                }));
+                            }
+                        });
                     });
-                });
-        });
+            });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Workload(kind), col);
         }
@@ -1068,13 +1336,19 @@ impl Workspace {
                 if !self.pods.loaded {
                     return None;
                 }
-                self.pods.items.iter().for_each(|p| add(pod_health(&p.status)));
+                self.pods
+                    .items
+                    .iter()
+                    .for_each(|p| add(pod_health(&p.status)));
             }
             Kind::Deployment => {
                 if !self.deployments.loaded {
                     return None;
                 }
-                self.deployments.items.iter().for_each(|d| add(deploy_health(d)));
+                self.deployments
+                    .items
+                    .iter()
+                    .for_each(|d| add(deploy_health(d)));
             }
             k => {
                 let state = self.workload(k);
@@ -1091,7 +1365,11 @@ impl Workspace {
     pub(super) fn ui_overview(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.label(theme::title("Overview"));
-            ui.label(RichText::new(namespaces_label(&self.selected_ns, false)).size(15.0).color(theme::TEXT_FAINT));
+            ui.label(
+                RichText::new(namespaces_label(&self.selected_ns, false))
+                    .size(15.0)
+                    .color(theme::TEXT_FAINT),
+            );
         });
         ui.add_space(12.0);
         if !self.conn_preamble(ui) {
@@ -1106,14 +1384,16 @@ impl Workspace {
         let per_row = (((avail + gap) / (MIN_CARD_W + gap)).floor() as usize).clamp(1, 4);
         let card_w = (avail - gap * (per_row - 1) as f32) / per_row as f32;
         let kinds = Tab::Overview.kinds();
-        egui::Grid::new("overview-cards").spacing([gap, gap]).show(ui, |ui| {
-            for (i, kind) in kinds.iter().copied().enumerate() {
-                self.overview_card(ui, kind, egui::vec2(card_w, CARD_H), actions);
-                if (i + 1) % per_row == 0 {
-                    ui.end_row();
+        egui::Grid::new("overview-cards")
+            .spacing([gap, gap])
+            .show(ui, |ui| {
+                for (i, kind) in kinds.iter().copied().enumerate() {
+                    self.overview_card(ui, kind, egui::vec2(card_w, CARD_H), actions);
+                    if (i + 1) % per_row == 0 {
+                        ui.end_row();
+                    }
                 }
-            }
-        });
+            });
 
         // Everything that needs a look, worst first.
         let mut problems: Vec<(Kind, &str, &str, String, Health)> = Vec::new();
@@ -1125,7 +1405,13 @@ impl Workspace {
         }
         for d in &self.deployments.items {
             if deploy_health(d) == Health::Progress {
-                problems.push((Kind::Deployment, &d.namespace, &d.name, format!("Ready {}/{}", d.ready, d.replicas), Health::Progress));
+                problems.push((
+                    Kind::Deployment,
+                    &d.namespace,
+                    &d.name,
+                    format!("Ready {}/{}", d.ready, d.replicas),
+                    Health::Progress,
+                ));
             }
         }
         for kind in WORKLOAD_KINDS {
@@ -1157,76 +1443,128 @@ impl Workspace {
 
         ui.add_space(22.0);
         ui.horizontal(|ui| {
-            ui.label(theme::semibold("Needs attention").size(15.0).color(theme::TEXT));
+            ui.label(
+                theme::semibold("Needs attention")
+                    .size(15.0)
+                    .color(theme::TEXT),
+            );
             if !problems.is_empty() {
-                ui.label(RichText::new(problems.len().to_string()).size(15.0).color(theme::TEXT_FAINT));
+                ui.label(
+                    RichText::new(problems.len().to_string())
+                        .size(15.0)
+                        .color(theme::TEXT_FAINT),
+                );
             }
         });
         ui.add_space(8.0);
         let all_loaded = kinds.iter().all(|k| self.health_counts(*k).is_some());
         if problems.is_empty() {
-            ui.label(RichText::new(if all_loaded { "Everything is healthy." } else { "Loading…" }).color(theme::TEXT_MUTED));
+            ui.label(
+                RichText::new(if all_loaded {
+                    "Everything is healthy."
+                } else {
+                    "Loading…"
+                })
+                .color(theme::TEXT_MUTED),
+            );
             return;
         }
         let show_ns = self.selected_ns.len() != 1;
         // Wide tables scroll sideways instead of clipping columns off the edge.
-        egui::ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
-            let mut table = Self::table(ui)
-                .column(Column::remainder().at_least(180.0).clip(true))
-                .column(Column::exact(150.0).clip(true))
-                .column(Column::exact(190.0).clip(true));
-            if show_ns {
-                table = table.column(Column::exact(130.0).clip(true));
-            }
-            table
-                .header(26.0, |mut h| {
-                    for t in ["Name", "Kind", "Status"] {
-                        h.col(|ui| sort_header(ui, t, sort, &mut clicked));
-                    }
-                    if show_ns {
-                        h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
-                    }
-                })
-                .body(|body| {
-                    body.rows(ROW_HEIGHT, problems.len(), |mut row| {
-                        let (kind, ns, name, status, health) = &problems[row.index()];
-                        row.col(|ui| name_cell(ui, name));
-                        row.col(|ui| { ui.label(RichText::new(kind.label()).color(theme::TEXT_MUTED)); });
-                        row.col(|ui| {
-                            let color = health_color(*health);
-                            dot(ui, color);
-                            ui.add(egui::Label::new(RichText::new(status).color(color)).truncate()).on_hover_text(status);
-                        });
+        egui::ScrollArea::horizontal()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut table = Self::table(ui)
+                    .column(Column::remainder().at_least(180.0).clip(true))
+                    .column(Column::exact(150.0).clip(true))
+                    .column(Column::exact(190.0).clip(true));
+                if show_ns {
+                    table = table.column(Column::exact(130.0).clip(true));
+                }
+                table
+                    .header(26.0, |mut h| {
+                        for t in ["Name", "Kind", "Status"] {
+                            h.col(|ui| sort_header(ui, t, sort, &mut clicked));
+                        }
                         if show_ns {
-                            row.col(|ui| { ui.label(mono_muted(*ns)); });
+                            h.col(|ui| sort_header(ui, "Namespace", sort, &mut clicked));
                         }
-                        if row.response().clicked() {
-                            actions.push(Action::OpenSelected(Selected {
-                                kind: *kind,
-                                namespace: ns.to_string(),
-                                name: name.to_string(),
-                            }));
-                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, problems.len(), |mut row| {
+                            let (kind, ns, name, status, health) = &problems[row.index()];
+                            row.col(|ui| name_cell(ui, name));
+                            row.col(|ui| {
+                                ui.label(RichText::new(kind.label()).color(theme::TEXT_MUTED));
+                            });
+                            row.col(|ui| {
+                                let color = health_color(*health);
+                                dot(ui, color);
+                                ui.add(
+                                    egui::Label::new(RichText::new(status).color(color)).truncate(),
+                                )
+                                .on_hover_text(status);
+                            });
+                            if show_ns {
+                                row.col(|ui| {
+                                    ui.label(mono_muted(*ns));
+                                });
+                            }
+                            if row.response().clicked() {
+                                actions.push(Action::OpenSelected(Selected {
+                                    kind: *kind,
+                                    namespace: ns.to_string(),
+                                    name: name.to_string(),
+                                }));
+                            }
+                        });
                     });
-                });
-        });
+            });
         if let Some(col) = clicked {
             self.toggle_sort(Tab::Overview, col);
         }
     }
 
-    fn overview_card(&self, ui: &mut egui::Ui, kind: Kind, size: egui::Vec2, actions: &mut Vec<Action>) {
+    fn overview_card(
+        &self,
+        ui: &mut egui::Ui,
+        kind: Kind,
+        size: egui::Vec2,
+        actions: &mut Vec<Action>,
+    ) {
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if !ui.is_rect_visible(rect) {
             return;
         }
         let p = ui.painter();
-        let fill = if resp.hovered() { theme::FIELD } else { theme::RAISED };
-        p.rect(rect, egui::CornerRadius::same(8), fill, egui::Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        let fill = if resp.hovered() {
+            theme::FIELD
+        } else {
+            theme::RAISED
+        };
+        p.rect(
+            rect,
+            egui::CornerRadius::same(8),
+            fill,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
         let inner = rect.shrink2(egui::vec2(14.0, 12.0));
-        p.text(inner.left_top(), Align2::LEFT_TOP, kind.plural(), egui::FontId::proportional(13.0), theme::TEXT_MUTED);
-        p.text(inner.right_top(), Align2::RIGHT_TOP, kind_glyph(kind), egui::FontId::proportional(15.0), theme::TEXT_FAINT);
+        p.text(
+            inner.left_top(),
+            Align2::LEFT_TOP,
+            kind.plural(),
+            egui::FontId::proportional(13.0),
+            theme::TEXT_MUTED,
+        );
+        p.text(
+            inner.right_top(),
+            Align2::RIGHT_TOP,
+            kind_glyph(kind),
+            egui::FontId::proportional(15.0),
+            theme::TEXT_FAINT,
+        );
 
         let counts = self.health_counts(kind);
         let total = counts.map(|c| c.iter().sum::<usize>());
@@ -1240,7 +1578,10 @@ impl Workspace {
         );
 
         // Stacked health bar.
-        let bar = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.bottom() - 22.0), egui::vec2(inner.width(), 5.0));
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(inner.left(), inner.bottom() - 22.0),
+            egui::vec2(inner.width(), 5.0),
+        );
         p.rect_filled(bar, egui::CornerRadius::same(2), theme::FIELD_ACTIVE);
         let colors = [GREEN, YELLOW, RED, theme::IDLE];
         if let (Some(c), Some(t)) = (counts, total.filter(|t| *t > 0)) {
@@ -1250,7 +1591,10 @@ impl Workspace {
                     continue;
                 }
                 let w = bar.width() * *n as f32 / t as f32;
-                let seg = egui::Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(w.max(2.0), bar.height()));
+                let seg = egui::Rect::from_min_size(
+                    egui::pos2(x, bar.top()),
+                    egui::vec2(w.max(2.0), bar.height()),
+                );
                 p.rect_filled(seg.intersect(bar), egui::CornerRadius::ZERO, color);
                 x += w;
             }
@@ -1268,16 +1612,32 @@ impl Workspace {
                 .collect::<Vec<_>>()
                 .join(" · "),
         };
-        let worst = counts.map(|c| if c[2] > 0 { RED } else if c[1] > 0 { YELLOW } else { theme::TEXT_FAINT });
+        let worst = counts.map(|c| {
+            if c[2] > 0 {
+                RED
+            } else if c[1] > 0 {
+                YELLOW
+            } else {
+                theme::TEXT_FAINT
+            }
+        });
         let color = worst.unwrap_or(theme::TEXT_FAINT);
         // One line, ending in an ellipsis on narrow cards.
         let mut job = egui::text::LayoutJob::single_section(
             legend,
-            egui::TextFormat { font_id: egui::FontId::proportional(12.0), color, ..Default::default() },
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(12.0),
+                color,
+                ..Default::default()
+            },
         );
         job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width());
         let galley = p.layout_job(job);
-        p.galley(egui::pos2(inner.left(), inner.bottom() - galley.size().y), galley, color);
+        p.galley(
+            egui::pos2(inner.left(), inner.bottom() - galley.size().y),
+            galley,
+            color,
+        );
         if resp.clicked() {
             actions.push(Action::Open(Tab::for_kind(kind)));
         }
@@ -1293,7 +1653,10 @@ impl Workspace {
             Some(c) => format!("{label} {c}"),
             None => label.to_string(),
         };
-        let events = n("Events", details.and_then(|d| d.events.as_ref().ok()).map(Vec::len));
+        let events = n(
+            "Events",
+            details.and_then(|d| d.events.as_ref().ok()).map(Vec::len),
+        );
         let mut tabs = vec![(DrawerTab::Overview, "Overview".to_string())];
         match (sel.kind, details.map(|d| &d.body)) {
             (Kind::Pod, body) => {
@@ -1301,8 +1664,14 @@ impl Workspace {
                     Some(Body::Pod(p)) => Some(p),
                     _ => None,
                 };
-                tabs.push((DrawerTab::Containers, n("Containers", pod.map(|p| p.containers.len()))));
-                tabs.push((DrawerTab::Volumes, n("Volumes", pod.map(|p| p.volumes.len()))));
+                tabs.push((
+                    DrawerTab::Containers,
+                    n("Containers", pod.map(|p| p.containers.len())),
+                ));
+                tabs.push((
+                    DrawerTab::Volumes,
+                    n("Volumes", pod.map(|p| p.volumes.len())),
+                ));
             }
             (Kind::Service, body) => {
                 let count = match body {
@@ -1318,7 +1687,9 @@ impl Workspace {
     }
 
     pub(super) fn ui_drawer(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let Some(sel) = self.selected.clone() else { return };
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
         let mut close = false;
         let mut new_tab = None;
         egui::SidePanel::right("drawer")
@@ -1341,35 +1712,52 @@ impl Workspace {
                         }
                         // The name takes the rest of the row and wraps beside the buttons.
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                            ui.add(egui::Label::new(theme::semibold(&sel.name).size(16.5).color(theme::TEXT)).wrap());
+                            ui.add(
+                                egui::Label::new(
+                                    theme::semibold(&sel.name).size(16.5).color(theme::TEXT),
+                                )
+                                .wrap(),
+                            );
                         });
                     });
                 });
                 ui.add_space(2.0);
-                ui.label(RichText::new(format!("{glyph}  {kind} · {}", sel.namespace)).color(theme::TEXT_MUTED));
+                ui.label(
+                    RichText::new(format!("{glyph}  {kind} · {}", sel.namespace))
+                        .color(theme::TEXT_MUTED),
+                );
                 ui.add_space(14.0);
                 let tabs = self.drawer_tabs(&sel);
                 let labels: Vec<String> = tabs.iter().map(|(_, l)| l.clone()).collect();
-                let current = tabs.iter().position(|(t, _)| *t == self.drawer_tab).unwrap_or(0);
+                let current = tabs
+                    .iter()
+                    .position(|(t, _)| *t == self.drawer_tab)
+                    .unwrap_or(0);
                 if let Some(i) = theme::underline_tabs(ui, &labels, current) {
                     new_tab = Some(tabs[i].0);
                 }
 
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    // Let people select and copy values in the drawer.
-                    ui.style_mut().interaction.selectable_labels = true;
-                    match (sel.kind, self.drawer_tab) {
-                        (_, DrawerTab::Events) => self.drawer_events(ui),
-                        (Kind::Pod, DrawerTab::Containers) => self.drawer_pod_containers(ui, &sel, actions),
-                        (Kind::Pod, DrawerTab::Volumes) => self.drawer_pod_volumes(ui),
-                        (Kind::Service, DrawerTab::Endpoints) => self.drawer_service_endpoints(ui, actions),
-                        (Kind::Pod, _) => self.drawer_pod(ui, &sel, actions),
-                        (Kind::Service, _) => self.drawer_service(ui, &sel, actions),
-                        (Kind::Deployment, _) => self.drawer_deployment(ui, &sel, actions),
-                        _ => self.drawer_workload(ui, &sel, actions),
-                    }
-                    ui.add_space(12.0);
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        // Let people select and copy values in the drawer.
+                        ui.style_mut().interaction.selectable_labels = true;
+                        match (sel.kind, self.drawer_tab) {
+                            (_, DrawerTab::Events) => self.drawer_events(ui),
+                            (Kind::Pod, DrawerTab::Containers) => {
+                                self.drawer_pod_containers(ui, &sel, actions)
+                            }
+                            (Kind::Pod, DrawerTab::Volumes) => self.drawer_pod_volumes(ui),
+                            (Kind::Service, DrawerTab::Endpoints) => {
+                                self.drawer_service_endpoints(ui, actions)
+                            }
+                            (Kind::Pod, _) => self.drawer_pod(ui, &sel, actions),
+                            (Kind::Service, _) => self.drawer_service(ui, &sel, actions),
+                            (Kind::Deployment, _) => self.drawer_deployment(ui, &sel, actions),
+                            _ => self.drawer_workload(ui, &sel, actions),
+                        }
+                        ui.add_space(12.0);
+                    });
             });
         if let Some(tab) = new_tab {
             self.drawer_tab = tab;
@@ -1412,7 +1800,11 @@ impl Workspace {
     }
 
     fn drawer_pod(&self, ui: &mut egui::Ui, sel: &Selected, actions: &mut Vec<Action>) {
-        let Some(p) = self.pods.items.iter().find(|p| p.namespace == sel.namespace && p.name == sel.name)
+        let Some(p) = self
+            .pods
+            .items
+            .iter()
+            .find(|p| p.namespace == sel.namespace && p.name == sel.name)
         else {
             if self.pods.loaded {
                 ui.weak("This pod no longer exists.");
@@ -1445,11 +1837,18 @@ impl Workspace {
             let logs_label = format!("{} Logs", icon::SCROLL);
             let previous_label = format!("{} Previous logs", icon::CLOCK_COUNTER_CLOCKWISE);
             let previous_hint = match p.containers.iter().find(|c| !c.last_exit.is_empty()) {
-                Some(c) => format!("Logs from the run before the last restart\nLast run: {}", c.last_exit),
+                Some(c) => format!(
+                    "Logs from the run before the last restart\nLast run: {}",
+                    c.last_exit
+                ),
                 None => "Logs from the run before the last restart".to_string(),
             };
             if restarted && failing {
-                if ui.add(theme::primary_button(previous_label)).on_hover_text(&previous_hint).clicked() {
+                if ui
+                    .add(theme::primary_button(previous_label))
+                    .on_hover_text(&previous_hint)
+                    .clicked()
+                {
                     actions.push(Action::OpenLogs(p.clone(), None, true));
                 }
                 if ui.button(logs_label).clicked() {
@@ -1459,7 +1858,12 @@ impl Workspace {
                 if ui.add(theme::primary_button(logs_label)).clicked() {
                     actions.push(Action::OpenLogs(p.clone(), None, false));
                 }
-                if restarted && ui.button(previous_label).on_hover_text(&previous_hint).clicked() {
+                if restarted
+                    && ui
+                        .button(previous_label)
+                        .on_hover_text(&previous_hint)
+                        .clicked()
+                {
                     actions.push(Action::OpenLogs(p.clone(), None, true));
                 }
             }
@@ -1476,7 +1880,12 @@ impl Workspace {
             }
             let running = p.status == "Running";
             let shell = egui::Button::new(format!("{} Shell", icon::TERMINAL_WINDOW));
-            let regular: Vec<&String> = p.containers.iter().filter(|c| !c.init).map(|c| &c.name).collect();
+            let regular: Vec<&String> = p
+                .containers
+                .iter()
+                .filter(|c| !c.init)
+                .map(|c| &c.name)
+                .collect();
             if regular.len() > 1 && running {
                 ui.menu_button(format!("{} Shell", icon::TERMINAL_WINDOW), |ui| {
                     for c in &regular {
@@ -1494,10 +1903,15 @@ impl Workspace {
             {
                 actions.push(Action::Shell(p.clone(), None));
             }
-            if ui.button(format!("{} Port forward", icon::ARROWS_LEFT_RIGHT)).clicked() {
+            if ui
+                .button(format!("{} Port forward", icon::ARROWS_LEFT_RIGHT))
+                .clicked()
+            {
                 actions.push(Action::ForwardPod(p.clone(), None));
             }
-            overflow_menu(ui, |ui| resource_menu(ui, Kind::Pod, &p.namespace, &p.name, actions));
+            overflow_menu(ui, |ui| {
+                resource_menu(ui, Kind::Pod, &p.namespace, &p.name, actions)
+            });
         });
 
         section(ui, "Details");
@@ -1521,7 +1935,11 @@ impl Workspace {
         section(ui, "Containers");
         for c in &p.containers {
             ui.horizontal(|ui| {
-                let color = if c.ready || c.state == "Completed" { GREEN } else { status_color(&c.state) };
+                let color = if c.ready || c.state == "Completed" {
+                    GREEN
+                } else {
+                    status_color(&c.state)
+                };
                 dot(ui, color);
                 ui.label(theme::semibold(&c.name));
                 if c.init {
@@ -1541,7 +1959,10 @@ impl Workspace {
             for port in &p.ports {
                 ui.horizontal(|ui| {
                     ui.monospace(port.to_string());
-                    if ui.small_button(format!("{} Forward", icon::ARROWS_LEFT_RIGHT)).clicked() {
+                    if ui
+                        .small_button(format!("{} Forward", icon::ARROWS_LEFT_RIGHT))
+                        .clicked()
+                    {
                         actions.push(Action::ForwardPod(p.clone(), Some(*port)));
                     }
                 });
@@ -1562,9 +1983,17 @@ impl Workspace {
     }
 
     fn drawer_pod_containers(&self, ui: &mut egui::Ui, sel: &Selected, actions: &mut Vec<Action>) {
-        let Some(details) = self.details_or_status(ui) else { return };
-        let Body::Pod(pod) = &details.body else { return };
-        let row = self.pods.items.iter().find(|p| p.namespace == sel.namespace && p.name == sel.name);
+        let Some(details) = self.details_or_status(ui) else {
+            return;
+        };
+        let Body::Pod(pod) = &details.body else {
+            return;
+        };
+        let row = self
+            .pods
+            .items
+            .iter()
+            .find(|p| p.namespace == sel.namespace && p.name == sel.name);
 
         for c in &pod.containers {
             let info = row.and_then(|p| p.containers.iter().find(|i| i.name == c.name));
@@ -1574,78 +2003,119 @@ impl Workspace {
                 .corner_radius(theme::RADIUS)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let color = match info {
-                        Some(i) if i.ready || i.state == "Completed" => GREEN,
-                        Some(i) => status_color(&i.state),
-                        None => theme::IDLE,
-                    };
-                    dot(ui, color);
-                    ui.label(theme::semibold(&c.name));
-                    if c.init {
-                        ui.weak("init");
-                    }
-                    if let Some(p) = row {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button(format!("{} Logs", icon::SCROLL)).clicked() {
-                                actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone()), false));
-                            }
-                            if info.is_some_and(|i| i.restarts > 0)
-                                && ui
-                                    .small_button(format!("{} Previous", icon::CLOCK_COUNTER_CLOCKWISE))
-                                    .on_hover_text("Logs from the run before the last restart")
-                                    .clicked()
-                            {
-                                actions.push(Action::OpenLogs(p.clone(), Some(c.name.clone()), true));
-                            }
-                            let can_shell = !c.init && p.status == "Running";
-                            if ui.add_enabled(can_shell, egui::Button::new(format!("{} Shell", icon::TERMINAL_WINDOW)).small()).clicked() {
-                                actions.push(Action::Shell(p.clone(), Some(c.name.clone())));
-                            }
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let color = match info {
+                            Some(i) if i.ready || i.state == "Completed" => GREEN,
+                            Some(i) => status_color(&i.state),
+                            None => theme::IDLE,
+                        };
+                        dot(ui, color);
+                        ui.label(theme::semibold(&c.name));
+                        if c.init {
+                            ui.weak("init");
+                        }
+                        if let Some(p) = row {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button(format!("{} Logs", icon::SCROLL)).clicked() {
+                                        actions.push(Action::OpenLogs(
+                                            p.clone(),
+                                            Some(c.name.clone()),
+                                            false,
+                                        ));
+                                    }
+                                    if info.is_some_and(|i| i.restarts > 0)
+                                        && ui
+                                            .small_button(format!(
+                                                "{} Previous",
+                                                icon::CLOCK_COUNTER_CLOCKWISE
+                                            ))
+                                            .on_hover_text(
+                                                "Logs from the run before the last restart",
+                                            )
+                                            .clicked()
+                                    {
+                                        actions.push(Action::OpenLogs(
+                                            p.clone(),
+                                            Some(c.name.clone()),
+                                            true,
+                                        ));
+                                    }
+                                    let can_shell = !c.init && p.status == "Running";
+                                    if ui
+                                        .add_enabled(
+                                            can_shell,
+                                            egui::Button::new(format!(
+                                                "{} Shell",
+                                                icon::TERMINAL_WINDOW
+                                            ))
+                                            .small(),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions
+                                            .push(Action::Shell(p.clone(), Some(c.name.clone())));
+                                    }
+                                },
+                            );
+                        }
+                    });
+                    if let Some(i) = info {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(&i.state);
+                            ui.weak(format!("· {} restarts", i.restarts));
                         });
                     }
-                });
-                if let Some(i) = info {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(&i.state);
-                        ui.weak(format!("· {} restarts", i.restarts));
-                    });
-                }
-                if !c.last_termination.is_empty() {
-                    ui.add(egui::Label::new(
-                        RichText::new(format!("Last terminated: {}", c.last_termination)).color(YELLOW),
-                    ).wrap());
-                }
-                ui.add(egui::Label::new(RichText::new(&c.image).monospace().weak()).wrap());
+                    if !c.last_termination.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Last terminated: {}", c.last_termination))
+                                    .color(YELLOW),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    ui.add(egui::Label::new(RichText::new(&c.image).monospace().weak()).wrap());
 
-                let mut rows = vec![("Pull policy", c.pull_policy.as_str())];
-                if !c.working_dir.is_empty() {
-                    rows.push(("Working dir", c.working_dir.as_str()));
-                }
-                details_grid(ui, &format!("c-{}", c.name), &rows);
+                    let mut rows = vec![("Pull policy", c.pull_policy.as_str())];
+                    if !c.working_dir.is_empty() {
+                        rows.push(("Working dir", c.working_dir.as_str()));
+                    }
+                    details_grid(ui, &format!("c-{}", c.name), &rows);
 
-                if !c.command.is_empty() || !c.args.is_empty() {
-                    sub_section(ui, "Command");
-                    let line = c.command.iter().chain(c.args.iter()).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ");
-                    code_block(ui, &line);
-                }
-                if !c.ports.is_empty() {
-                    sub_section(ui, "Ports");
-                    tags(ui, c.ports.iter().cloned());
-                }
-                if !c.requests.is_empty() || !c.limits.is_empty() {
-                    sub_section(ui, "Resources");
-                    resources_grid(ui, &format!("res-{}", c.name), &c.requests, &c.limits);
-                }
+                    if !c.command.is_empty() || !c.args.is_empty() {
+                        sub_section(ui, "Command");
+                        let line = c
+                            .command
+                            .iter()
+                            .chain(c.args.iter())
+                            .map(|s| shell_quote(s))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        code_block(ui, &line);
+                    }
+                    if !c.ports.is_empty() {
+                        sub_section(ui, "Ports");
+                        tags(ui, c.ports.iter().cloned());
+                    }
+                    if !c.requests.is_empty() || !c.limits.is_empty() {
+                        sub_section(ui, "Resources");
+                        resources_grid(ui, &format!("res-{}", c.name), &c.requests, &c.limits);
+                    }
 
-                let env_count = c.env.len() + c.env_from_secrets.len();
-                egui::CollapsingHeader::new(RichText::new(format!("Environment ({env_count})")).strong())
+                    let env_count = c.env.len() + c.env_from_secrets.len();
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("Environment ({env_count})")).strong(),
+                    )
                     .id_salt(("env", &c.name))
                     .default_open(true)
                     .show(ui, |ui| self.env_list(ui, &sel.namespace, c, actions));
-                if !c.mounts.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new(format!("Mounts ({})", c.mounts.len())).strong())
+                    if !c.mounts.is_empty() {
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("Mounts ({})", c.mounts.len())).strong(),
+                        )
                         .id_salt(("mounts", &c.name))
                         .show(ui, |ui| {
                             for (path, source) in &c.mounts {
@@ -1655,24 +2125,35 @@ impl Workspace {
                                 });
                             }
                         });
-                }
-                if !c.probes.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new(format!("Probes ({})", c.probes.len())).strong())
+                    }
+                    if !c.probes.is_empty() {
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("Probes ({})", c.probes.len())).strong(),
+                        )
                         .id_salt(("probes", &c.name))
                         .show(ui, |ui| {
                             for (kind, desc) in &c.probes {
                                 ui.label(theme::semibold(kind));
-                                ui.add(egui::Label::new(RichText::new(desc).monospace().small()).wrap());
+                                ui.add(
+                                    egui::Label::new(RichText::new(desc).monospace().small())
+                                        .wrap(),
+                                );
                                 ui.add_space(4.0);
                             }
                         });
-                }
-            });
+                    }
+                });
             ui.add_space(6.0);
         }
     }
 
-    fn env_list(&self, ui: &mut egui::Ui, ns: &str, c: &ContainerDetails, actions: &mut Vec<Action>) {
+    fn env_list(
+        &self,
+        ui: &mut egui::Ui,
+        ns: &str,
+        c: &ContainerDetails,
+        actions: &mut Vec<Action>,
+    ) {
         if c.env.is_empty() && c.env_from_secrets.is_empty() {
             ui.weak("No environment variables");
             return;
@@ -1682,12 +2163,19 @@ impl Workspace {
         // One search shared by every container's list (kept in egui memory for this drawer).
         let filter_key = egui::Id::new("env-filter");
         let mut filter: String = ui.data(|d| d.get_temp(filter_key)).unwrap_or_default();
-        let resp = ui.push_id(("env-filter", &c.name), |ui| theme::search_field(ui, &mut filter, "Search env", 220.0)).inner;
+        let resp = ui
+            .push_id(("env-filter", &c.name), |ui| {
+                theme::search_field(ui, &mut filter, "Search env", 220.0)
+            })
+            .inner;
         if resp.changed() {
             ui.data_mut(|d| d.insert_temp(filter_key, filter.clone()));
         }
         // Esc clears the search; consumed so it doesn't also close the drawer.
-        if resp.has_focus() && !filter.is_empty() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if resp.has_focus()
+            && !filter.is_empty()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             filter.clear();
             ui.data_mut(|d| d.insert_temp(filter_key, String::new()));
         }
@@ -1721,16 +2209,29 @@ impl Workspace {
             let (value, source, secret_name) = match &e.source {
                 EnvSource::Literal => (e.value.clone(), None, None),
                 EnvSource::ConfigMap { name, key } => (
-                    Some(e.value.clone().unwrap_or_else(|| "(ConfigMap not readable)".into())),
+                    Some(
+                        e.value
+                            .clone()
+                            .unwrap_or_else(|| "(ConfigMap not readable)".into()),
+                    ),
                     Some(format!("ConfigMap {name} · {key}")),
                     None,
                 ),
                 EnvSource::Secret { name, key } => {
                     let value = match secret(name) {
-                        Some(Ok(values)) => Some(values.get(key).cloned().unwrap_or_else(|| "(missing key)".into())),
+                        Some(Ok(values)) => Some(
+                            values
+                                .get(key)
+                                .cloned()
+                                .unwrap_or_else(|| "(missing key)".into()),
+                        ),
                         _ => None,
                     };
-                    (value, Some(format!("Secret {name} · {key}")), Some(name.as_str()))
+                    (
+                        value,
+                        Some(format!("Secret {name} · {key}")),
+                        Some(name.as_str()),
+                    )
                 }
                 EnvSource::Field(path) => (None, Some(format!("field {path}")), None),
                 EnvSource::Resource(r) => (None, Some(format!("resource {r}")), None),
@@ -1764,12 +2265,26 @@ impl Workspace {
         }
 
         if !needle.is_empty() && shown == 0 {
-            let hidden = c.env_from_secrets.iter().any(|n| !matches!(secret(n), Some(Ok(_))));
-            ui.weak(if hidden { "No variables match (reveal secrets to search their keys)" } else { "No variables match" });
+            let hidden = c
+                .env_from_secrets
+                .iter()
+                .any(|n| !matches!(secret(n), Some(Ok(_))));
+            ui.weak(if hidden {
+                "No variables match (reveal secrets to search their keys)"
+            } else {
+                "No variables match"
+            });
             ui.add_space(4.0);
         }
-        let copy_label = if needle.is_empty() { "Copy as .env" } else { "Copy matches as .env" };
-        if ui.small_button(format!("{} {copy_label}", icon::COPY)).clicked() {
+        let copy_label = if needle.is_empty() {
+            "Copy as .env"
+        } else {
+            "Copy matches as .env"
+        };
+        if ui
+            .small_button(format!("{} {copy_label}", icon::COPY))
+            .clicked()
+        {
             ui.ctx().copy_text(dotenv.join("\n"));
         }
     }
@@ -1782,16 +2297,26 @@ impl Workspace {
         }
         match self.secrets.get(&key) {
             Some(Ok(_)) => {
-                if ui.small_button(format!("{} Hide", icon::EYE_SLASH)).clicked() {
+                if ui
+                    .small_button(format!("{} Hide", icon::EYE_SLASH))
+                    .clicked()
+                {
                     actions.push(Action::HideSecret(key.0, key.1));
                 }
             }
             Some(Err(e)) => {
-                ui.colored_label(RED, RichText::new(format!("{} not readable", icon::WARNING_CIRCLE)).small())
-                    .on_hover_text(e);
+                ui.colored_label(
+                    RED,
+                    RichText::new(format!("{} not readable", icon::WARNING_CIRCLE)).small(),
+                )
+                .on_hover_text(e);
             }
             None => {
-                if ui.small_button(format!("{} Reveal", icon::EYE)).on_hover_text("Read this secret").clicked() {
+                if ui
+                    .small_button(format!("{} Reveal", icon::EYE))
+                    .on_hover_text("Read this secret")
+                    .clicked()
+                {
                     actions.push(Action::RevealSecret(key.0, key.1));
                 }
             }
@@ -1799,8 +2324,12 @@ impl Workspace {
     }
 
     fn drawer_pod_volumes(&self, ui: &mut egui::Ui) {
-        let Some(details) = self.details_or_status(ui) else { return };
-        let Body::Pod(pod) = &details.body else { return };
+        let Some(details) = self.details_or_status(ui) else {
+            return;
+        };
+        let Body::Pod(pod) = &details.body else {
+            return;
+        };
         if pod.volumes.is_empty() {
             ui.weak("No volumes");
             return;
@@ -1812,7 +2341,11 @@ impl Workspace {
                 .flat_map(|c| {
                     c.mounts
                         .iter()
-                        .filter(|(_, src)| src == name || src.starts_with(&format!("{name}/")) || src.starts_with(&format!("{name} ")))
+                        .filter(|(_, src)| {
+                            src == name
+                                || src.starts_with(&format!("{name}/"))
+                                || src.starts_with(&format!("{name} "))
+                        })
                         .map(move |(path, _)| format!("{}:{path}", c.name))
                 })
                 .collect();
@@ -1828,7 +2361,9 @@ impl Workspace {
     }
 
     fn drawer_events(&self, ui: &mut egui::Ui) {
-        let Some(details) = self.details_or_status(ui) else { return };
+        let Some(details) = self.details_or_status(ui) else {
+            return;
+        };
         let events = match &details.events {
             Ok(e) => e,
             Err(e) => {
@@ -1850,7 +2385,11 @@ impl Workspace {
                 ui.colored_label(color, glyph);
                 ui.label(theme::semibold(&e.reason));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let count = if e.count > 1 { format!(" ×{}", e.count) } else { String::new() };
+                    let count = if e.count > 1 {
+                        format!(" ×{}", e.count)
+                    } else {
+                        String::new()
+                    };
                     ui.weak(format!("{} ago{count}", e.age));
                 });
             });
@@ -1860,7 +2399,11 @@ impl Workspace {
     }
 
     fn drawer_service(&self, ui: &mut egui::Ui, sel: &Selected, actions: &mut Vec<Action>) {
-        let Some(s) = self.services.items.iter().find(|s| s.namespace == sel.namespace && s.name == sel.name)
+        let Some(s) = self
+            .services
+            .items
+            .iter()
+            .find(|s| s.namespace == sel.namespace && s.name == sel.name)
         else {
             ui.weak("This service no longer exists.");
             return;
@@ -1881,13 +2424,22 @@ impl Workspace {
                 actions.push(Action::ForwardService(s.clone(), None));
             }
             let logs = egui::Button::new(format!("{} Logs (all pods)", icon::STACK));
-            if ui.add_enabled(can_forward, logs).on_disabled_hover_text("Service has no selector").clicked() {
+            if ui
+                .add_enabled(can_forward, logs)
+                .on_disabled_hover_text("Service has no selector")
+                .clicked()
+            {
                 actions.push(Action::OpenGroupLogs {
                     namespace: s.namespace.clone(),
-                    target: LogTarget::Selector { label: format!("svc/{}", s.name), selector: s.selector.clone() },
+                    target: LogTarget::Selector {
+                        label: format!("svc/{}", s.name),
+                        selector: s.selector.clone(),
+                    },
                 });
             }
-            overflow_menu(ui, |ui| resource_menu(ui, Kind::Service, &s.namespace, &s.name, actions));
+            overflow_menu(ui, |ui| {
+                resource_menu(ui, Kind::Service, &s.namespace, &s.name, actions)
+            });
         });
 
         section(ui, "Details");
@@ -1923,7 +2475,11 @@ impl Workspace {
         }
         for port in &s.ports {
             ui.horizontal_wrapped(|ui| {
-                let name = if port.name.is_empty() { String::new() } else { format!("{} ", port.name) };
+                let name = if port.name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", port.name)
+                };
                 ui.monospace(format!(
                     "{name}{} {} {}/{}",
                     port.port,
@@ -1934,7 +2490,8 @@ impl Workspace {
                 if let Some(np) = port.node_port {
                     ui.weak(format!("node {np}"));
                 }
-                let forward = egui::Button::new(format!("{} Forward", icon::ARROWS_LEFT_RIGHT)).small();
+                let forward =
+                    egui::Button::new(format!("{} Forward", icon::ARROWS_LEFT_RIGHT)).small();
                 if ui.add_enabled(can_forward, forward).clicked() {
                     actions.push(Action::ForwardService(s.clone(), Some(port.port)));
                 }
@@ -1957,8 +2514,12 @@ impl Workspace {
     }
 
     fn drawer_service_endpoints(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let Some(details) = self.details_or_status(ui) else { return };
-        let Body::Service(svc) = &details.body else { return };
+        let Some(details) = self.details_or_status(ui) else {
+            return;
+        };
+        let Body::Service(svc) = &details.body else {
+            return;
+        };
         if !svc.endpoint_ports.is_empty() {
             sub_section(ui, "Ports");
             tags(ui, svc.endpoint_ports.iter().cloned());
@@ -1968,7 +2529,11 @@ impl Workspace {
             ui.weak("No endpoints. Check that the selector matches ready pods.");
             return;
         }
-        let ns = self.selected.as_ref().map(|s| s.namespace.clone()).unwrap_or_default();
+        let ns = self
+            .selected
+            .as_ref()
+            .map(|s| s.namespace.clone())
+            .unwrap_or_default();
         for e in &svc.endpoints {
             ui.horizontal_wrapped(|ui| {
                 dot(ui, if e.ready { GREEN } else { RED });
@@ -1994,7 +2559,11 @@ impl Workspace {
     }
 
     fn drawer_deployment(&self, ui: &mut egui::Ui, sel: &Selected, actions: &mut Vec<Action>) {
-        let Some(d) = self.deployments.items.iter().find(|d| d.namespace == sel.namespace && d.name == sel.name)
+        let Some(d) = self
+            .deployments
+            .items
+            .iter()
+            .find(|d| d.namespace == sel.namespace && d.name == sel.name)
         else {
             ui.weak("This deployment no longer exists.");
             return;
@@ -2016,29 +2585,61 @@ impl Workspace {
             ui.label(format!("Age {}", d.age()));
         });
         ui.add_space(8.0);
-        if !d.selector.is_empty() && ui.button(format!("{} Logs (all pods)", icon::STACK)).clicked() {
+        if !d.selector.is_empty()
+            && ui
+                .button(format!("{} Logs (all pods)", icon::STACK))
+                .clicked()
+        {
             actions.push(Action::OpenGroupLogs {
                 namespace: d.namespace.clone(),
-                target: LogTarget::Selector { label: format!("deploy/{}", d.name), selector: d.selector.clone() },
+                target: LogTarget::Selector {
+                    label: format!("deploy/{}", d.name),
+                    selector: d.selector.clone(),
+                },
             });
         }
         ui.horizontal(|ui| {
             ui.label("Replicas");
-            if ui.add_enabled(d.replicas > 0, egui::Button::new(icon::MINUS)).on_hover_text("Scale down").clicked() {
-                actions.push(Action::Scale(Kind::Deployment, d.namespace.clone(), d.name.clone(), d.replicas - 1));
+            if ui
+                .add_enabled(d.replicas > 0, egui::Button::new(icon::MINUS))
+                .on_hover_text("Scale down")
+                .clicked()
+            {
+                actions.push(Action::Scale(
+                    Kind::Deployment,
+                    d.namespace.clone(),
+                    d.name.clone(),
+                    d.replicas - 1,
+                ));
             }
             ui.label(theme::semibold(d.replicas.to_string()));
             if ui.button(icon::PLUS).on_hover_text("Scale up").clicked() {
-                actions.push(Action::Scale(Kind::Deployment, d.namespace.clone(), d.name.clone(), d.replicas + 1));
+                actions.push(Action::Scale(
+                    Kind::Deployment,
+                    d.namespace.clone(),
+                    d.name.clone(),
+                    d.replicas + 1,
+                ));
             }
             ui.separator();
             overflow_menu(ui, |ui| {
-                if ui.button(format!("{} Rollout restart", icon::ARROW_COUNTER_CLOCKWISE)).clicked() {
-                    actions.push(Action::Restart(Kind::Deployment, d.namespace.clone(), d.name.clone()));
+                if ui
+                    .button(format!("{} Rollout restart", icon::ARROW_COUNTER_CLOCKWISE))
+                    .clicked()
+                {
+                    actions.push(Action::Restart(
+                        Kind::Deployment,
+                        d.namespace.clone(),
+                        d.name.clone(),
+                    ));
                 }
                 // Paused state comes with the details; offer the toggle once it's known.
                 if let Some(paused) = details.map(|det| det.paused) {
-                    let (glyph, text) = if paused { (icon::PLAY, "Resume rollout") } else { (icon::PAUSE, "Pause rollout") };
+                    let (glyph, text) = if paused {
+                        (icon::PLAY, "Resume rollout")
+                    } else {
+                        (icon::PAUSE, "Pause rollout")
+                    };
                     if ui.button(format!("{glyph} {text}")).clicked() {
                         actions.push(Action::Pause(d.namespace.clone(), d.name.clone(), !paused));
                     }
@@ -2049,8 +2650,12 @@ impl Workspace {
         });
 
         section(ui, "Details");
-        let min_ready = details.map(|d| d.min_ready_seconds.to_string()).unwrap_or_default();
-        let history = details.map(|d| d.revision_history.to_string()).unwrap_or_default();
+        let min_ready = details
+            .map(|d| d.min_ready_seconds.to_string())
+            .unwrap_or_default();
+        let history = details
+            .map(|d| d.revision_history.to_string())
+            .unwrap_or_default();
         let mut rows = vec![("Strategy", d.strategy.as_str())];
         if let Some(det) = details {
             rows.extend([
@@ -2083,7 +2688,11 @@ impl Workspace {
         }
     }
     fn drawer_workload(&self, ui: &mut egui::Ui, sel: &Selected, actions: &mut Vec<Action>) {
-        let Some(w) = self.workload(sel.kind).items.iter().find(|w| w.namespace == sel.namespace && w.name == sel.name)
+        let Some(w) = self
+            .workload(sel.kind)
+            .items
+            .iter()
+            .find(|w| w.namespace == sel.namespace && w.name == sel.name)
         else {
             ui.weak(format!("This {} no longer exists.", sel.kind.label()));
             return;
@@ -2106,21 +2715,38 @@ impl Workspace {
             let mut first = true;
             if w.kind == Kind::CronJob {
                 first = false;
-                if ui.add(theme::primary_button(format!("{} Run now", icon::PLAY))).on_hover_text("Start a job from this cron job's template").clicked() {
+                if ui
+                    .add(theme::primary_button(format!("{} Run now", icon::PLAY)))
+                    .on_hover_text("Start a job from this cron job's template")
+                    .clicked()
+                {
                     actions.push(Action::Trigger(w.namespace.clone(), w.name.clone()));
                 }
             }
             if let Some(suspended) = w.suspended.filter(|_| !w.finished) {
                 first = false;
-                let (glyph, text) = if suspended { (icon::PLAY_CIRCLE, "Resume") } else { (icon::PAUSE, "Suspend") };
+                let (glyph, text) = if suspended {
+                    (icon::PLAY_CIRCLE, "Resume")
+                } else {
+                    (icon::PAUSE, "Suspend")
+                };
                 let hint = match (w.kind, suspended) {
                     (Kind::CronJob, false) => "Stop scheduling new runs",
                     (Kind::CronJob, true) => "Start scheduling runs again",
                     (_, false) => "Stop the job's pods until resumed",
                     (_, true) => "Let the job run again",
                 };
-                if ui.button(format!("{glyph} {text}")).on_hover_text(hint).clicked() {
-                    actions.push(Action::Suspend(w.kind, w.namespace.clone(), w.name.clone(), !suspended));
+                if ui
+                    .button(format!("{glyph} {text}"))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    actions.push(Action::Suspend(
+                        w.kind,
+                        w.namespace.clone(),
+                        w.name.clone(),
+                        !suspended,
+                    ));
                 }
             }
             if !w.selector.is_empty() && w.kind != Kind::CronJob {
@@ -2129,7 +2755,11 @@ impl Workspace {
                 }
                 first = false;
             }
-            if !w.selector.is_empty() && ui.button(format!("{} Logs (all pods)", icon::STACK)).clicked() {
+            if !w.selector.is_empty()
+                && ui
+                    .button(format!("{} Logs (all pods)", icon::STACK))
+                    .clicked()
+            {
                 actions.push(Action::OpenGroupLogs {
                     namespace: w.namespace.clone(),
                     target: LogTarget::Selector {
@@ -2144,12 +2774,26 @@ impl Workspace {
                 }
                 first = false;
                 ui.label("Replicas");
-                if ui.add_enabled(replicas > 0, egui::Button::new(icon::MINUS)).on_hover_text("Scale down").clicked() {
-                    actions.push(Action::Scale(w.kind, w.namespace.clone(), w.name.clone(), replicas - 1));
+                if ui
+                    .add_enabled(replicas > 0, egui::Button::new(icon::MINUS))
+                    .on_hover_text("Scale down")
+                    .clicked()
+                {
+                    actions.push(Action::Scale(
+                        w.kind,
+                        w.namespace.clone(),
+                        w.name.clone(),
+                        replicas - 1,
+                    ));
                 }
                 ui.label(theme::semibold(replicas.to_string()));
                 if ui.button(icon::PLUS).on_hover_text("Scale up").clicked() {
-                    actions.push(Action::Scale(w.kind, w.namespace.clone(), w.name.clone(), replicas + 1));
+                    actions.push(Action::Scale(
+                        w.kind,
+                        w.namespace.clone(),
+                        w.name.clone(),
+                        replicas + 1,
+                    ));
                 }
             }
             if !first {
@@ -2157,7 +2801,10 @@ impl Workspace {
             }
             overflow_menu(ui, |ui| {
                 if w.kind.restartable() {
-                    if ui.button(format!("{} Rollout restart", icon::ARROW_COUNTER_CLOCKWISE)).clicked() {
+                    if ui
+                        .button(format!("{} Rollout restart", icon::ARROW_COUNTER_CLOCKWISE))
+                        .clicked()
+                    {
                         actions.push(Action::Restart(w.kind, w.namespace.clone(), w.name.clone()));
                     }
                     ui.separator();
@@ -2168,7 +2815,11 @@ impl Workspace {
 
         section(ui, "Details");
         let columns = kube_ops::columns(w.kind);
-        let cells: Vec<(&str, String)> = columns.iter().map(|(t, _)| *t).zip(w.cells.iter().map(|c| c.text())).collect();
+        let cells: Vec<(&str, String)> = columns
+            .iter()
+            .map(|(t, _)| *t)
+            .zip(w.cells.iter().map(|c| c.text()))
+            .collect();
         let mut rows: Vec<(&str, &str)> = cells.iter().map(|(k, v)| (*k, v.as_str())).collect();
         rows.extend(w.info.iter().map(|(k, v)| (*k, v.as_str())));
         if !w.owner.is_empty() {
@@ -2201,10 +2852,16 @@ impl Workspace {
 
 /// Edit YAML, View YAML and Delete: the end of every drawer's ⋯ menu.
 fn resource_menu(ui: &mut egui::Ui, kind: Kind, ns: &str, name: &str, actions: &mut Vec<Action>) {
-    if ui.button(format!("{} Edit YAML", icon::PENCIL_SIMPLE)).clicked() {
+    if ui
+        .button(format!("{} Edit YAML", icon::PENCIL_SIMPLE))
+        .clicked()
+    {
         actions.push(Action::EditYaml(kind, ns.to_string(), name.to_string()));
     }
-    if ui.button(format!("{} View YAML", icon::FILE_CODE)).clicked() {
+    if ui
+        .button(format!("{} View YAML", icon::FILE_CODE))
+        .clicked()
+    {
         actions.push(Action::Yaml(kind, ns.to_string(), name.to_string()));
     }
     ui.separator();
@@ -2215,7 +2872,10 @@ fn resource_menu(ui: &mut egui::Ui, kind: Kind, ns: &str, name: &str, actions: &
 }
 
 fn empty_workloads() -> HashMap<Kind, ListState<WorkRow>> {
-    WORKLOAD_KINDS.into_iter().map(|k| (k, ListState::default())).collect()
+    WORKLOAD_KINDS
+        .into_iter()
+        .map(|k| (k, ListState::default()))
+        .collect()
 }
 
 fn kind_glyph(kind: Kind) -> &'static str {
@@ -2233,7 +2893,11 @@ fn kind_glyph(kind: Kind) -> &'static str {
 
 /// Sort order on the Overview, matching the sidebar.
 fn kind_order(kind: Kind) -> usize {
-    Tab::Overview.kinds().iter().position(|k| *k == kind).unwrap_or(usize::MAX)
+    Tab::Overview
+        .kinds()
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or(usize::MAX)
 }
 
 fn pod_health(status: &str) -> Health {
@@ -2281,15 +2945,22 @@ fn snapshot<T>(rows: Vec<T>, errors: Vec<String>) -> (Result<Vec<T>, String>, Op
 /// Lists across the selected namespaces. "All" or a single namespace is one call; several
 /// namespaces are fetched in parallel, one call each, since a cluster-wide list is often
 /// forbidden. Returns the merged items plus a warning naming namespaces that failed.
-async fn list_in<T, F, Fut>(namespaces: &[String], list: F) -> (Result<Vec<T>, String>, Option<String>)
+async fn list_in<T, F, Fut>(
+    namespaces: &[String],
+    list: F,
+) -> (Result<Vec<T>, String>, Option<String>)
 where
     F: Fn(Option<String>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<T>>>,
 {
     if namespaces.len() <= 1 {
-        return (list(namespaces.first().cloned()).await.map_err(err_string), None);
+        return (
+            list(namespaces.first().cloned()).await.map_err(err_string),
+            None,
+        );
     }
-    let results = futures::future::join_all(namespaces.iter().map(|ns| list(Some(ns.clone())))).await;
+    let results =
+        futures::future::join_all(namespaces.iter().map(|ns| list(Some(ns.clone())))).await;
     let mut items = Vec::new();
     let mut errors = Vec::new();
     // `namespaces` is sorted and each list is sorted by name, so the merge stays ordered.

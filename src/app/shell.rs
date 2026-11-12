@@ -49,7 +49,14 @@ fn nz(v: u16) -> NonZeroU16 {
 }
 
 impl ShellView {
-    pub(super) fn new(id: u64, context: String, client: Client, namespace: String, pod: String, container: Option<String>) -> Self {
+    pub(super) fn new(
+        id: u64,
+        context: String,
+        client: Client,
+        namespace: String,
+        pod: String,
+        container: Option<String>,
+    ) -> Self {
         Self {
             id,
             context,
@@ -74,7 +81,12 @@ impl ShellView {
     }
 
     pub(super) fn hover(&self) -> String {
-        format!("Shell in {}/{} ({})", self.namespace, self.title(), self.context)
+        format!(
+            "Shell in {}/{} ({})",
+            self.namespace,
+            self.title(),
+            self.context
+        )
     }
 
     pub(super) fn live(&self) -> bool {
@@ -89,8 +101,14 @@ impl ShellView {
         let (tx, rx) = unbounded_channel();
         self.tx = Some(tx);
         self.status = ShellStatus::Connecting;
-        let (id, client, ns, pod, container, size) =
-            (self.id, self.client.clone(), self.namespace.clone(), self.pod.clone(), self.container.clone(), self.size);
+        let (id, client, ns, pod, container, size) = (
+            self.id,
+            self.client.clone(),
+            self.namespace.clone(),
+            self.pod.clone(),
+            self.container.clone(),
+            self.size,
+        );
         let bus = bus.clone();
         self.task = Some(rt.spawn(async move {
             let out_bus = bus.clone();
@@ -145,7 +163,10 @@ impl ShellView {
         ui.horizontal(|ui| {
             let (color, text) = match &self.status {
                 ShellStatus::Connecting => (YELLOW, "Connecting…".to_string()),
-                ShellStatus::Open => (GREEN, format!("Connected · {}/{}", self.namespace, self.title())),
+                ShellStatus::Open => (
+                    GREEN,
+                    format!("Connected · {}/{}", self.namespace, self.title()),
+                ),
                 ShellStatus::Exited(None) => (theme::IDLE, "Session ended".to_string()),
                 ShellStatus::Exited(Some(e)) => (RED, format!("Session ended: {e}")),
             };
@@ -153,7 +174,13 @@ impl ShellView {
             ui.add(egui::Label::new(RichText::new(text).color(theme::TEXT_MUTED)).truncate());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if matches!(self.status, ShellStatus::Exited(_)) {
-                    if ui.add(theme::primary_button(format!("{} Reconnect", icon::ARROW_CLOCKWISE))).clicked() {
+                    if ui
+                        .add(theme::primary_button(format!(
+                            "{} Reconnect",
+                            icon::ARROW_CLOCKWISE
+                        )))
+                        .clicked()
+                    {
                         reconnect = true;
                     }
                 }
@@ -188,15 +215,24 @@ impl ShellView {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
                     id,
-                    egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
                 )
             });
         }
 
         // Mouse: selection by drag (screen cells), wheel scrolls back through history.
         let cell_at = |pos: egui::Pos2| -> (u16, u16) {
-            let col = ((pos.x - inner.left()) / char_w).floor().clamp(0.0, cols as f32 - 1.0) as u16;
-            let row = ((pos.y - inner.top()) / line_h).floor().clamp(0.0, rows as f32 - 1.0) as u16;
+            let col = ((pos.x - inner.left()) / char_w)
+                .floor()
+                .clamp(0.0, cols as f32 - 1.0) as u16;
+            let row = ((pos.y - inner.top()) / line_h)
+                .floor()
+                .clamp(0.0, rows as f32 - 1.0) as u16;
             (row, col)
         };
         if resp.drag_started() {
@@ -217,13 +253,18 @@ impl ShellView {
             if scroll.abs() > 0.0 && !self.parser.screen().alternate_screen() {
                 let lines = (scroll / line_h).round() as isize;
                 let now = self.parser.screen().scrollback() as isize;
-                self.parser.screen_mut().set_scrollback((now + lines).max(0) as usize);
+                self.parser
+                    .screen_mut()
+                    .set_scrollback((now + lines).max(0) as usize);
             }
         }
 
         if focused && matches!(self.status, ShellStatus::Open | ShellStatus::Connecting) {
             self.handle_keys(ui);
-        } else if focused && matches!(self.status, ShellStatus::Exited(_)) && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        } else if focused
+            && matches!(self.status, ShellStatus::Exited(_))
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+        {
             reconnect = true;
         }
 
@@ -256,7 +297,12 @@ impl ShellView {
                         ui.ctx().copy_text(text);
                     }
                 }
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
                     if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                         self.send(bytes);
                         typed = true;
@@ -278,16 +324,31 @@ impl ShellView {
         if start == end {
             return None;
         }
-        Some(self.parser.screen().contents_between(start.0, start.1, end.0, end.1 + 1))
+        Some(
+            self.parser
+                .screen()
+                .contents_between(start.0, start.1, end.0, end.1 + 1),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, ui: &egui::Ui, rect: egui::Rect, inner: egui::Rect, font: &egui::FontId, char_w: f32, line_h: f32, focused: bool) {
+    fn paint(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        inner: egui::Rect,
+        font: &egui::FontId,
+        char_w: f32,
+        line_h: f32,
+        focused: bool,
+    ) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::WELL);
         let screen = self.parser.screen();
         let (rows, cols) = (self.size.1, self.size.0);
-        let sel = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        let sel = self
+            .selection
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         let selected = |r: u16, c: u16| match sel {
             Some((s, e)) if s != e => (r, c) >= s && (r, c) <= e,
             _ => false,
@@ -303,7 +364,10 @@ impl ShellView {
                     c += 1;
                     continue;
                 }
-                let (mut fg, mut bg) = (term_color(cell.fgcolor(), true, cell.bold()), term_color(cell.bgcolor(), false, false));
+                let (mut fg, mut bg) = (
+                    term_color(cell.fgcolor(), true, cell.bold()),
+                    term_color(cell.bgcolor(), false, false),
+                );
                 if cell.inverse() {
                     std::mem::swap(&mut fg, &mut bg);
                     // Default colours have no swatch to swap: use the well and ink explicitly.
@@ -325,12 +389,19 @@ impl ShellView {
                 if bg != Color32::TRANSPARENT {
                     let x = inner.left() + c as f32 * char_w;
                     painter.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(char_w * width, line_h)),
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, y),
+                            egui::vec2(char_w * width, line_h),
+                        ),
                         0.0,
                         bg,
                     );
                 }
-                let text = if cell.has_contents() { cell.contents() } else { " " };
+                let text = if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " "
+                };
                 job.append(
                     text,
                     0.0,
@@ -338,7 +409,11 @@ impl ShellView {
                         font_id: font.clone(),
                         color: fg,
                         italics: cell.italic(),
-                        underline: if cell.underline() { egui::Stroke::new(1.0, fg) } else { egui::Stroke::NONE },
+                        underline: if cell.underline() {
+                            egui::Stroke::new(1.0, fg)
+                        } else {
+                            egui::Stroke::NONE
+                        },
                         ..Default::default()
                     },
                 );
@@ -350,16 +425,27 @@ impl ShellView {
         }
 
         // Cursor: a block when focused, an outline otherwise; hidden while scrolled back.
-        if !screen.hide_cursor() && screen.scrollback() == 0 && self.status != ShellStatus::Connecting {
+        if !screen.hide_cursor()
+            && screen.scrollback() == 0
+            && self.status != ShellStatus::Connecting
+        {
             let (r, c) = screen.cursor_position();
             let cr = egui::Rect::from_min_size(
-                egui::pos2(inner.left() + c as f32 * char_w, inner.top() + r as f32 * line_h),
+                egui::pos2(
+                    inner.left() + c as f32 * char_w,
+                    inner.top() + r as f32 * line_h,
+                ),
                 egui::vec2(char_w, line_h),
             );
             if focused {
                 painter.rect_filled(cr, 1.0, theme::ACCENT.gamma_multiply(0.75));
             } else {
-                painter.rect_stroke(cr, 1.0, egui::Stroke::new(1.0, theme::TEXT_MUTED), egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    cr,
+                    1.0,
+                    egui::Stroke::new(1.0, theme::TEXT_MUTED),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
         if screen.scrollback() > 0 {
@@ -484,20 +570,41 @@ mod tests {
 
     #[test]
     fn control_keys() {
-        let ctrl = egui::Modifiers { ctrl: true, ..Default::default() };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
         assert_eq!(key_bytes(egui::Key::C, ctrl, false), Some(vec![3]));
         assert_eq!(key_bytes(egui::Key::D, ctrl, false), Some(vec![4]));
-        assert_eq!(key_bytes(egui::Key::Enter, egui::Modifiers::NONE, false), Some(b"\r".to_vec()));
-        assert_eq!(key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, false), Some(b"\x1b[A".to_vec()));
-        assert_eq!(key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(
+            key_bytes(egui::Key::Enter, egui::Modifiers::NONE, false),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            key_bytes(egui::Key::ArrowUp, egui::Modifiers::NONE, true),
+            Some(b"\x1bOA".to_vec())
+        );
         // Plain letters come through text events, not key events.
         assert_eq!(key_bytes(egui::Key::A, egui::Modifiers::NONE, false), None);
     }
 
     #[test]
     fn colours() {
-        assert_eq!(term_color(vt100::Color::Default, false, false), Color32::TRANSPARENT);
-        assert_eq!(term_color(vt100::Color::Idx(1), true, true), term_color(vt100::Color::Idx(9), true, false));
-        assert_eq!(term_color(vt100::Color::Rgb(1, 2, 3), true, false), Color32::from_rgb(1, 2, 3));
+        assert_eq!(
+            term_color(vt100::Color::Default, false, false),
+            Color32::TRANSPARENT
+        );
+        assert_eq!(
+            term_color(vt100::Color::Idx(1), true, true),
+            term_color(vt100::Color::Idx(9), true, false)
+        );
+        assert_eq!(
+            term_color(vt100::Color::Rgb(1, 2, 3), true, false),
+            Color32::from_rgb(1, 2, 3)
+        );
     }
 }

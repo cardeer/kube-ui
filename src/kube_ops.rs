@@ -12,6 +12,10 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::{AsyncBufReadExt, StreamExt, TryStreamExt};
+use hyper_util::{
+    client::legacy::{Client as LegacyClient, connect::HttpConnector},
+    rt::TokioExecutor,
+};
 use k8s_openapi::{
     NamespaceResourceScope,
     api::{
@@ -30,13 +34,9 @@ use kube::{
     runtime::{WatchStreamExt, watcher},
 };
 use serde::de::DeserializeOwned;
-use hyper_util::{
-    client::legacy::{Client as LegacyClient, connect::HttpConnector},
-    rt::TokioExecutor,
-};
-use tower::{BoxError, ServiceBuilder};
 use serde_json::json;
 use tokio::net::TcpListener;
+use tower::{BoxError, ServiceBuilder};
 
 // ---------------------------------------------------------------------------
 // Kubeconfig / connection
@@ -159,7 +159,12 @@ pub async fn watch_rows<K, R>(
     to_row: fn(&K) -> R,
     mut emit: impl FnMut(Vec<R>, Vec<String>),
 ) where
-    K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug + Send + 'static,
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + Send
+        + 'static,
     <K as kube::Resource>::DynamicType: Default,
     R: Clone,
 {
@@ -178,7 +183,13 @@ pub async fn watch_rows<K, R>(
     let mut events = futures::stream::select_all(streams);
     let mut scopes: Vec<WatchScope<R>> = labels
         .into_iter()
-        .map(|label| WatchScope { label, rows: BTreeMap::new(), buffer: None, synced: false, error: None })
+        .map(|label| WatchScope {
+            label,
+            rows: BTreeMap::new(),
+            buffer: None,
+            synced: false,
+            error: None,
+        })
         .collect();
     let key = |k: &K| (k.namespace().unwrap_or_default(), k.name_any());
     let mut deadline: Option<tokio::time::Instant> = None;
@@ -223,7 +234,10 @@ pub async fn watch_rows<K, R>(
                 false
             }
             Ok(watcher::Event::InitApply(k)) => {
-                scope.buffer.get_or_insert_default().insert(key(&k), to_row(&k));
+                scope
+                    .buffer
+                    .get_or_insert_default()
+                    .insert(key(&k), to_row(&k));
                 false
             }
             Ok(watcher::Event::InitDone) => {
@@ -419,7 +433,11 @@ pub fn pod_row(p: &Pod) -> PodRow {
         let no_init = Vec::new();
         let groups = [
             (&spec.containers, &statuses, false),
-            (spec.init_containers.as_ref().unwrap_or(&no_init), &init_statuses, true),
+            (
+                spec.init_containers.as_ref().unwrap_or(&no_init),
+                &init_statuses,
+                true,
+            ),
         ];
         for (specs, statuses, init) in groups {
             for c in specs {
@@ -436,7 +454,9 @@ pub fn pod_row(p: &Pod) -> PodRow {
                         .map(|t| {
                             let reason = t.reason.clone().unwrap_or_else(|| "Terminated".into());
                             match &t.finished_at {
-                                Some(f) => format!("{reason} (exit {}) {} ago", t.exit_code, age(Some(f))),
+                                Some(f) => {
+                                    format!("{reason} (exit {}) {} ago", t.exit_code, age(Some(f)))
+                                }
                                 None => format!("{reason} (exit {})", t.exit_code),
                             }
                         })
@@ -472,14 +492,22 @@ pub fn pod_row(p: &Pod) -> PodRow {
             .find(|o| o.controller == Some(true))
             .map(|o| format!("{}/{}", o.kind, o.name))
             .unwrap_or_default(),
-        labels: p.labels().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        labels: p
+            .labels()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         containers,
         ports,
     }
 }
 
 /// One-shot list of any namespaced kind, mapped to rows and sorted by (namespace, name).
-pub async fn list_rows<K, R>(client: Client, ns: Option<String>, to_row: fn(&K) -> R) -> Result<Vec<R>>
+pub async fn list_rows<K, R>(
+    client: Client,
+    ns: Option<String>,
+    to_row: fn(&K) -> R,
+) -> Result<Vec<R>>
 where
     K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug,
     <K as kube::Resource>::DynamicType: Default,
@@ -502,7 +530,6 @@ pub async fn list_pods(client: Client, ns: Option<String>) -> Result<Vec<PodRow>
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Ok(rows)
 }
-
 
 pub struct LogOptions {
     pub container: String,
@@ -812,7 +839,12 @@ pub async fn list_deployments(client: Client, ns: Option<String>) -> Result<Vec<
     Ok(rows)
 }
 
-async fn merge_patch<K>(client: Client, ns: &str, name: &str, patch: serde_json::Value) -> Result<()>
+async fn merge_patch<K>(
+    client: Client,
+    ns: &str,
+    name: &str,
+    patch: serde_json::Value,
+) -> Result<()>
 where
     K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug,
     <K as kube::Resource>::DynamicType: Default,
@@ -823,13 +855,21 @@ where
     Ok(())
 }
 
-pub async fn scale(client: Client, kind: Kind, ns: String, name: String, replicas: i32) -> Result<()> {
+pub async fn scale(
+    client: Client,
+    kind: Kind,
+    ns: String,
+    name: String,
+    replicas: i32,
+) -> Result<()> {
     let patch = json!({ "spec": { "replicas": replicas } });
     match kind {
         Kind::Deployment => merge_patch::<Deployment>(client, &ns, &name, patch).await,
         Kind::StatefulSet => merge_patch::<StatefulSet>(client, &ns, &name, patch).await,
         Kind::ReplicaSet => merge_patch::<ReplicaSet>(client, &ns, &name, patch).await,
-        Kind::ReplicationController => merge_patch::<ReplicationController>(client, &ns, &name, patch).await,
+        Kind::ReplicationController => {
+            merge_patch::<ReplicationController>(client, &ns, &name, patch).await
+        }
         _ => Err(anyhow!("{} can't be scaled", kind.label())),
     }
 }
@@ -887,7 +927,12 @@ pub async fn run_shell(
     let mut resize = proc.terminal_size();
     let status = proc.take_status();
     if let Some(r) = resize.as_mut() {
-        let _ = r.send(TerminalSize { width: size.0, height: size.1 }).await;
+        let _ = r
+            .send(TerminalSize {
+                width: size.0,
+                height: size.1,
+            })
+            .await;
     }
 
     let mut buf = vec![0u8; 16 * 1024];
@@ -918,9 +963,12 @@ pub async fn run_shell(
         Some(s) => s.await,
         None => None,
     };
-    Ok(status.filter(|s| s.status.as_deref() == Some("Failure")).map(|s| {
-        s.message.unwrap_or_else(|| "the shell exited with an error".into())
-    }))
+    Ok(status
+        .filter(|s| s.status.as_deref() == Some("Failure"))
+        .map(|s| {
+            s.message
+                .unwrap_or_else(|| "the shell exited with an error".into())
+        }))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +981,9 @@ where
     <K as kube::Resource>::DynamicType: Default,
 {
     // Background propagation, like kubectl: the API's own default for jobs orphans their pods.
-    Api::<K>::namespaced(client, ns).delete(name, &DeleteParams::background()).await?;
+    Api::<K>::namespaced(client, ns)
+        .delete(name, &DeleteParams::background())
+        .await?;
     Ok(())
 }
 
@@ -945,14 +995,22 @@ pub async fn delete(client: Client, kind: Kind, ns: String, name: String) -> Res
         Kind::DaemonSet => delete_one::<DaemonSet>(client, &ns, &name).await,
         Kind::StatefulSet => delete_one::<StatefulSet>(client, &ns, &name).await,
         Kind::ReplicaSet => delete_one::<ReplicaSet>(client, &ns, &name).await,
-        Kind::ReplicationController => delete_one::<ReplicationController>(client, &ns, &name).await,
+        Kind::ReplicationController => {
+            delete_one::<ReplicationController>(client, &ns, &name).await
+        }
         Kind::Job => delete_one::<Job>(client, &ns, &name).await,
         Kind::CronJob => delete_one::<CronJob>(client, &ns, &name).await,
     }
 }
 
 /// Suspends or resumes a cron job (no new runs) or a job (its pods are stopped).
-pub async fn set_suspend(client: Client, kind: Kind, ns: String, name: String, suspend: bool) -> Result<()> {
+pub async fn set_suspend(
+    client: Client,
+    kind: Kind,
+    ns: String,
+    name: String,
+    suspend: bool,
+) -> Result<()> {
     let patch = json!({ "spec": { "suspend": suspend } });
     match kind {
         Kind::CronJob => merge_patch::<CronJob>(client, &ns, &name, patch).await,
@@ -968,7 +1026,9 @@ pub async fn set_paused(client: Client, ns: String, name: String, paused: bool) 
 
 /// Runs a cron job now, like `kubectl create job --from=cronjob/<name>`. Returns the job's name.
 pub async fn trigger_cronjob(client: Client, ns: String, name: String) -> Result<String> {
-    let cron = Api::<CronJob>::namespaced(client.clone(), &ns).get(&name).await?;
+    let cron = Api::<CronJob>::namespaced(client.clone(), &ns)
+        .get(&name)
+        .await?;
     let template = cron.spec.job_template;
     // Job names are DNS labels (63 chars); keep the suffix and trim the cron job's name.
     let suffix = format!("-manual-{}", Timestamp::now().as_second() % 1_000_000);
@@ -984,43 +1044,60 @@ pub async fn trigger_cronjob(client: Client, ns: String, name: String) -> Result
             labels: tmeta.labels,
             annotations: Some(annotations),
             // Owned by the cron job, so it shows up (and is cleaned up) with its runs.
-            owner_references: Some(vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                api_version: "batch/v1".into(),
-                kind: "CronJob".into(),
-                name: name.clone(),
-                uid: cron.metadata.uid.clone().unwrap_or_default(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            owner_references: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "batch/v1".into(),
+                    kind: "CronJob".into(),
+                    name: name.clone(),
+                    uid: cron.metadata.uid.clone().unwrap_or_default(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                },
+            ]),
             ..Default::default()
         },
         spec: template.spec,
         status: None,
     };
-    Api::<Job>::namespaced(client, &ns).create(&PostParams::default(), &job).await?;
+    Api::<Job>::namespaced(client, &ns)
+        .create(&PostParams::default(), &job)
+        .await?;
     Ok(job_name)
 }
 
 async fn create_one<K>(client: Client, ns: &str, value: serde_json::Value) -> Result<String>
 where
-    K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug + serde::Serialize,
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + serde::Serialize,
     <K as kube::Resource>::DynamicType: Default,
 {
     let obj: K = serde_json::from_value(value).context("the YAML doesn't match its kind")?;
-    let created = Api::<K>::namespaced(client, ns).create(&PostParams::default(), &obj).await?;
+    let created = Api::<K>::namespaced(client, ns)
+        .create(&PostParams::default(), &obj)
+        .await?;
     Ok(created.name_any())
 }
 
 /// Creates an object from YAML, like `kubectl create -f`. The kind comes from the YAML;
 /// the namespace too, falling back to `default_ns`. Returns (kind, namespace, name).
-pub async fn create_yaml(client: Client, default_ns: String, yaml: String) -> Result<(Kind, String, String)> {
+pub async fn create_yaml(
+    client: Client,
+    default_ns: String,
+    yaml: String,
+) -> Result<(Kind, String, String)> {
     let mut value: serde_json::Value = serde_yaml::from_str(&yaml).context("invalid YAML")?;
     let kind_name = value["kind"].as_str().unwrap_or_default().to_string();
     let kind = Kind::from_label(&kind_name).ok_or_else(|| {
         let known = Kind::ALL.map(Kind::label).join(", ");
         anyhow!("kind {kind_name:?} isn't supported here (use one of: {known})")
     })?;
-    let ns = value["metadata"]["namespace"].as_str().map(str::to_string).unwrap_or(default_ns);
+    let ns = value["metadata"]["namespace"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(default_ns);
     if !value["metadata"].is_object() {
         return Err(anyhow!("metadata is missing"));
     }
@@ -1032,7 +1109,9 @@ pub async fn create_yaml(client: Client, default_ns: String, yaml: String) -> Re
         Kind::DaemonSet => create_one::<DaemonSet>(client, &ns, value).await?,
         Kind::StatefulSet => create_one::<StatefulSet>(client, &ns, value).await?,
         Kind::ReplicaSet => create_one::<ReplicaSet>(client, &ns, value).await?,
-        Kind::ReplicationController => create_one::<ReplicationController>(client, &ns, value).await?,
+        Kind::ReplicationController => {
+            create_one::<ReplicationController>(client, &ns, value).await?
+        }
         Kind::Job => create_one::<Job>(client, &ns, value).await?,
         Kind::CronJob => create_one::<CronJob>(client, &ns, value).await?,
     };
@@ -1097,23 +1176,42 @@ pub fn template(kind: Kind, ns: &str) -> String {
     }
 }
 
-async fn replace_one<K>(client: Client, ns: &str, name: &str, value: serde_json::Value) -> Result<()>
+async fn replace_one<K>(
+    client: Client,
+    ns: &str,
+    name: &str,
+    value: serde_json::Value,
+) -> Result<()>
 where
-    K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug + serde::Serialize,
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + serde::Serialize,
     <K as kube::Resource>::DynamicType: Default,
 {
     let obj: K = serde_json::from_value(value).context("the YAML doesn't match this kind")?;
-    Api::<K>::namespaced(client, ns).replace(name, &PostParams::default(), &obj).await?;
+    Api::<K>::namespaced(client, ns)
+        .replace(name, &PostParams::default(), &obj)
+        .await?;
     Ok(())
 }
 
 /// Saves an edited object (a full replace). The `resourceVersion` in the YAML makes the
 /// API refuse the write if someone else changed the object since it was loaded.
-pub async fn apply_yaml(client: Client, kind: Kind, ns: String, name: String, yaml: String) -> Result<()> {
+pub async fn apply_yaml(
+    client: Client,
+    kind: Kind,
+    ns: String,
+    name: String,
+    yaml: String,
+) -> Result<()> {
     let value: serde_json::Value = serde_yaml::from_str(&yaml).context("invalid YAML")?;
     let meta = &value["metadata"];
     if meta["name"].as_str() != Some(name.as_str()) {
-        return Err(anyhow!("metadata.name must stay {name:?}; create a copy with kubectl instead"));
+        return Err(anyhow!(
+            "metadata.name must stay {name:?}; create a copy with kubectl instead"
+        ));
     }
     if meta["namespace"].as_str().is_some_and(|n| n != ns) {
         return Err(anyhow!("metadata.namespace must stay {ns:?}"));
@@ -1128,7 +1226,9 @@ pub async fn apply_yaml(client: Client, kind: Kind, ns: String, name: String, ya
         Kind::DaemonSet => replace_one::<DaemonSet>(client, &ns, &name, value).await,
         Kind::StatefulSet => replace_one::<StatefulSet>(client, &ns, &name, value).await,
         Kind::ReplicaSet => replace_one::<ReplicaSet>(client, &ns, &name, value).await,
-        Kind::ReplicationController => replace_one::<ReplicationController>(client, &ns, &name, value).await,
+        Kind::ReplicationController => {
+            replace_one::<ReplicationController>(client, &ns, &name, value).await
+        }
         Kind::Job => replace_one::<Job>(client, &ns, &name, value).await,
         Kind::CronJob => replace_one::<CronJob>(client, &ns, &name, value).await,
     }
@@ -1199,7 +1299,10 @@ impl Kind {
     }
 
     pub fn scalable(self) -> bool {
-        matches!(self, Kind::Deployment | Kind::StatefulSet | Kind::ReplicaSet | Kind::ReplicationController)
+        matches!(
+            self,
+            Kind::Deployment | Kind::StatefulSet | Kind::ReplicaSet | Kind::ReplicationController
+        )
     }
 
     pub fn restartable(self) -> bool {
@@ -1209,14 +1312,25 @@ impl Kind {
 
 async fn get_value<K>(client: Client, ns: &str, name: &str) -> Result<serde_json::Value>
 where
-    K: kube::Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug + serde::Serialize,
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + Debug
+        + serde::Serialize,
     <K as kube::Resource>::DynamicType: Default,
 {
-    Ok(serde_json::to_value(Api::<K>::namespaced(client, ns).get(name).await?)?)
+    Ok(serde_json::to_value(
+        Api::<K>::namespaced(client, ns).get(name).await?,
+    )?)
 }
 
 /// The object as JSON, for any supported kind.
-pub async fn get_object(client: Client, kind: Kind, ns: &str, name: &str) -> Result<serde_json::Value> {
+pub async fn get_object(
+    client: Client,
+    kind: Kind,
+    ns: &str,
+    name: &str,
+) -> Result<serde_json::Value> {
     match kind {
         Kind::Pod => get_value::<Pod>(client, ns, name).await,
         Kind::Service => get_value::<Service>(client, ns, name).await,
@@ -1264,12 +1378,19 @@ pub enum PfEvent {
 
 /// Resolves a forward target to a concrete pod name and container port.
 /// For services this picks a ready pod behind the selector and maps `targetPort`.
-async fn resolve_target(client: &Client, ns: &str, target: &PfTarget, port: u16) -> Result<(String, u16)> {
+async fn resolve_target(
+    client: &Client,
+    ns: &str,
+    target: &PfTarget,
+    port: u16,
+) -> Result<(String, u16)> {
     let name = match target {
         PfTarget::Pod(name) => return Ok((name.clone(), port)),
         PfTarget::Service(name) => name,
     };
-    let svc = Api::<Service>::namespaced(client.clone(), ns).get(name).await?;
+    let svc = Api::<Service>::namespaced(client.clone(), ns)
+        .get(name)
+        .await?;
     let spec = svc.spec.context("service has no spec")?;
     let selector = spec
         .selector
@@ -1355,7 +1476,10 @@ pub async fn port_forward(
                 let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
                 drop(upstream);
                 // Surfaces errors the kubelet reports, e.g. nothing listening on the port.
-                forwarder.join().await.with_context(|| format!("pod/{pod}:{port}"))
+                forwarder
+                    .join()
+                    .await
+                    .with_context(|| format!("pod/{pod}:{port}"))
             }
             .await;
             connections.fetch_sub(1, Ordering::Relaxed);
@@ -1454,11 +1578,24 @@ impl WorkRow {
 /// Column titles and widths for each workload kind's table (after Name, before Age).
 pub fn columns(kind: Kind) -> &'static [(&'static str, f32)] {
     match kind {
-        Kind::DaemonSet => &[("Desired", 68.0), ("Current", 68.0), ("Ready", 60.0), ("Up-to-date", 84.0), ("Available", 76.0)],
+        Kind::DaemonSet => &[
+            ("Desired", 68.0),
+            ("Current", 68.0),
+            ("Ready", 60.0),
+            ("Up-to-date", 84.0),
+            ("Available", 76.0),
+        ],
         Kind::StatefulSet => &[("Ready", 72.0), ("Up-to-date", 84.0)],
-        Kind::ReplicaSet | Kind::ReplicationController => &[("Desired", 68.0), ("Current", 68.0), ("Ready", 60.0)],
+        Kind::ReplicaSet | Kind::ReplicationController => {
+            &[("Desired", 68.0), ("Current", 68.0), ("Ready", 60.0)]
+        }
         Kind::Job => &[("Status", 96.0), ("Completions", 96.0), ("Duration", 76.0)],
-        Kind::CronJob => &[("Schedule", 130.0), ("Suspend", 70.0), ("Active", 56.0), ("Last run", 76.0)],
+        Kind::CronJob => &[
+            ("Schedule", 130.0),
+            ("Suspend", 70.0),
+            ("Active", 56.0),
+            ("Last run", 76.0),
+        ],
         _ => &[],
     }
 }
@@ -1467,17 +1604,29 @@ fn n(v: i32) -> Cell {
     Cell::Text(v.to_string())
 }
 
-fn match_labels(sel: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector>) -> String {
-    sel.and_then(|s| s.match_labels.as_ref()).map(join_labels).unwrap_or_default()
+fn match_labels(
+    sel: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector>,
+) -> String {
+    sel.and_then(|s| s.match_labels.as_ref())
+        .map(join_labels)
+        .unwrap_or_default()
 }
 
 fn join_labels(m: &std::collections::BTreeMap<String, String>) -> String {
-    m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",")
+    m.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn template_images(t: Option<&k8s_openapi::api::core::v1::PodTemplateSpec>) -> Vec<String> {
     t.and_then(|t| t.spec.as_ref())
-        .map(|s| s.containers.iter().filter_map(|c| c.image.clone()).collect())
+        .map(|s| {
+            s.containers
+                .iter()
+                .filter_map(|c| c.image.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1543,9 +1692,26 @@ pub fn daemon_set_row(d: &DaemonSet) -> WorkRow {
         .map(join_labels)
         .unwrap_or_default();
     row.info = vec![
-        ("Strategy", d.spec.update_strategy.as_ref().and_then(|s| s.type_.clone()).unwrap_or_else(|| "RollingUpdate".into())),
-        ("Node selector", if node_selector.is_empty() { "-".into() } else { node_selector }),
-        ("Misscheduled", st.map(|s| s.number_misscheduled).unwrap_or(0).to_string()),
+        (
+            "Strategy",
+            d.spec
+                .update_strategy
+                .as_ref()
+                .and_then(|s| s.type_.clone())
+                .unwrap_or_else(|| "RollingUpdate".into()),
+        ),
+        (
+            "Node selector",
+            if node_selector.is_empty() {
+                "-".into()
+            } else {
+                node_selector
+            },
+        ),
+        (
+            "Misscheduled",
+            st.map(|s| s.number_misscheduled).unwrap_or(0).to_string(),
+        ),
     ];
     row
 }
@@ -1563,10 +1729,34 @@ pub fn stateful_set_row(s: &StatefulSet) -> WorkRow {
     row.selector = match_labels(Some(&s.spec.selector));
     row.images = template_images(Some(&s.spec.template));
     row.info = vec![
-        ("Service", s.spec.service_name.clone().unwrap_or_else(|| "-".into())),
-        ("Strategy", s.spec.update_strategy.as_ref().and_then(|s| s.type_.clone()).unwrap_or_else(|| "RollingUpdate".into())),
-        ("Pod management", s.spec.pod_management_policy.clone().unwrap_or_else(|| "OrderedReady".into())),
-        ("Volume claims", s.spec.volume_claim_templates.as_ref().map(Vec::len).unwrap_or(0).to_string()),
+        (
+            "Service",
+            s.spec.service_name.clone().unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Strategy",
+            s.spec
+                .update_strategy
+                .as_ref()
+                .and_then(|s| s.type_.clone())
+                .unwrap_or_else(|| "RollingUpdate".into()),
+        ),
+        (
+            "Pod management",
+            s.spec
+                .pod_management_policy
+                .clone()
+                .unwrap_or_else(|| "OrderedReady".into()),
+        ),
+        (
+            "Volume claims",
+            s.spec
+                .volume_claim_templates
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0)
+                .to_string(),
+        ),
     ];
     row
 }
@@ -1597,7 +1787,10 @@ pub fn replication_controller_row(r: &ReplicationController) -> WorkRow {
     row.summary = format!("Ready {ready}/{desired}");
     row.cells = vec![n(desired), n(current), n(ready)];
     row.replicas = Some(desired);
-    row.selector = spec.and_then(|s| s.selector.as_ref()).map(join_labels).unwrap_or_default();
+    row.selector = spec
+        .and_then(|s| s.selector.as_ref())
+        .map(join_labels)
+        .unwrap_or_default();
     row.images = template_images(spec.and_then(|s| s.template.as_ref()));
     row
 }
@@ -1655,8 +1848,14 @@ pub fn job_row(j: &Job) -> WorkRow {
         ("Active", active.to_string()),
         ("Succeeded", succeeded.to_string()),
         ("Failed", failed.to_string()),
-        ("Parallelism", spec.and_then(|s| s.parallelism).unwrap_or(1).to_string()),
-        ("Backoff limit", spec.and_then(|s| s.backoff_limit).unwrap_or(6).to_string()),
+        (
+            "Parallelism",
+            spec.and_then(|s| s.parallelism).unwrap_or(1).to_string(),
+        ),
+        (
+            "Backoff limit",
+            spec.and_then(|s| s.backoff_limit).unwrap_or(6).to_string(),
+        ),
     ];
     row
 }
@@ -1664,7 +1863,10 @@ pub fn job_row(j: &Job) -> WorkRow {
 pub fn cron_job_row(c: &CronJob) -> WorkRow {
     let st = c.status.as_ref();
     let suspended = c.spec.suspend.unwrap_or(false);
-    let active = st.and_then(|s| s.active.as_ref()).map(Vec::len).unwrap_or(0);
+    let active = st
+        .and_then(|s| s.active.as_ref())
+        .map(Vec::len)
+        .unwrap_or(0);
     let mut row = base(Kind::CronJob, c);
     row.suspended = Some(suspended);
     row.health = if suspended {
@@ -1674,7 +1876,11 @@ pub fn cron_job_row(c: &CronJob) -> WorkRow {
     } else {
         Health::Ok
     };
-    row.summary = if suspended { "Suspended".into() } else { format!("Scheduled · {}", c.spec.schedule) };
+    row.summary = if suspended {
+        "Suspended".into()
+    } else {
+        format!("Scheduled · {}", c.spec.schedule)
+    };
     row.cells = vec![
         Cell::Text(c.spec.schedule.clone()),
         Cell::Text(if suspended { "Yes" } else { "No" }.into()),
@@ -1684,20 +1890,42 @@ pub fn cron_job_row(c: &CronJob) -> WorkRow {
     let job_spec = c.spec.job_template.spec.as_ref();
     row.images = template_images(job_spec.map(|s| &s.template));
     row.info = vec![
-        ("Time zone", c.spec.time_zone.clone().unwrap_or_else(|| "Controller local".into())),
-        ("Concurrency", c.spec.concurrency_policy.clone().unwrap_or_else(|| "Allow".into())),
-        ("Last success", age(st.and_then(|s| s.last_successful_time.as_ref()))),
-        ("History", format!(
-            "{} ok / {} failed",
-            c.spec.successful_jobs_history_limit.unwrap_or(3),
-            c.spec.failed_jobs_history_limit.unwrap_or(1)
-        )),
+        (
+            "Time zone",
+            c.spec
+                .time_zone
+                .clone()
+                .unwrap_or_else(|| "Controller local".into()),
+        ),
+        (
+            "Concurrency",
+            c.spec
+                .concurrency_policy
+                .clone()
+                .unwrap_or_else(|| "Allow".into()),
+        ),
+        (
+            "Last success",
+            age(st.and_then(|s| s.last_successful_time.as_ref())),
+        ),
+        (
+            "History",
+            format!(
+                "{} ok / {} failed",
+                c.spec.successful_jobs_history_limit.unwrap_or(3),
+                c.spec.failed_jobs_history_limit.unwrap_or(1)
+            ),
+        ),
     ];
     row
 }
 
 /// Lists one workload kind (one-shot).
-pub async fn list_workloads(client: Client, kind: Kind, ns: Option<String>) -> Result<Vec<WorkRow>> {
+pub async fn list_workloads(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+) -> Result<Vec<WorkRow>> {
     match kind {
         Kind::DaemonSet => list_rows(client, ns, daemon_set_row).await,
         Kind::StatefulSet => list_rows(client, ns, stateful_set_row).await,
@@ -1720,7 +1948,9 @@ pub async fn watch_workloads(
         Kind::DaemonSet => watch_rows(client, namespaces, daemon_set_row, emit).await,
         Kind::StatefulSet => watch_rows(client, namespaces, stateful_set_row, emit).await,
         Kind::ReplicaSet => watch_rows(client, namespaces, replica_set_row, emit).await,
-        Kind::ReplicationController => watch_rows(client, namespaces, replication_controller_row, emit).await,
+        Kind::ReplicationController => {
+            watch_rows(client, namespaces, replication_controller_row, emit).await
+        }
         Kind::Job => watch_rows(client, namespaces, job_row, emit).await,
         Kind::CronJob => watch_rows(client, namespaces, cron_job_row, emit).await,
         _ => {}
@@ -1759,7 +1989,12 @@ mod describe_tests {
     use super::*;
 
     fn status(code: u16, message: &str) -> anyhow::Error {
-        let s = kube::core::Status { code, message: message.into(), reason: "Forbidden".into(), ..Default::default() };
+        let s = kube::core::Status {
+            code,
+            message: message.into(),
+            reason: "Forbidden".into(),
+            ..Default::default()
+        };
         anyhow::Error::from(kube::Error::Api(Box::new(s)))
     }
 
@@ -1781,6 +2016,9 @@ mod describe_tests {
             403,
             r#"deployments.apps is forbidden: User "alice" cannot list resource "deployments" in API group "apps" at the cluster scope"#,
         );
-        assert_eq!(describe_error(&e), "No permission to list deployments.apps across the cluster. Signed in as alice.");
+        assert_eq!(
+            describe_error(&e),
+            "No permission to list deployments.apps across the cluster. Signed in as alice."
+        );
     }
 }

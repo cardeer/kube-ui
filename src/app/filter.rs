@@ -28,7 +28,11 @@ impl Matcher {
         self.kind = if filter.is_empty() {
             MatchKind::All
         } else if regex {
-            match regex::RegexBuilder::new(filter).case_insensitive(true).size_limit(1 << 20).build() {
+            match regex::RegexBuilder::new(filter)
+                .case_insensitive(true)
+                .size_limit(1 << 20)
+                .build()
+            {
                 Ok(re) => MatchKind::Regex(re),
                 Err(e) => {
                     self.error = Some(e.to_string());

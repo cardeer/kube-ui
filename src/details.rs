@@ -37,9 +37,15 @@ pub struct EventRow {
 pub enum EnvSource {
     Literal,
     /// Resolved from a ConfigMap (value filled in when readable).
-    ConfigMap { name: String, key: String },
+    ConfigMap {
+        name: String,
+        key: String,
+    },
     /// Secret values are never fetched until the user asks to reveal them.
-    Secret { name: String, key: String },
+    Secret {
+        name: String,
+        key: String,
+    },
     Field(String),
     Resource(String),
 }
@@ -138,12 +144,18 @@ pub async fn fetch(client: Client, kind: Kind, ns: String, name: String) -> Resu
         Kind::Deployment => Body::Deployment(deployment_details(&client, &ns, &name).await?),
         _ => Body::Workload(workload_details(&client, kind, &ns, &name).await?),
     };
-    let events = events(&client, &ns, kind.label(), &name).await.map_err(|e| format!("{e:#}"));
+    let events = events(&client, &ns, kind.label(), &name)
+        .await
+        .map_err(|e| format!("{e:#}"));
     Ok(Details { body, events })
 }
 
 /// Reads a secret's decoded values, for the "reveal" button.
-pub async fn read_secret(client: Client, ns: String, name: String) -> Result<BTreeMap<String, String>> {
+pub async fn read_secret(
+    client: Client,
+    ns: String,
+    name: String,
+) -> Result<BTreeMap<String, String>> {
     let secret = Api::<Secret>::namespaced(client, &ns).get(&name).await?;
     Ok(secret
         .data
@@ -165,7 +177,10 @@ fn conditions_ok(status: &str) -> bool {
 async fn events(client: &Client, ns: &str, kind: &str, name: &str) -> Result<Vec<EventRow>> {
     let api: Api<Event> = Api::namespaced(client.clone(), ns);
     let selector = format!("involvedObject.kind={kind},involvedObject.name={name}");
-    let mut items = api.list(&ListParams::default().fields(&selector)).await?.items;
+    let mut items = api
+        .list(&ListParams::default().fields(&selector))
+        .await?
+        .items;
     let last_seen = |e: &Event| {
         e.last_timestamp
             .as_ref()
@@ -197,9 +212,17 @@ async fn pod_details(client: &Client, ns: &str, name: &str) -> Result<PodDetails
 
     // Resolve ConfigMap-backed env vars. Unreadable ConfigMaps just leave values unresolved.
     let mut config_map_names = BTreeSet::new();
-    for c in spec.containers.iter().chain(spec.init_containers.iter().flatten()) {
+    for c in spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+    {
         for e in c.env.iter().flatten() {
-            if let Some(r) = e.value_from.as_ref().and_then(|v| v.config_map_key_ref.as_ref()) {
+            if let Some(r) = e
+                .value_from
+                .as_ref()
+                .and_then(|v| v.config_map_key_ref.as_ref())
+            {
                 config_map_names.insert(r.name.clone());
             }
         }
@@ -270,7 +293,11 @@ async fn pod_details(client: &Client, ns: &str, name: &str) -> Result<PodDetails
         service_account: spec.service_account_name.clone().unwrap_or_default(),
         restart_policy: spec.restart_policy.clone().unwrap_or_default(),
         host_ip: status.host_ip.clone().unwrap_or_default(),
-        started: status.start_time.as_ref().map(|t| format!("{} ago", age(Some(t)))).unwrap_or_default(),
+        started: status
+            .start_time
+            .as_ref()
+            .map(|t| format!("{} ago", age(Some(t))))
+            .unwrap_or_default(),
         priority_class: spec.priority_class_name.clone().unwrap_or_default(),
         node_selector: spec
             .node_selector
@@ -311,12 +338,18 @@ fn container_details(
                 Some(data) => env.extend(data.iter().map(|(k, v)| EnvRow {
                     name: format!("{prefix}{k}"),
                     value: Some(v.clone()),
-                    source: EnvSource::ConfigMap { name: r.name.clone(), key: k.clone() },
+                    source: EnvSource::ConfigMap {
+                        name: r.name.clone(),
+                        key: k.clone(),
+                    },
                 })),
                 None => env.push(EnvRow {
                     name: format!("{prefix}*"),
                     value: None,
-                    source: EnvSource::ConfigMap { name: r.name.clone(), key: "*".into() },
+                    source: EnvSource::ConfigMap {
+                        name: r.name.clone(),
+                        key: "*".into(),
+                    },
                 }),
             }
         }
@@ -326,13 +359,31 @@ fn container_details(
     }
     for e in c.env.iter().flatten() {
         let (value, source) = match &e.value_from {
-            None => (Some(e.value.clone().unwrap_or_default()), EnvSource::Literal),
+            None => (
+                Some(e.value.clone().unwrap_or_default()),
+                EnvSource::Literal,
+            ),
             Some(from) => {
                 if let Some(r) = &from.config_map_key_ref {
-                    let value = config_maps.get(&r.name).and_then(|d| d.get(&r.key)).cloned();
-                    (value, EnvSource::ConfigMap { name: r.name.clone(), key: r.key.clone() })
+                    let value = config_maps
+                        .get(&r.name)
+                        .and_then(|d| d.get(&r.key))
+                        .cloned();
+                    (
+                        value,
+                        EnvSource::ConfigMap {
+                            name: r.name.clone(),
+                            key: r.key.clone(),
+                        },
+                    )
                 } else if let Some(r) = &from.secret_key_ref {
-                    (None, EnvSource::Secret { name: r.name.clone(), key: r.key.clone() })
+                    (
+                        None,
+                        EnvSource::Secret {
+                            name: r.name.clone(),
+                            key: r.key.clone(),
+                        },
+                    )
                 } else if let Some(r) = &from.field_ref {
                     (None, EnvSource::Field(r.field_path.clone()))
                 } else if let Some(r) = &from.resource_field_ref {
@@ -343,13 +394,18 @@ fn container_details(
             }
         };
         env.retain(|row| row.name != e.name);
-        env.push(EnvRow { name: e.name.clone(), value, source });
+        env.push(EnvRow {
+            name: e.name.clone(),
+            value,
+            source,
+        });
     }
 
-    let quantities = |m: Option<&BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>| {
-        m.map(|m| m.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect())
-            .unwrap_or_default()
-    };
+    let quantities =
+        |m: Option<&BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>| {
+            m.map(|m| m.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect())
+                .unwrap_or_default()
+        };
     let resources = c.resources.as_ref();
 
     let mut probes = Vec::new();
@@ -371,7 +427,10 @@ fn container_details(
                 "{} (exit {}) {}",
                 t.reason.clone().unwrap_or_else(|| "Terminated".into()),
                 t.exit_code,
-                t.finished_at.as_ref().map(|f| format!("{} ago", age(Some(f)))).unwrap_or_default()
+                t.finished_at
+                    .as_ref()
+                    .map(|f| format!("{} ago", age(Some(f))))
+                    .unwrap_or_default()
             )
         })
         .unwrap_or_default();
@@ -455,7 +514,9 @@ fn describe_probe(p: &Probe) -> String {
 // ---------------------------------------------------------------------------
 
 async fn service_details(client: &Client, ns: &str, name: &str) -> Result<ServiceDetails> {
-    let svc = Api::<Service>::namespaced(client.clone(), ns).get(name).await?;
+    let svc = Api::<Service>::namespaced(client.clone(), ns)
+        .get(name)
+        .await?;
     let spec = svc.spec.clone().unwrap_or_default();
 
     let mut endpoint_ports = BTreeSet::new();
@@ -467,7 +528,11 @@ async fn service_details(client: &Client, ns: &str, name: &str) -> Result<Servic
         Ok(slices) => {
             for slice in &slices.items {
                 for p in slice.ports.iter().flatten() {
-                    endpoint_ports.insert(port_label(p.name.as_deref(), p.port, p.protocol.as_deref()));
+                    endpoint_ports.insert(port_label(
+                        p.name.as_deref(),
+                        p.port,
+                        p.protocol.as_deref(),
+                    ));
                 }
                 for e in slice.endpoints.iter().flatten() {
                     let target = e.target_ref.as_ref().map(target_label).unwrap_or_default();
@@ -485,12 +550,21 @@ async fn service_details(client: &Client, ns: &str, name: &str) -> Result<Servic
         // Some RBAC setups grant the legacy Endpoints API but not EndpointSlices.
         Err(_) => {
             #[allow(deprecated)]
-            let legacy = Api::<Endpoints>::namespaced(client.clone(), ns).get_opt(name).await?;
+            let legacy = Api::<Endpoints>::namespaced(client.clone(), ns)
+                .get_opt(name)
+                .await?;
             for subset in legacy.iter().flat_map(|e| e.subsets.iter().flatten()) {
                 for p in subset.ports.iter().flatten() {
-                    endpoint_ports.insert(port_label(p.name.as_deref(), Some(p.port), p.protocol.as_deref()));
+                    endpoint_ports.insert(port_label(
+                        p.name.as_deref(),
+                        Some(p.port),
+                        p.protocol.as_deref(),
+                    ));
                 }
-                let groups = [(&subset.addresses, true), (&subset.not_ready_addresses, false)];
+                let groups = [
+                    (&subset.addresses, true),
+                    (&subset.not_ready_addresses, false),
+                ];
                 for (addresses, ready) in groups {
                     for a in addresses.iter().flatten() {
                         endpoints.push(EndpointRow {
@@ -507,7 +581,10 @@ async fn service_details(client: &Client, ns: &str, name: &str) -> Result<Servic
     endpoints.sort_by(|a, b| (!a.ready, &a.target).cmp(&(!b.ready, &b.target)));
 
     Ok(ServiceDetails {
-        session_affinity: spec.session_affinity.clone().unwrap_or_else(|| "None".into()),
+        session_affinity: spec
+            .session_affinity
+            .clone()
+            .unwrap_or_else(|| "None".into()),
         external_traffic_policy: spec.external_traffic_policy.clone().unwrap_or_default(),
         internal_traffic_policy: spec.internal_traffic_policy.clone().unwrap_or_default(),
         ip_families: spec.ip_families.clone().unwrap_or_default().join(", "),
@@ -540,7 +617,9 @@ fn target_label(r: &k8s_openapi::api::core::v1::ObjectReference) -> String {
 // ---------------------------------------------------------------------------
 
 async fn deployment_details(client: &Client, ns: &str, name: &str) -> Result<DeploymentDetails> {
-    let d = Api::<Deployment>::namespaced(client.clone(), ns).get(name).await?;
+    let d = Api::<Deployment>::namespaced(client.clone(), ns)
+        .get(name)
+        .await?;
     Ok(DeploymentDetails {
         paused: d.spec.paused.unwrap_or(false),
         min_ready_seconds: d.spec.min_ready_seconds.unwrap_or(0),
@@ -567,18 +646,26 @@ async fn deployment_details(client: &Client, ns: &str, name: &str) -> Result<Dep
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // Other workloads
 // ---------------------------------------------------------------------------
 
 /// Read from the object's JSON so one function covers every workload kind.
-async fn workload_details(client: &Client, kind: Kind, ns: &str, name: &str) -> Result<WorkloadDetails> {
+async fn workload_details(
+    client: &Client,
+    kind: Kind,
+    ns: &str,
+    name: &str,
+) -> Result<WorkloadDetails> {
     let v = crate::kube_ops::get_object(client.clone(), kind, ns, name).await?;
     let str_map = |key: &str| -> Vec<(String, String)> {
         v["metadata"][key]
             .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let text = |c: &serde_json::Value, key: &str| c[key].as_str().unwrap_or_default().to_string();

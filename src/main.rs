@@ -50,7 +50,11 @@ fn inherit_shell_path() {
         return;
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if let Some(path) = stdout.rsplit("__KUBE_UI_PATH__").next().filter(|p| !p.is_empty() && stdout.contains("__KUBE_UI_PATH__")) {
+    if let Some(path) = stdout
+        .rsplit("__KUBE_UI_PATH__")
+        .next()
+        .filter(|p| !p.is_empty() && stdout.contains("__KUBE_UI_PATH__"))
+    {
         // SAFETY: called first thing in main, before any other threads exist.
         unsafe { std::env::set_var("PATH", path.trim()) };
     }

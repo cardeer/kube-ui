@@ -31,10 +31,19 @@ pub struct EditorOutput {
 
 /// An editable YAML editor. `error_line` (1-based) is marked in the gutter.
 /// `start` puts the cursor at the top and focuses the editor (when editing begins).
-pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_line: Option<usize>, start: bool, find: &mut Find) -> EditorOutput {
+pub fn yaml_editor(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &mut String,
+    error_line: Option<usize>,
+    start: bool,
+    find: &mut Find,
+) -> EditorOutput {
     if start {
         let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
-        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(0))));
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(0))));
         state.store(ui.ctx(), id);
         ui.memory_mut(|m| m.request_focus(id));
     }
@@ -55,7 +64,10 @@ pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_lin
         save = cmd_s;
         if enter || tab || untab || comment {
             let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
-            let range = state.cursor.char_range().unwrap_or_else(|| CCursorRange::one(CCursor::new(text.chars().count())));
+            let range = state
+                .cursor
+                .char_range()
+                .unwrap_or_else(|| CCursorRange::one(CCursor::new(text.chars().count())));
             let new_range = if enter {
                 Some(newline_with_indent(text, range))
             } else if comment {
@@ -71,7 +83,10 @@ pub fn yaml_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, error_lin
         }
     }
     let out = show(ui, id, text, true, error_line, find);
-    EditorOutput { changed: changed || out, save }
+    EditorOutput {
+        changed: changed || out,
+        save,
+    }
 }
 
 /// The same editor, read-only (selectable, copyable).
@@ -80,13 +95,25 @@ pub fn yaml_viewer(ui: &mut egui::Ui, id: egui::Id, text: &str, find: &mut Find)
     show(ui, id, &mut s, false, None, find);
 }
 
-fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: bool, error_line: Option<usize>, find: &mut Find) -> bool {
+fn show(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    buffer: &mut dyn TextBuffer,
+    editable: bool,
+    error_line: Option<usize>,
+    find: &mut Find,
+) -> bool {
     find.update(buffer.as_str());
-    let reveal = std::mem::take(&mut find.reveal).then(|| find.current_match()).flatten();
+    let reveal = std::mem::take(&mut find.reveal)
+        .then(|| find.current_match())
+        .flatten();
     if let Some(m) = &reveal {
         // Select the current match so closing the bar leaves the cursor on it.
         let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
-        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(m.start), CCursor::new(m.end))));
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(m.start),
+            CCursor::new(m.end),
+        )));
         state.store(ui.ctx(), id);
     }
 
@@ -111,7 +138,12 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
         .code_editor()
         .frame(false)
         .interactive(true)
-        .margin(egui::Margin { left: gutter as i8, right: 12, top: 6, bottom: 6 })
+        .margin(egui::Margin {
+            left: gutter as i8,
+            right: 12,
+            top: 6,
+            bottom: 6,
+        })
         .desired_width(f32::INFINITY)
         .min_size(ui.available_size())
         .layouter(&mut layouter)
@@ -125,14 +157,26 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
     let row_right = rect.right().max(visible.right());
 
     // Which logical line holds the cursor.
-    let cursor_line = out.cursor_range.filter(|_| editable || out.response.has_focus()).map(|r| {
-        text.chars().take(r.primary.index).filter(|c| *c == '\n').count()
-    });
+    let cursor_line = out
+        .cursor_range
+        .filter(|_| editable || out.response.has_focus())
+        .map(|r| {
+            text.chars()
+                .take(r.primary.index)
+                .filter(|c| *c == '\n')
+                .count()
+        });
     let indents = line_indents(text);
 
     let mut shapes = Vec::new();
     // Gutter ground and its hairline.
-    let gutter_rect = Rect::from_min_max(rect.min, egui::pos2(rect.left() + gutter - 8.0, rect.bottom().max(visible.bottom())));
+    let gutter_rect = Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            rect.left() + gutter - 8.0,
+            rect.bottom().max(visible.bottom()),
+        ),
+    );
     shapes.push(Shape::rect_filled(gutter_rect, 0.0, theme::WELL));
     shapes.push(Shape::line_segment(
         [gutter_rect.right_top(), gutter_rect.right_bottom()],
@@ -147,7 +191,11 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
         if r.bottom() >= visible.top() && r.top() <= visible.bottom() {
             let band = Rect::from_x_y_ranges(row_left..=row_right, r.y_range());
             if error_line == Some(line + 1) {
-                shapes.push(Shape::rect_filled(band, 0.0, theme::BAD.gamma_multiply(0.14)));
+                shapes.push(Shape::rect_filled(
+                    band,
+                    0.0,
+                    theme::BAD.gamma_multiply(0.14),
+                ));
             } else if cursor_line == Some(line) {
                 shapes.push(Shape::rect_filled(band, 0.0, theme::FIELD));
             }
@@ -156,7 +204,10 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
             let mut col = 0;
             while col < indent {
                 let x = (out.galley_pos.x + col as f32 * char_w).round() + 0.5;
-                shapes.push(Shape::line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], Stroke::new(1.0, theme::BORDER_STRONG)));
+                shapes.push(Shape::line_segment(
+                    [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
+                    Stroke::new(1.0, theme::BORDER_STRONG),
+                ));
                 col += INDENT;
             }
             if first_row_of_line {
@@ -167,7 +218,11 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
                 } else {
                     theme::TEXT_FAINT
                 };
-                numbers.push((egui::pos2(rect.left() + gutter - GUTTER_PAD - 4.0, r.center().y), (line + 1).to_string(), color));
+                numbers.push((
+                    egui::pos2(rect.left() + gutter - GUTTER_PAD - 4.0, r.center().y),
+                    (line + 1).to_string(),
+                    color,
+                ));
             }
         }
         first_row_of_line = row.ends_with_newline;
@@ -185,7 +240,12 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
             }
             if current.as_ref() == Some(m) {
                 shapes.push(Shape::rect_filled(r, 2.0, theme::WARN.gamma_multiply(0.45)));
-                shapes.push(Shape::rect_stroke(r, 2.0, Stroke::new(1.0, theme::WARN), egui::StrokeKind::Outside));
+                shapes.push(Shape::rect_stroke(
+                    r,
+                    2.0,
+                    Stroke::new(1.0, theme::WARN),
+                    egui::StrokeKind::Outside,
+                ));
             } else {
                 shapes.push(Shape::rect_filled(r, 2.0, theme::WARN.gamma_multiply(0.18)));
             }
@@ -208,7 +268,12 @@ fn show(ui: &mut egui::Ui, id: egui::Id, buffer: &mut dyn TextBuffer, editable: 
 
 /// Where a match sits in the galley; one spanning lines is drawn to the end of its first line.
 fn match_rect(galley: &Galley, text: &str, m: &Range<usize>) -> Rect {
-    let first_line = text.chars().skip(m.start).take(m.end - m.start).take_while(|c| *c != '\n').count();
+    let first_line = text
+        .chars()
+        .skip(m.start)
+        .take(m.end - m.start)
+        .take_while(|c| *c != '\n')
+        .count();
     let a = galley.pos_from_cursor(CCursor::new(m.start));
     let b = galley.pos_from_cursor(CCursor::new(m.start + first_line));
     let width = (b.left() - a.left()).max(3.0);
@@ -252,9 +317,17 @@ impl Find {
         if let Some(range) = TextEditState::load(ctx, doc_id).and_then(|s| s.cursor.char_range()) {
             let sel = range.as_sorted_char_range();
             self.anchor = sel.start;
-            let selected: String = text.chars().skip(sel.start).take(sel.end - sel.start).collect();
+            let selected: String = text
+                .chars()
+                .skip(sel.start)
+                .take(sel.end - sel.start)
+                .collect();
             if !selected.is_empty() && !selected.contains('\n') {
-                self.query = if self.regex { regex::escape(&selected) } else { selected };
+                self.query = if self.regex {
+                    regex::escape(&selected)
+                } else {
+                    selected
+                };
             }
         }
         self.key = None;
@@ -283,7 +356,11 @@ impl Find {
         if n == 0 {
             return;
         }
-        self.current = if back { (self.current + n - 1) % n } else { (self.current + 1) % n };
+        self.current = if back {
+            (self.current + n - 1) % n
+        } else {
+            (self.current + 1) % n
+        };
         self.reveal = true;
     }
 
@@ -291,18 +368,30 @@ impl Find {
     fn update(&mut self, text: &str) {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
-        let key = (self.query.clone(), self.regex, self.case_sensitive, h.finish());
+        let key = (
+            self.query.clone(),
+            self.regex,
+            self.case_sensitive,
+            h.finish(),
+        );
         if self.key.as_ref() == Some(&key) {
             return;
         }
-        let query_changed = self.key.as_ref().is_none_or(|k| (&k.0, k.1, k.2) != (&key.0, key.1, key.2));
+        let query_changed = self
+            .key
+            .as_ref()
+            .is_none_or(|k| (&k.0, k.1, k.2) != (&key.0, key.1, key.2));
         self.key = Some(key);
         let (matches, error) = find_matches(text, &self.query, self.regex, self.case_sensitive);
         self.matches = matches;
         self.error = error;
         if query_changed {
             // Start from the first match at or after where the cursor was.
-            self.current = self.matches.iter().position(|m| m.start >= self.anchor).unwrap_or(0);
+            self.current = self
+                .matches
+                .iter()
+                .position(|m| m.start >= self.anchor)
+                .unwrap_or(0);
             self.reveal = !self.matches.is_empty();
         } else if self.current >= self.matches.len() {
             self.current = self.matches.len().saturating_sub(1);
@@ -327,7 +416,10 @@ impl Find {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .id(field_id)
-                    .hint_text(egui::RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS)).color(theme::TEXT_FAINT))
+                    .hint_text(
+                        egui::RichText::new(format!("{}  {hint}", icon::MAGNIFYING_GLASS))
+                            .color(theme::TEXT_FAINT),
+                    )
                     .desired_width(240.0)
                     .margin(egui::Margin::symmetric(8, 5)),
             );
@@ -335,7 +427,9 @@ impl Find {
                 resp.request_focus();
                 if let Some(mut state) = TextEditState::load(ui.ctx(), field_id) {
                     let n = self.query.chars().count();
-                    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+                    state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
                     state.store(ui.ctx(), field_id);
                 }
             }
@@ -347,13 +441,26 @@ impl Find {
             }
             self.update(text);
             if let Some(err) = &self.error {
-                ui.label(egui::RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD)).on_hover_text(err);
+                ui.label(
+                    egui::RichText::new(format!("{} Invalid regex", icon::WARNING))
+                        .color(theme::BAD),
+                )
+                .on_hover_text(err);
             } else if !self.query.is_empty() {
                 let label = if self.matches.is_empty() {
                     egui::RichText::new("No results").color(theme::BAD)
                 } else {
-                    let more = if self.matches.len() >= MAX_MATCHES { "+" } else { "" };
-                    egui::RichText::new(format!("{} of {}{more}", self.current + 1, self.matches.len())).color(theme::TEXT_MUTED)
+                    let more = if self.matches.len() >= MAX_MATCHES {
+                        "+"
+                    } else {
+                        ""
+                    };
+                    egui::RichText::new(format!(
+                        "{} of {}{more}",
+                        self.current + 1,
+                        self.matches.len()
+                    ))
+                    .color(theme::TEXT_MUTED)
                 };
                 ui.label(label);
             }
@@ -380,12 +487,25 @@ impl Find {
 }
 
 /// Char ranges of `query` in `text`; an invalid regex finds nothing and reports why.
-fn find_matches(text: &str, query: &str, regex: bool, case_sensitive: bool) -> (Vec<Range<usize>>, Option<String>) {
+fn find_matches(
+    text: &str,
+    query: &str,
+    regex: bool,
+    case_sensitive: bool,
+) -> (Vec<Range<usize>>, Option<String>) {
     if query.is_empty() {
         return (Vec::new(), None);
     }
-    let pattern = if regex { query.to_owned() } else { regex::escape(query) };
-    let re = match regex::RegexBuilder::new(&pattern).case_insensitive(!case_sensitive).size_limit(1 << 20).build() {
+    let pattern = if regex {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    let re = match regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!case_sensitive)
+        .size_limit(1 << 20)
+        .build()
+    {
         Ok(re) => re,
         Err(e) => return (Vec::new(), Some(e.to_string())),
     };
@@ -401,7 +521,11 @@ fn find_matches(text: &str, query: &str, regex: bool, case_sensitive: bool) -> (
         }
         text.chars().count()
     };
-    for m in re.find_iter(text).filter(|m| !m.is_empty()).take(MAX_MATCHES) {
+    for m in re
+        .find_iter(text)
+        .filter(|m| !m.is_empty())
+        .take(MAX_MATCHES)
+    {
         let start = to_char(m.start());
         let end = to_char(m.end());
         out.push(start..end);
@@ -435,7 +559,10 @@ fn line_indents(text: &str) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 
 fn byte_at(text: &str, char_idx: usize) -> usize {
-    text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
 }
 
 fn line_start(text: &str, byte: usize) -> usize {
@@ -453,7 +580,12 @@ fn newline_with_indent(text: &mut String, range: CCursorRange) -> CCursorRange {
     let code = body.split(" #").next().unwrap_or(body).trim_end();
     let extra = if body.starts_with('#') {
         0
-    } else if code.ends_with(':') || code.ends_with('|') || code.ends_with('>') || code.ends_with("|-") || code.ends_with(">-") {
+    } else if code.ends_with(':')
+        || code.ends_with('|')
+        || code.ends_with('>')
+        || code.ends_with("|-")
+        || code.ends_with(">-")
+    {
         INDENT
     } else if code.starts_with("- ") || code == "-" {
         INDENT
@@ -479,7 +611,10 @@ fn indent_lines(text: &mut String, range: CCursorRange, outdent: bool) -> CCurso
     }
     // Whole lines from the selection's first line to its last.
     let first = line_start(text, start);
-    let last_end = text[end..].find('\n').map(|i| end + i).unwrap_or(text.len());
+    let last_end = text[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(text.len());
     let block = text[first..last_end].to_string();
     let mut removed_first = 0isize;
     let mut delta = 0isize;
@@ -509,7 +644,11 @@ fn indent_lines(text: &mut String, range: CCursorRange, outdent: bool) -> CCurso
     text.replace_range(first..last_end, &new_block.join("\n"));
     let a = (sel.start as isize + removed_first).max(0) as usize;
     let b = (sel.end as isize + delta).max(a as isize) as usize;
-    if multi { CCursorRange::two(CCursor::new(a), CCursor::new(b)) } else { CCursorRange::one(CCursor::new(a)) }
+    if multi {
+        CCursorRange::two(CCursor::new(a), CCursor::new(b))
+    } else {
+        CCursorRange::one(CCursor::new(a))
+    }
 }
 
 /// Cmd+/: comment out the selected lines, or uncomment them if they all are.
@@ -517,10 +656,16 @@ fn toggle_comment(text: &mut String, range: CCursorRange) -> CCursorRange {
     let sel = range.as_sorted_char_range();
     let (start, end) = (byte_at(text, sel.start), byte_at(text, sel.end));
     let first = line_start(text, start);
-    let last_end = text[end..].find('\n').map(|i| end + i).unwrap_or(text.len());
+    let last_end = text[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(text.len());
     let block = text[first..last_end].to_string();
     let lines: Vec<&str> = block.split('\n').collect();
-    let all_commented = lines.iter().filter(|l| !l.trim().is_empty()).all(|l| l.trim_start().starts_with('#'));
+    let all_commented = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.trim_start().starts_with('#'));
     // Comment marks go at the block's shallowest indentation so they line up.
     let min_indent = lines
         .iter()
@@ -539,7 +684,10 @@ fn toggle_comment(text: &mut String, range: CCursorRange) -> CCursorRange {
             } else if all_commented {
                 let pos = l.find('#').unwrap_or(0);
                 let skip = if l[pos + 1..].starts_with(' ') { 2 } else { 1 };
-                (format!("{}{}", &l[..pos], &l[pos + skip..]), -(skip as isize))
+                (
+                    format!("{}{}", &l[..pos], &l[pos + skip..]),
+                    -(skip as isize),
+                )
             } else {
                 (format!("{}# {}", &l[..min_indent], &l[min_indent..]), 2)
             };
@@ -553,7 +701,11 @@ fn toggle_comment(text: &mut String, range: CCursorRange) -> CCursorRange {
     text.replace_range(first..last_end, &new.join("\n"));
     let a = (sel.start as isize + first_delta).max(0) as usize;
     let b = (sel.end as isize + delta).max(a as isize) as usize;
-    if a == b { CCursorRange::one(CCursor::new(a)) } else { CCursorRange::two(CCursor::new(a), CCursor::new(b)) }
+    if a == b {
+        CCursorRange::one(CCursor::new(a))
+    } else {
+        CCursorRange::two(CCursor::new(a), CCursor::new(b))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +716,15 @@ fn highlight(text: &str, font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     let mut push = |s: &str, color: Color32| {
         if !s.is_empty() {
-            job.append(s, 0.0, TextFormat { font_id: font.clone(), color, ..Default::default() });
+            job.append(
+                s,
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    ..Default::default()
+                },
+            );
         }
     };
     let mut lines = text.split('\n').peekable();
@@ -590,7 +750,10 @@ fn highlight(text: &str, font: &FontId) -> LayoutJob {
         } else if rest == "---" || rest == "..." {
             push(rest, theme::TEXT_FAINT);
         } else {
-            while let Some(after) = rest.strip_prefix("- ").or_else(|| (rest == "-").then_some("")) {
+            while let Some(after) = rest
+                .strip_prefix("- ")
+                .or_else(|| (rest == "-").then_some(""))
+            {
                 push(&rest[..rest.len() - after.len()], theme::TEXT_MUTED);
                 rest = after;
             }
@@ -639,7 +802,9 @@ fn key_split(s: &str) -> Option<(&str, &str)> {
 fn push_value(push: &mut impl FnMut(&str, Color32), value: &str) {
     // Trailing comment.
     let (code, comment) = match value.find(" #") {
-        Some(i) if !value[..i].contains('"') && !value[..i].contains('\'') => (&value[..i], &value[i..]),
+        Some(i) if !value[..i].contains('"') && !value[..i].contains('\'') => {
+            (&value[..i], &value[i..])
+        }
         _ => (value, ""),
     };
     let t = code.trim();
@@ -647,11 +812,16 @@ fn push_value(push: &mut impl FnMut(&str, Color32), value: &str) {
     push(lead, theme::TEXT);
     let color = if t.starts_with('"') || t.starts_with('\'') {
         theme::SYNTAX_STRING
-    } else if matches!(t, "true" | "false" | "null" | "~" | "True" | "False" | "yes" | "no")
-        || t.parse::<f64>().is_ok()
+    } else if matches!(
+        t,
+        "true" | "false" | "null" | "~" | "True" | "False" | "yes" | "no"
+    ) || t.parse::<f64>().is_ok()
     {
         theme::SYNTAX_LITERAL
-    } else if matches!(t, "|" | ">" | "|-" | ">-" | "|+" | ">+" | "{}" | "[]") || t.starts_with('&') || t.starts_with('*') {
+    } else if matches!(t, "|" | ">" | "|-" | ">-" | "|+" | ">+" | "{}" | "[]")
+        || t.starts_with('&')
+        || t.starts_with('*')
+    {
         theme::TEXT_MUTED
     } else {
         theme::TEXT
@@ -695,7 +865,11 @@ mod tests {
         assert_eq!(r.primary.index, 5);
 
         let mut t = String::from("a:\n    b: 1\n    c: 2");
-        indent_lines(&mut t, CCursorRange::two(CCursor::new(4), CCursor::new(18)), true);
+        indent_lines(
+            &mut t,
+            CCursorRange::two(CCursor::new(4), CCursor::new(18)),
+            true,
+        );
         assert_eq!(t, "a:\n  b: 1\n  c: 2");
     }
 
@@ -723,7 +897,10 @@ mod tests {
 
     #[test]
     fn guides_bridge_blank_lines() {
-        assert_eq!(line_indents("a:\n  b:\n\n    c: 1\n  d: 2"), vec![0, 2, 2, 4, 2]);
+        assert_eq!(
+            line_indents("a:\n  b:\n\n    c: 1\n  d: 2"),
+            vec![0, 2, 2, 4, 2]
+        );
     }
 
     #[test]

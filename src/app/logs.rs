@@ -23,7 +23,10 @@ const PALETTE: [Color32; 8] = [
 pub(super) enum LogTarget {
     Pod(String),
     /// Every pod matching a label selector, e.g. a deployment's or service's.
-    Selector { label: String, selector: String },
+    Selector {
+        label: String,
+        selector: String,
+    },
     /// Every pod controlled by "Kind/name", e.g. a pod's ReplicaSet.
     Owner(String),
 }
@@ -85,10 +88,19 @@ fn parse_ansi(raw: &str) -> (String, Vec<Span>) {
     let mut bold = false;
     let mut start = 0;
     let mut chars = raw.chars().peekable();
-    let close = |spans: &mut Vec<Span>, out: &str, start: usize, color: Option<vt100::Color>, bold: bool| {
+    let close = |spans: &mut Vec<Span>,
+                 out: &str,
+                 start: usize,
+                 color: Option<vt100::Color>,
+                 bold: bool| {
         if out.len() > start {
-            let c = color.map(|c| super::shell::term_color(c, true, bold)).or(bold.then_some(theme::TEXT));
-            spans.push(Span { range: start..out.len(), color: c });
+            let c = color
+                .map(|c| super::shell::term_color(c, true, bold))
+                .or(bold.then_some(theme::TEXT));
+            spans.push(Span {
+                range: start..out.len(),
+                color: c,
+            });
         }
     };
     while let Some(ch) = chars.next() {
@@ -110,7 +122,10 @@ fn parse_ansi(raw: &str) -> (String, Vec<Span>) {
                     }
                     close(&mut spans, &out, start, color, bold);
                     start = out.len();
-                    let nums: Vec<u16> = params.split([';', ':']).map(|p| p.parse().unwrap_or(0)).collect();
+                    let nums: Vec<u16> = params
+                        .split([';', ':'])
+                        .map(|p| p.parse().unwrap_or(0))
+                        .collect();
                     let mut i = 0;
                     while i < nums.len() {
                         match nums[i] {
@@ -124,7 +139,8 @@ fn parse_ansi(raw: &str) -> (String, Vec<Span>) {
                                 let fg = nums[i] == 38;
                                 let c = match nums.get(i + 1) {
                                     Some(5) => {
-                                        let c = nums.get(i + 2).map(|&n| vt100::Color::Idx(n as u8));
+                                        let c =
+                                            nums.get(i + 2).map(|&n| vt100::Color::Idx(n as u8));
                                         i += 2;
                                         c
                                     }
@@ -230,7 +246,9 @@ impl LogView {
             context,
             clients,
             namespace,
-            container: container.or_else(|| containers.first().cloned()).unwrap_or_default(),
+            container: container
+                .or_else(|| containers.first().cloned())
+                .unwrap_or_default(),
             containers,
             target,
             tail: 500,
@@ -280,11 +298,21 @@ impl LogView {
         } else {
             label
         };
-        if self.previous { format!("{label} · previous") } else { label }
+        if self.previous {
+            format!("{label} · previous")
+        } else {
+            label
+        }
     }
 
     pub(super) fn hover(&self) -> String {
-        format!("{} · {}/{} · {}", self.context, self.namespace, self.target.label(), self.container)
+        format!(
+            "{} · {}/{} · {}",
+            self.context,
+            self.namespace,
+            self.target.label(),
+            self.container
+        )
     }
 
     pub(super) fn live(&self) -> bool {
@@ -310,8 +338,12 @@ impl LogView {
         self.lines.clear();
         self.older = Older::Idle;
         self.error = None;
-        let hidden: HashSet<String> =
-            self.sources.iter().filter(|s| !s.visible).map(|s| s.pod.clone()).collect();
+        let hidden: HashSet<String> = self
+            .sources
+            .iter()
+            .filter(|s| !s.visible)
+            .map(|s| s.pod.clone())
+            .collect();
 
         match self.target.clone() {
             LogTarget::Pod(name) => {
@@ -326,10 +358,16 @@ impl LogView {
     fn resolve(&mut self, selector: Option<String>, owner: Option<String>, rt: &Handle, bus: &Bus) {
         self.resolving = true;
         self.sources.clear();
-        let (id, client, ns, bus) =
-            (self.stream_id, self.clients.main.clone(), self.namespace.clone(), bus.clone());
+        let (id, client, ns, bus) = (
+            self.stream_id,
+            self.clients.main.clone(),
+            self.namespace.clone(),
+            bus.clone(),
+        );
         self.tasks.push(rt.spawn(async move {
-            let result = kube_ops::pods_for_logs(client, ns, selector, owner).await.map_err(err_string);
+            let result = kube_ops::pods_for_logs(client, ns, selector, owner)
+                .await
+                .map_err(err_string);
             bus.send(Msg::LogPods { id, result });
         }));
     }
@@ -374,7 +412,11 @@ impl LogView {
                     line_bus.send(Msg::LogLine { id, src, line })
                 })
                 .await;
-                bus.send(Msg::LogEnded { id, src, error: result.err().map(err_string) });
+                bus.send(Msg::LogEnded {
+                    id,
+                    src,
+                    error: result.err().map(err_string),
+                });
             }));
         }
     }
@@ -440,7 +482,11 @@ impl LogView {
                     }
                 }
                 if self.older_pending == 0 {
-                    self.older = if self.older_found { Older::Idle } else { Older::Done };
+                    self.older = if self.older_found {
+                        Older::Idle
+                    } else {
+                        Older::Done
+                    };
                 }
             }
             _ => {}
@@ -454,7 +500,8 @@ impl LogView {
         if let Some(s) = self.sources.get_mut(vl.src) {
             s.held += 1;
         }
-        let in_order = vl.line.ts.is_empty() || self.lines.back().is_none_or(|b| b.line.ts <= vl.line.ts);
+        let in_order =
+            vl.line.ts.is_empty() || self.lines.back().is_none_or(|b| b.line.ts <= vl.line.ts);
         if in_order {
             self.lines.push_back(vl);
         } else {
@@ -480,7 +527,11 @@ impl LogView {
             return;
         }
         // Without a full tail the streams already started at the first line.
-        let Some(before) = self.lines.front().map(|l| l.line.ts.clone()).filter(|ts| !ts.is_empty() && self.tail > 0)
+        let Some(before) = self
+            .lines
+            .front()
+            .map(|l| l.line.ts.clone())
+            .filter(|ts| !ts.is_empty() && self.tail > 0)
         else {
             self.older = Older::Done;
             return;
@@ -512,8 +563,7 @@ impl LogView {
     }
 
     fn visible(&self, vl: &ViewLine) -> bool {
-        self.sources.get(vl.src).is_none_or(|s| s.visible)
-            && self.matcher.matches(&vl.line.text)
+        self.sources.get(vl.src).is_none_or(|s| s.visible) && self.matcher.matches(&vl.line.text)
     }
 
     fn format_plain(&self, vl: &ViewLine) -> String {
@@ -546,7 +596,10 @@ impl LogView {
                     .selected_text(&self.container)
                     .show_ui(ui, |ui| {
                         for c in self.containers.clone() {
-                            if ui.selectable_value(&mut self.container, c.clone(), &c).changed() {
+                            if ui
+                                .selectable_value(&mut self.container, c.clone(), &c)
+                                .changed()
+                            {
                                 out.restart = true;
                             }
                         }
@@ -556,36 +609,60 @@ impl LogView {
             }
             ui.separator();
             ui.label(RichText::new("Initial lines").color(theme::TEXT_MUTED));
-            let tail_label = |n: i64| if n == 0 { "All".to_string() } else { n.to_string() };
+            let tail_label = |n: i64| {
+                if n == 0 {
+                    "All".to_string()
+                } else {
+                    n.to_string()
+                }
+            };
             egui::ComboBox::from_id_salt(("log-tail", &self.key))
                 .icon(theme::caret)
                 .width(70.0)
                 .selected_text(tail_label(self.tail))
                 .show_ui(ui, |ui| {
                     for n in [100, 500, 1000, 5000, 0] {
-                        if ui.selectable_value(&mut self.tail, n, tail_label(n)).changed() {
+                        if ui
+                            .selectable_value(&mut self.tail, n, tail_label(n))
+                            .changed()
+                        {
                             out.restart = true;
                         }
                     }
                 })
                 .response
-                .on_hover_text("Lines per pod to start from. Scroll to the top to load older lines.");
+                .on_hover_text(
+                    "Lines per pod to start from. Scroll to the top to load older lines.",
+                );
             ui.add_space(4.0);
             theme::checkbox(ui, &mut self.timestamps, "Timestamps");
             theme::checkbox(ui, &mut self.follow, "Auto-scroll");
             ui.add_space(4.0);
             let run_hint = "Current run, or the run before the last restart (--previous)";
-            if let Some(i) = theme::segmented(ui, &["Current", "Previous"], self.previous as usize, run_hint) {
+            if let Some(i) = theme::segmented(
+                ui,
+                &["Current", "Previous"],
+                self.previous as usize,
+                run_hint,
+            ) {
                 self.previous = i == 1;
                 out.restart = true;
             }
             if self.previous {
-                if let Some(exit) = self.last_exit.get(&self.container).filter(|e| !e.is_empty()) {
+                if let Some(exit) = self
+                    .last_exit
+                    .get(&self.container)
+                    .filter(|e| !e.is_empty())
+                {
                     ui.label(RichText::new(format!("Last run: {exit}")).color(YELLOW));
                 }
             }
             ui.add_space(4.0);
-            let hint = if self.regex { "Filter (regex)" } else { "Filter lines" };
+            let hint = if self.regex {
+                "Filter (regex)"
+            } else {
+                "Filter lines"
+            };
             theme::search_field(ui, &mut self.filter, hint, 200.0);
             let regex_hint = "Regular expression (case-insensitive)";
             if theme::toggle_button(ui, ".*", self.regex, regex_hint).clicked() {
@@ -593,10 +670,16 @@ impl LogView {
             }
             self.matcher.update(&self.filter, self.regex);
             if let Some(err) = &self.matcher.error {
-                ui.label(RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD))
-                    .on_hover_text(err);
+                ui.label(
+                    RichText::new(format!("{} Invalid regex", icon::WARNING)).color(theme::BAD),
+                )
+                .on_hover_text(err);
             }
-            let restart_hint = if self.is_group() { "Restart (also picks up new pods)" } else { "Restart stream" };
+            let restart_hint = if self.is_group() {
+                "Restart (also picks up new pods)"
+            } else {
+                "Restart stream"
+            };
             if theme::icon_button(ui, icon::ARROW_CLOCKWISE, restart_hint).clicked() {
                 out.restart = true;
             }
@@ -646,23 +729,46 @@ impl LogView {
                     }
                 }
                 for s in &mut self.sources {
-                    let color = if s.visible { s.color } else { ui.visuals().weak_text_color() };
-                    let glyph = if s.streaming { icon::CIRCLE } else { icon::WARNING_CIRCLE };
-                    let text = RichText::new(format!("{glyph} {}", s.short)).color(color).monospace();
+                    let color = if s.visible {
+                        s.color
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    let glyph = if s.streaming {
+                        icon::CIRCLE
+                    } else {
+                        icon::WARNING_CIRCLE
+                    };
+                    let text = RichText::new(format!("{glyph} {}", s.short))
+                        .color(color)
+                        .monospace();
                     let mut hover = s.pod.clone();
                     if let Some(st) = &s.status {
                         hover.push_str(&format!("\n{st}"));
                     }
                     hover.push_str("\nClick to show/hide");
-                    if ui.add(egui::Button::selectable(s.visible, text)).on_hover_text(hover).clicked() {
+                    if ui
+                        .add(egui::Button::selectable(s.visible, text))
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
                         s.visible = !s.visible;
                     }
                 }
             });
         } else if let Some(e) = &self.error {
             ui.colored_label(RED, e);
-        } else if let Some(st) = self.sources.first().filter(|s| !s.streaming).and_then(|s| s.status.as_ref()) {
-            let color = if st == "Stream ended" || st.starts_with("No previous run") { theme::TEXT_MUTED } else { YELLOW };
+        } else if let Some(st) = self
+            .sources
+            .first()
+            .filter(|s| !s.streaming)
+            .and_then(|s| s.status.as_ref())
+        {
+            let color = if st == "Stream ended" || st.starts_with("No previous run") {
+                theme::TEXT_MUTED
+            } else {
+                YELLOW
+            };
             ui.add(egui::Label::new(RichText::new(st).color(color)).wrap());
         }
         ui.separator();
@@ -676,9 +782,16 @@ impl LogView {
         let text_color = ui.visuals().text_color();
         let weak_color = ui.visuals().weak_text_color();
         let multi = self.sources.len() > 1;
-        let tag_width = self.sources.iter().map(|s| s.short.len()).max().unwrap_or(0);
+        let tag_width = self
+            .sources
+            .iter()
+            .map(|s| s.short.len())
+            .max()
+            .unwrap_or(0);
 
-        let mut area = egui::ScrollArea::both().auto_shrink(false).stick_to_bottom(self.follow);
+        let mut area = egui::ScrollArea::both()
+            .auto_shrink(false)
+            .stick_to_bottom(self.follow);
         if let Some(offset) = self.pending_offset.take() {
             area = area.vertical_scroll_offset(offset);
         }
@@ -696,7 +809,10 @@ impl LogView {
                             ui.weak("Beginning of log");
                         }
                         Older::Idle => {
-                            if ui.link(format!("{} Load older lines", icon::ARROW_LINE_UP)).clicked() {
+                            if ui
+                                .link(format!("{} Load older lines", icon::ARROW_LINE_UP))
+                                .clicked()
+                            {
                                 *load_older = true;
                             }
                         }
@@ -705,14 +821,21 @@ impl LogView {
                 }
                 let vl = lines[i - 1];
                 let lower = vl.line.text.to_lowercase();
-                let color = if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+                let color = if lower.contains("error")
+                    || lower.contains("fatal")
+                    || lower.contains("panic")
+                {
                     RED
                 } else if lower.contains("warn") {
                     YELLOW
                 } else {
                     text_color
                 };
-                let fmt = |color| TextFormat { font_id: font.clone(), color, ..Default::default() };
+                let fmt = |color| TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    ..Default::default()
+                };
                 let mut job = LayoutJob::default();
                 if multi {
                     if let Some(s) = self.sources.get(vl.src) {
@@ -726,7 +849,11 @@ impl LogView {
                     job.append(&vl.line.text, 0.0, fmt(color));
                 } else {
                     for s in &vl.spans {
-                        job.append(&vl.line.text[s.range.clone()], 0.0, fmt(s.color.unwrap_or(color)));
+                        job.append(
+                            &vl.line.text[s.range.clone()],
+                            0.0,
+                            fmt(s.color.unwrap_or(color)),
+                        );
                     }
                 }
                 ui.add(egui::Label::new(job).extend());
@@ -737,8 +864,8 @@ impl LogView {
         // Auto-load when the user scrolls up into the banner, or when everything fits on screen.
         let near_top = output.state.offset.y <= self.row_pitch;
         let fits = output.content_size.y <= output.inner_rect.height();
-        let scrolling_up =
-            ui.rect_contains_pointer(output.inner_rect) && ui.input(|i| i.smooth_scroll_delta.y > 0.0);
+        let scrolling_up = ui.rect_contains_pointer(output.inner_rect)
+            && ui.input(|i| i.smooth_scroll_delta.y > 0.0);
         if near_top && !lines.is_empty() && (scrolling_up || fits) {
             *load_older = true;
         }

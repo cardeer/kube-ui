@@ -17,7 +17,9 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub enum UpdateState {
     #[default]
     Idle,
-    Checking { manual: bool },
+    Checking {
+        manual: bool,
+    },
     UpToDate,
     /// A newer release, by tag (e.g. `v0.2.0`).
     Available(String),
@@ -32,7 +34,16 @@ pub enum UpdateState {
 pub async fn latest_tag() -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases/latest");
     let out = tokio::process::Command::new("/usr/bin/curl")
-        .args(["-fsSIL", "--max-time", "15", "-o", "/dev/null", "-w", "%{url_effective}", &url])
+        .args([
+            "-fsSIL",
+            "--max-time",
+            "15",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            &url,
+        ])
         .output()
         .await
         .map_err(|e| format!("Could not run curl: {e}"))?;
@@ -61,7 +72,9 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 
 /// Where the installer's output goes.
 pub fn log_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join("Library/Logs/kube-ui-update.log")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/Logs/kube-ui-update.log")
 }
 
 /// The folder holding the running `Kube UI.app`, so an update replaces this copy.
@@ -81,7 +94,9 @@ fn app_bundle() -> Option<PathBuf> {
 /// Reopens the app shortly after this process exits (the caller then closes the window).
 /// False when not running from a bundle.
 pub fn relaunch() -> bool {
-    let Some(app) = app_bundle() else { return false };
+    let Some(app) = app_bundle() else {
+        return false;
+    };
     Command::new("/bin/sh")
         .arg("-c")
         .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$0""#)
@@ -129,8 +144,17 @@ pub fn install(tag: &str) -> Result<std::sync::mpsc::Receiver<Result<(), String>
             Ok(())
         } else {
             let tail = std::fs::read_to_string(log_path()).unwrap_or_default();
-            let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-            Err(if last.is_empty() { "The installer failed.".into() } else { strip_ansi(&last) })
+            let last = tail
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .to_string();
+            Err(if last.is_empty() {
+                "The installer failed.".into()
+            } else {
+                strip_ansi(&last)
+            })
         };
         let _ = tx.send(result);
     });

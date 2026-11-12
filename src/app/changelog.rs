@@ -25,7 +25,11 @@ fn releases() -> Vec<Release<'static>> {
                 Some((v, d)) => (v, Some(d.trim())),
                 None => (rest, None),
             };
-            out.push(Release { version: version.trim().trim_matches(['[', ']']), date, sections: Vec::new() });
+            out.push(Release {
+                version: version.trim().trim_matches(['[', ']']),
+                date,
+                sections: Vec::new(),
+            });
         } else if let Some(heading) = line.strip_prefix("### ") {
             if let Some(r) = out.last_mut() {
                 r.sections.push((heading.trim(), Vec::new()));
@@ -82,42 +86,55 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
         .default_size([560.0, 520.0])
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                if releases.is_empty() {
-                    ui.weak("No release notes.");
-                }
-                for (i, r) in releases.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(10.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if releases.is_empty() {
+                        ui.weak("No release notes.");
                     }
-                    ui.horizontal(|ui| {
-                        ui.label(theme::semibold(format!("v{}", r.version)).size(16.0).color(theme::TEXT));
-                        if r.version == update::CURRENT {
-                            theme::badge(ui, "installed", theme::OK, false);
+                    for (i, r) in releases.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(10.0);
                         }
-                        if let Some(d) = r.date {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(d).color(theme::TEXT_FAINT));
-                            });
-                        }
-                    });
-                    for (heading, items) in &r.sections {
-                        ui.add_space(6.0);
-                        if !heading.is_empty() {
-                            ui.label(theme::label_small(*heading).color(section_color(heading)));
-                            ui.add_space(2.0);
-                        }
-                        for item in items {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(icon::DOT_OUTLINE).color(theme::TEXT_FAINT));
-                                ui.label(RichText::new(item).color(theme::TEXT));
-                            });
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                theme::semibold(format!("v{}", r.version))
+                                    .size(16.0)
+                                    .color(theme::TEXT),
+                            );
+                            if r.version == update::CURRENT {
+                                theme::badge(ui, "installed", theme::OK, false);
+                            }
+                            if let Some(d) = r.date {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(RichText::new(d).color(theme::TEXT_FAINT));
+                                    },
+                                );
+                            }
+                        });
+                        for (heading, items) in &r.sections {
+                            ui.add_space(6.0);
+                            if !heading.is_empty() {
+                                ui.label(
+                                    theme::label_small(*heading).color(section_color(heading)),
+                                );
+                                ui.add_space(2.0);
+                            }
+                            for item in items {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(icon::DOT_OUTLINE).color(theme::TEXT_FAINT),
+                                    );
+                                    ui.label(RichText::new(item).color(theme::TEXT));
+                                });
+                            }
                         }
                     }
-                }
-            });
+                });
         });
 }
 
@@ -130,9 +147,15 @@ mod tests {
         let r = releases();
         assert!(!r.is_empty());
         assert!(r.iter().all(|r| r.version != "Unreleased"));
-        assert!(r.iter().any(|r| r.version == "0.2.1" && r.date == Some("2026-11-11")));
+        assert!(
+            r.iter()
+                .any(|r| r.version == "0.2.1" && r.date == Some("2026-11-11"))
+        );
         let first = r.iter().find(|r| r.version == "0.1.0").unwrap();
-        assert_eq!(first.sections[0], ("", vec!["First tagged release.".to_string()]));
+        assert_eq!(
+            first.sections[0],
+            ("", vec!["First tagged release.".to_string()])
+        );
         let added = &first.sections[1];
         assert_eq!(added.0, "Added");
         assert!(added.1[0].ends_with("network and port-forward views."));
