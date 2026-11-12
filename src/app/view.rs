@@ -55,6 +55,7 @@ impl App {
             env_filter: &self.env_filter,
             toggled: &self.toggled_sections,
             drawer_width: self.drawer_width,
+            widths: &self.settings.column_widths,
         }
     }
 
@@ -482,112 +483,94 @@ impl App {
             ]
             .into();
         }
-        const WIDTHS: [f32; 7] = [160.0, 130.0, 260.0, 150.0, 120.0, 60.0, 220.0];
-        let cell = |content: El<'static>, w: f32| -> El<'static> {
-            container(content)
-                .width(w)
-                .height(ROW_HEIGHT)
-                .padding([0, 8])
-                .center_y(ROW_HEIGHT)
-                .clip(true)
-                .into()
-        };
-        let header = row([
-            "Context",
-            "Namespace",
-            "Target",
-            "Local / Remote",
-            "Status",
-            "Conns",
-            "",
-        ]
-        .iter()
-        .zip(WIDTHS)
-        .map(|(t, w)| cell(theme::label_small(*t).into(), w)))
-        .height(26);
-        let mut rows = column![header];
-        for (i, f) in self.forwards.iter().enumerate() {
-            let local = f.bound_port.unwrap_or(f.spec.local_port);
-            let (color, label) = match &f.status {
-                PfStatus::Starting => (YELLOW, "Starting…"),
-                PfStatus::Listening => (GREEN, "Active"),
-                PfStatus::Stopped => (theme::IDLE, "Stopped"),
-                PfStatus::Failed(_) => (RED, "Failed"),
-            };
-            let status: El<'static> = {
-                let r = row![theme::dot(color), theme::colored(label, color)]
-                    .spacing(6)
-                    .align_y(iced::Center);
-                match &f.status {
-                    PfStatus::Failed(e) => theme::tip(r, e.clone()),
-                    _ => r.into(),
+        let scroll = self.ws().map(|w| w.list_scroll).unwrap_or(0.0);
+        let table = table::Table {
+            id: "list",
+            cols: vec![
+                table::Col::fixed("Context", 200.0),
+                table::Col::fixed("Namespace", 130.0),
+                table::Col::fill("Target", 220.0),
+                table::Col::fixed("Local / Remote", 150.0),
+                table::Col::fixed("Status", 120.0),
+                table::Col::fixed("Conns", 70.0),
+                table::Col::fixed("", 170.0),
+            ],
+            sort: None,
+            tab: Tab::Forwards,
+            sortable: false,
+            widths: &self.settings.column_widths,
+            len: self.forwards.len(),
+            scroll,
+            hovered: self.hovered_row,
+            row: move |i, w: &[f32]| {
+                let f: &Forward = &self.forwards[i];
+                let local = f.bound_port.unwrap_or(f.spec.local_port);
+                let (color, label) = match &f.status {
+                    PfStatus::Starting => (YELLOW, "Starting…"),
+                    PfStatus::Listening => (GREEN, "Active"),
+                    PfStatus::Stopped => (theme::IDLE, "Stopped"),
+                    PfStatus::Failed(_) => (RED, "Failed"),
+                };
+                let status: El<'_> = {
+                    let r = row![theme::dot(color), theme::colored(label, color)]
+                        .spacing(6)
+                        .align_y(iced::Center);
+                    match &f.status {
+                        PfStatus::Failed(e) => theme::tip(r, e.clone()),
+                        _ => r.into(),
+                    }
+                };
+                let menu_id = format!("pf-menu-{}", f.id);
+                let controls: El<'_> = row![
+                    if f.handle.is_some() {
+                        theme::small_button(
+                            Some(icon::STOP_CIRCLE),
+                            "Stop",
+                            Some(Message::Action(Action::StopForward(f.id))),
+                        )
+                    } else {
+                        theme::small_button(
+                            Some(icon::PLAY),
+                            "Start",
+                            Some(Message::Action(Action::RestartForward(f.id))),
+                        )
+                    },
+                    container(theme::small_button(
+                        Some(icon::DOTS_THREE),
+                        "",
+                        Some(Message::OpenPopup(
+                            PopupKind::Forward(f.id),
+                            widget::Id::from(menu_id.clone()),
+                        )),
+                    ))
+                    .id(menu_id),
+                ]
+                .spacing(6)
+                .align_y(iced::Center)
+                .into();
+                let context = table::truncated(&f.spec.context, w[0], 7.6, theme::txt);
+                table::Row {
+                    cells: vec![
+                        theme::tip(context, display_path(&f.spec.kubeconfig)),
+                        table::truncated(&f.spec.namespace, w[1], 7.6, theme::txt),
+                        table::truncated(&f.spec.target.label(), w[2], 7.6, theme::txt),
+                        table::truncated(
+                            &format!("{local} → {}", f.spec.remote_port),
+                            w[3],
+                            7.5,
+                            theme::mono,
+                        ),
+                        status,
+                        theme::txt(f.connections.load(Ordering::Relaxed).to_string()).into(),
+                        controls,
+                    ],
+                    selected: false,
+                    on_click: Message::Noop,
+                    on_double_click: None,
                 }
-            };
-            let running = f.handle.is_some();
-            let menu_id = format!("pf-menu-{}", f.id);
-            let controls: El<'static> = row![
-                if running {
-                    theme::small_button(
-                        Some(icon::STOP_CIRCLE),
-                        "Stop",
-                        Some(Message::Action(Action::StopForward(f.id))),
-                    )
-                } else {
-                    theme::small_button(
-                        Some(icon::PLAY),
-                        "Start",
-                        Some(Message::Action(Action::RestartForward(f.id))),
-                    )
-                },
-                container(theme::small_button(
-                    Some(icon::DOTS_THREE),
-                    "",
-                    Some(Message::OpenPopup(
-                        PopupKind::Forward(f.id),
-                        widget::Id::from(menu_id.clone()),
-                    )),
-                ))
-                .id(menu_id),
-            ]
-            .spacing(6)
-            .align_y(iced::Center)
-            .into();
-            let cells = vec![
-                cell(
-                    theme::tip(
-                        theme::txt(f.spec.context.clone()),
-                        display_path(&f.spec.kubeconfig),
-                    ),
-                    WIDTHS[0],
-                ),
-                cell(theme::txt(f.spec.namespace.clone()).into(), WIDTHS[1]),
-                cell(theme::txt(f.spec.target.label()).into(), WIDTHS[2]),
-                cell(
-                    theme::mono(format!("{local} → {}", f.spec.remote_port)).into(),
-                    WIDTHS[3],
-                ),
-                cell(status, WIDTHS[4]),
-                cell(
-                    theme::txt(f.connections.load(Ordering::Relaxed).to_string()).into(),
-                    WIDTHS[5],
-                ),
-                cell(controls, WIDTHS[6]),
-            ];
-            let stripe = i % 2 == 1;
-            rows = rows.push(container(row(cells)).style(move |_| container::Style {
-                background: stripe.then_some(theme::STRIPE.into()),
-                ..Default::default()
-            }));
-        }
-        column![
-            title,
-            theme::vspace(8.0),
-            scrollable(rows)
-                .direction(theme::thin_both())
-                .style(theme::scrollbar)
-                .height(Length::Fill)
-        ]
-        .into()
+            },
+        };
+        column![title, theme::vspace(8.0), table.view()].into()
     }
 
     fn view_settings(&self) -> El<'_> {
@@ -1154,8 +1137,9 @@ impl App {
             .line_height(text::LineHeight::Absolute(code_editor::LINE_HEIGHT.into()))
             .padding(code_editor::EDITOR_PAD)
             .wrapping(text::Wrapping::None)
-            // An explicit height: the editor lays out nothing when its height is unbounded.
-            .height(lines.max(1) as f32 * code_editor::LINE_HEIGHT + 2.0 * code_editor::EDITOR_PAD)
+            // Unbounded height inside the scrollable: the editor then leaves wheel events to
+            // the scrollable (with a fixed height it takes them and nothing scrolls).
+            .height(Length::Shrink)
             .width(width.max(400.0))
             .style(theme::editor);
         container(

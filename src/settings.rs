@@ -131,6 +131,9 @@ pub struct Settings {
     pub window_size: Option<[f32; 2]>,
     #[serde(default)]
     pub window_maximized: bool,
+    /// Table column widths the user dragged, keyed `"<page>/<column>"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_widths: BTreeMap<String, f32>,
     /// Version that last ran; "What's new" opens once when it differs from the running one.
     #[serde(default)]
     pub last_seen_version: Option<String>,
@@ -162,6 +165,7 @@ impl Default for Settings {
             window_size: None,
             window_maximized: false,
             last_seen_version: None,
+            column_widths: BTreeMap::new(),
         }
     }
 }
