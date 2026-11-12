@@ -1124,6 +1124,11 @@ impl App {
             .as_ref()
             .map(|(l, _)| *l)
             .filter(|_| y.editing);
+        let guides = code_editor::IndentGuides {
+            depths: code_editor::indent_depths(y.content.lines().map(|l| l.text)),
+            cursor_line,
+        };
+        let editor_width = width.max(400.0);
         let editor = text_editor(&y.content)
             .id(YAML_EDITOR)
             .on_action(Message::YamlAction)
@@ -1140,8 +1145,15 @@ impl App {
             // Unbounded height inside the scrollable: the editor then leaves wheel events to
             // the scrollable (with a fixed height it takes them and nothing scrolls).
             .height(Length::Shrink)
-            .width(width.max(400.0))
+            .width(editor_width)
             .style(theme::editor);
+        // The editor stays the base layer so it keeps its unbounded height: with a bounded
+        // one it would take wheel events and the scrollable would stop scrolling.
+        let editor = stack![editor].push_under(
+            iced::widget::canvas(guides)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        );
         container(
             scrollable(row![
                 code_editor::gutter(lines, cursor_line, error_line),
