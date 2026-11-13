@@ -5,6 +5,31 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-13
+
+### Added
+- Bottom panel tabs have a right-click menu: Close, Close others, Close tabs to the
+  left / right, and Close all. ⌘W closes the selected one while the panel has focus
+  (you last clicked in it, or just opened a tab there); ⇧⌘W (File > Close Logs/Terminal
+  Tab) closes it from anywhere.
+- The YAML editor has undo and redo (⌘Z, ⇧⌘Z or ⌘Y). Brackets and quotes close
+  themselves, step over their closing partner, and wrap a selection; Backspace removes an
+  empty pair at once, and one indent level in leading spaces.
+- More YAML editor shortcuts: ⌘L select line, ⇧⌘D duplicate line, ⇧⌘K delete line,
+  ⌥↑ / ⌥↓ move lines, ⌘] / ⌘[ indent and outdent, ⌘↩ new line below, ⌥⌫ / ⌘⌫ delete
+  a word / to the line start, ⌥⌦ delete the next word, ⌘↑ / ⌘↓ go to the start / end.
+
+### Changed
+- Scrolling in the YAML editor moves along one axis at a time: a swipe keeps to the
+  direction it started in, so it no longer drifts sideways while scrolling down.
+- At most three notifications show at once; older ones make way for new ones. A repeated
+  message shows once with a count (×3), each has a × to dismiss it, and long errors are
+  cut short.
+
+### Fixed
+- Typing in the YAML editor no longer jumps back to the top when the YAML becomes invalid
+  (for example after typing an opening quote) or a notice appears above it.
+
 ## [1.0.1] - 2026-11-12
 
 ### Changed
