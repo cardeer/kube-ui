@@ -1,9 +1,9 @@
 //! The YAML editor's pieces on top of iced's `text_editor`: a line-based YAML highlighter
-//! (which also tints find matches), editor keys (auto-indent on Enter, Tab / Shift+Tab
-//! indent by two spaces, Cmd+/ toggles comments, Cmd+S saves), a line-number gutter,
-//! indent guides, and the find bar (Cmd+F).
+//! (which also tints find matches), editor keys (see [`key_binding`]), undo history, a
+//! line-number gutter, indent guides, and the find bar (Cmd+F).
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use iced::{
     Color, Element, Length, Task,
@@ -221,20 +221,358 @@ pub fn toggle_comment(text: &mut String, sel: Range<usize>) -> Range<usize> {
     a..b
 }
 
+/// Whole-line edits on the lines the selection touches.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LineOp {
+    Duplicate,
+    Delete,
+    MoveUp,
+    MoveDown,
+}
+
+/// Byte span of the whole lines `sel` touches (without the final newline).
+fn line_block(text: &str, sel: &Range<usize>) -> (usize, usize) {
+    let (start, end) = (byte_at(text, sel.start), byte_at(text, sel.end));
+    let first = line_start(text, start);
+    let last_end = text[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(text.len());
+    (first, last_end)
+}
+
+/// Duplicate (Shift+Cmd+D), delete (Shift+Cmd+K) or move (Option+Up / Down) the selected
+/// lines. Returns the new selection.
+pub fn line_op(text: &mut String, sel: Range<usize>, op: LineOp) -> Range<usize> {
+    let (first, last_end) = line_block(text, &sel);
+    let block = text[first..last_end].to_string();
+    let block_chars = block.chars().count();
+    let shift = |by: isize| {
+        let f = |i: usize| (i as isize + by).max(0) as usize;
+        f(sel.start)..f(sel.end)
+    };
+    match op {
+        LineOp::Duplicate => {
+            text.insert_str(last_end, &format!("\n{block}"));
+            shift(block_chars as isize + 1)
+        }
+        LineOp::Delete => {
+            let range = if last_end < text.len() {
+                first..last_end + 1
+            } else if first > 0 {
+                first - 1..last_end
+            } else {
+                first..last_end
+            };
+            let at = text[..range.start].chars().count();
+            text.replace_range(range, "");
+            // The caret goes to the start of the line that took the deleted lines' place.
+            let b = line_start(text, byte_at(text, at));
+            let at = text[..b].chars().count();
+            at..at
+        }
+        LineOp::MoveUp => {
+            if first == 0 {
+                return sel;
+            }
+            let prev_start = line_start(text, first - 1);
+            let prev = text[prev_start..first - 1].to_string();
+            text.replace_range(prev_start..last_end, &format!("{block}\n{prev}"));
+            shift(-(prev.chars().count() as isize + 1))
+        }
+        LineOp::MoveDown => {
+            if last_end >= text.len() {
+                return sel;
+            }
+            let next_end = text[last_end + 1..]
+                .find('\n')
+                .map(|i| last_end + 1 + i)
+                .unwrap_or(text.len());
+            let next = text[last_end + 1..next_end].to_string();
+            text.replace_range(first..next_end, &format!("{next}\n{block}"));
+            shift(next.chars().count() as isize + 1)
+        }
+    }
+}
+
+/// What typing a bracket or quote does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Typed {
+    /// Insert it as is.
+    Insert,
+    /// Step over the same closing character already after the cursor.
+    Skip,
+    /// Insert it with its closing partner and put the cursor between them.
+    Pair(char),
+    /// Wrap the selection in it and its partner.
+    Wrap(char),
+}
+
+/// The characters typed through [`on_type`].
+pub fn is_pair_char(c: char) -> bool {
+    matches!(c, '(' | '[' | '{' | ')' | ']' | '}' | '"' | '\'')
+}
+
+fn closing(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' | '\'' => Some(c),
+        _ => None,
+    }
+}
+
+/// Auto-closing brackets and quotes. `before` / `after` are the cursor's line on either side.
+pub fn on_type(before: &str, after: &str, has_selection: bool, c: char) -> Typed {
+    let close = closing(c);
+    if let (Some(close), true) = (close, has_selection) {
+        return Typed::Wrap(close);
+    }
+    let next = after.chars().next();
+    let is_quote = c == '"' || c == '\'';
+    if (is_quote || close.is_none()) && next == Some(c) {
+        return Typed::Skip;
+    }
+    let Some(close) = close else {
+        return Typed::Insert;
+    };
+    // Only pair where nothing would be swallowed: before a space, a closer or the line end.
+    if !next.is_none_or(|n| n.is_whitespace() || matches!(n, ')' | ']' | '}' | ',')) {
+        return Typed::Insert;
+    }
+    if is_quote {
+        let prev = before.chars().next_back();
+        // Not after a letter (don't), and not to close a quote already open on the line.
+        if prev.is_some_and(|p| p.is_alphanumeric() || p == c) || before.matches(c).count() % 2 == 1
+        {
+            return Typed::Insert;
+        }
+    }
+    Typed::Pair(close)
+}
+
+/// What Backspace deletes (no selection): an empty bracket or quote pair at once, and in
+/// leading spaces, back to the previous indent stop. Returns how many characters to delete
+/// before the cursor and after it.
+pub fn on_backspace(before: &str, after: &str) -> (usize, usize) {
+    let prev = before.chars().next_back();
+    let next = after.chars().next();
+    if let (Some(p), Some(n)) = (prev, next)
+        && closing(p) == Some(n)
+    {
+        return (1, 1);
+    }
+    if !before.is_empty() && before.chars().all(|c| c == ' ') {
+        return ((before.len() - 1) % INDENT + 1, 0);
+    }
+    (1, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Undo history
+// ---------------------------------------------------------------------------
+
+/// Undo steps kept per document.
+const MAX_UNDO: usize = 500;
+/// Typing (or deleting) without a pause this long stays one undo step.
+const UNDO_GROUP: Duration = Duration::from_millis(1200);
+
+struct Snapshot {
+    text: String,
+    cursor: text_editor::Cursor,
+}
+
+impl Snapshot {
+    fn of(content: &text_editor::Content) -> Self {
+        Self {
+            text: content.text(),
+            cursor: content.cursor(),
+        }
+    }
+
+    fn restore(self, content: &mut text_editor::Content) {
+        *content = text_editor::Content::with_text(&self.text);
+        content.move_to(self.cursor);
+    }
+}
+
+/// The kind of an edit, for grouping undo steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EditKind {
+    /// Typing a word (whitespace starts a new step).
+    Typing,
+    /// Backspace / Delete.
+    Deleting,
+    /// Anything else: its own step.
+    Other,
+}
+
+impl EditKind {
+    pub fn of(action: &text_editor::Action) -> Self {
+        match action {
+            text_editor::Action::Edit(text_editor::Edit::Insert(c)) if !c.is_whitespace() => {
+                Self::Typing
+            }
+            text_editor::Action::Edit(text_editor::Edit::Backspace | text_editor::Edit::Delete) => {
+                Self::Deleting
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Undo / redo by document snapshots.
+#[derive(Default)]
+pub struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The step being extended: its kind and when it was last extended.
+    open: Option<(EditKind, Instant)>,
+}
+
+impl History {
+    /// Call before applying an edit to `content`.
+    pub fn record(&mut self, kind: EditKind, content: &text_editor::Content) {
+        let now = Instant::now();
+        let extend = kind != EditKind::Other
+            && self
+                .open
+                .is_some_and(|(k, at)| k == kind && now - at < UNDO_GROUP);
+        self.open = (kind != EditKind::Other).then_some((kind, now));
+        if extend {
+            return;
+        }
+        self.undo.push(Snapshot::of(content));
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// The cursor moved: the next edit starts a new step.
+    pub fn break_step(&mut self) {
+        self.open = None;
+    }
+
+    pub fn undo(&mut self, content: &mut text_editor::Content) -> bool {
+        let Some(s) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(Snapshot::of(content));
+        s.restore(content);
+        self.open = None;
+        true
+    }
+
+    pub fn redo(&mut self, content: &mut text_editor::Content) -> bool {
+        let Some(s) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(Snapshot::of(content));
+        s.restore(content);
+        self.open = None;
+        true
+    }
+}
+
 /// The editor's own keys; everything else gets iced's defaults.
+///
+/// - Enter keeps (and after `key:` deepens) the indentation; Cmd+Enter opens a line below
+/// - Tab / Shift+Tab and Cmd+] / Cmd+[ indent and outdent; Backspace in leading spaces
+///   removes one indent level
+/// - Brackets and quotes close themselves and wrap a selection
+/// - Cmd+Z undo, Shift+Cmd+Z / Cmd+Y redo
+/// - Cmd+/ comment, Cmd+L select line, Shift+Cmd+D duplicate, Shift+Cmd+K delete line,
+///   Option+Up / Down move lines
+/// - Option+Backspace / Cmd+Backspace delete a word / to the line start, Option+Delete the
+///   next word; Cmd+Up / Down go to the start / end of the document
+/// - Cmd+S save, Cmd+F find, Cmd+G / Shift+Cmd+G next / previous match
 pub fn key_binding(press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
-    use text_editor::Binding;
+    use text_editor::{Binding, Motion};
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
     let m = press.modifiers;
     let latin = press.key.to_latin(press.physical_key);
+    let typed = press
+        .text
+        .as_deref()
+        .and_then(|t| t.chars().next())
+        .filter(|_| !m.command() && !m.control());
+    if let Some(c) = typed.filter(|c| is_pair_char(*c)) {
+        return Some(Binding::Custom(Message::YamlType(c)));
+    }
+    let select_or_move = |motion| {
+        if m.shift() {
+            Binding::Select(motion)
+        } else {
+            Binding::Move(motion)
+        }
+    };
     match (press.key.as_ref(), latin) {
         (Key::Named(Named::Enter), _) if m.is_empty() => {
             return Some(Binding::Custom(Message::YamlEnter));
         }
+        (Key::Named(Named::Enter), _) if m.command() && !m.shift() => {
+            return Some(Binding::Sequence(vec![
+                Binding::Move(Motion::End),
+                Binding::Custom(Message::YamlEnter),
+            ]));
+        }
         (Key::Named(Named::Tab), _) if !m.command() && !m.alt() => {
             return Some(Binding::Custom(Message::YamlIndent(m.shift())));
+        }
+        (Key::Named(Named::Backspace), _) if m.command() => {
+            return Some(Binding::Sequence(vec![
+                Binding::Select(Motion::Home),
+                Binding::Backspace,
+            ]));
+        }
+        (Key::Named(Named::Backspace), _) if m.alt() => {
+            return Some(Binding::Sequence(vec![
+                Binding::Select(Motion::WordLeft),
+                Binding::Backspace,
+            ]));
+        }
+        (Key::Named(Named::Backspace), _) if !m.control() => {
+            return Some(Binding::Custom(Message::YamlBackspace));
+        }
+        (Key::Named(Named::Delete), _) if m.alt() => {
+            return Some(Binding::Sequence(vec![
+                Binding::Select(Motion::WordRight),
+                Binding::Delete,
+            ]));
+        }
+        (Key::Named(Named::ArrowUp), _) if m.alt() && !m.command() => {
+            return Some(Binding::Custom(Message::YamlLine(LineOp::MoveUp)));
+        }
+        (Key::Named(Named::ArrowDown), _) if m.alt() && !m.command() => {
+            return Some(Binding::Custom(Message::YamlLine(LineOp::MoveDown)));
+        }
+        (Key::Named(Named::ArrowUp), _) if m.macos_command() => {
+            return Some(select_or_move(Motion::DocumentStart));
+        }
+        (Key::Named(Named::ArrowDown), _) if m.macos_command() => {
+            return Some(select_or_move(Motion::DocumentEnd));
+        }
+        (_, Some('z')) if m.command() && m.shift() => {
+            return Some(Binding::Custom(Message::YamlRedo));
+        }
+        (_, Some('z')) if m.command() => return Some(Binding::Custom(Message::YamlUndo)),
+        (_, Some('y')) if m.command() => return Some(Binding::Custom(Message::YamlRedo)),
+        (_, Some('d')) if m.command() && m.shift() => {
+            return Some(Binding::Custom(Message::YamlLine(LineOp::Duplicate)));
+        }
+        (_, Some('k')) if m.command() && m.shift() => {
+            return Some(Binding::Custom(Message::YamlLine(LineOp::Delete)));
+        }
+        (_, Some('l')) if m.command() && !m.shift() => return Some(Binding::SelectLine),
+        (_, Some(']')) if m.command() && !m.shift() => {
+            return Some(Binding::Custom(Message::YamlIndent(false)));
+        }
+        (_, Some('[')) if m.command() && !m.shift() => {
+            return Some(Binding::Custom(Message::YamlIndent(true)));
         }
         (_, Some('/')) if m.command() => return Some(Binding::Custom(Message::YamlComment)),
         (_, Some('s')) if m.command() => return Some(Binding::Custom(Message::YamlApply)),
@@ -841,6 +1179,44 @@ fn push_value(push: &mut impl FnMut(usize, usize, Color), at: usize, value: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_ops() {
+        let mut t = String::from("a\nb\nc");
+        let sel = line_op(&mut t, 2..2, LineOp::Duplicate);
+        assert_eq!((t.as_str(), sel), ("a\nb\nb\nc", 4..4));
+        let mut t = String::from("a\nb\nc");
+        let sel = line_op(&mut t, 2..2, LineOp::MoveUp);
+        assert_eq!((t.as_str(), sel), ("b\na\nc", 0..0));
+        let mut t = String::from("a\nb\nc");
+        let sel = line_op(&mut t, 2..2, LineOp::MoveDown);
+        assert_eq!((t.as_str(), sel), ("a\nc\nb", 4..4));
+        let mut t = String::from("a\nb\nc");
+        let sel = line_op(&mut t, 2..2, LineOp::Delete);
+        assert_eq!((t.as_str(), sel), ("a\nc", 2..2));
+        let mut t = String::from("a\nb\nc");
+        let sel = line_op(&mut t, 4..4, LineOp::Delete);
+        assert_eq!((t.as_str(), sel), ("a\nb", 2..2));
+        let mut t = String::from("a\nb");
+        assert_eq!(line_op(&mut t, 0..0, LineOp::MoveUp), 0..0);
+        assert_eq!(t, "a\nb");
+    }
+
+    #[test]
+    fn auto_pairs() {
+        assert_eq!(on_type("name: ", "", false, '"'), Typed::Pair('"'));
+        assert_eq!(on_type("name: \"x", "\"", false, '"'), Typed::Skip);
+        assert_eq!(on_type("don", "", false, '\''), Typed::Insert);
+        assert_eq!(on_type("a: \"x", "", false, '"'), Typed::Insert);
+        assert_eq!(on_type("a: ", "x", false, '['), Typed::Insert);
+        assert_eq!(on_type("a: ", "", false, '['), Typed::Pair(']'));
+        assert_eq!(on_type("a: [", "]", false, ']'), Typed::Skip);
+        assert_eq!(on_type("a: ", "x", true, '"'), Typed::Wrap('"'));
+        assert_eq!(on_backspace("a: [", "]"), (1, 1));
+        assert_eq!(on_backspace("    ", "b: 1"), (2, 0));
+        assert_eq!(on_backspace("   ", "b"), (1, 0));
+        assert_eq!(on_backspace("ab", ""), (1, 0));
+    }
 
     #[test]
     fn indent_depths_bridge_blank_lines() {

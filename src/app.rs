@@ -1,3 +1,4 @@
+mod axis_lock;
 mod changelog;
 mod code_editor;
 mod filter;
@@ -57,6 +58,8 @@ const MAX_LOG_LINES: usize = 100_000;
 /// How many extra lines to request each time the user scrolls to the top of the logs.
 const LOG_PAGE: usize = 1_000;
 const TOAST_FOR: Duration = Duration::from_secs(5);
+/// Notifications on screen at once; older ones make way for new ones.
+const MAX_TOASTS: usize = 3;
 const ROW_HEIGHT: f32 = 36.0;
 const NAV_WIDTH: f32 = 224.0;
 const LOG_MIN_HEIGHT: f32 = 160.0;
@@ -418,6 +421,8 @@ struct YamlView {
     parse_error: Option<(usize, String)>,
     /// A new object (Apply creates it) rather than an existing one.
     create: bool,
+    /// Undo / redo of the edit buffer.
+    history: code_editor::History,
 }
 
 #[derive(PartialEq)]
@@ -452,9 +457,12 @@ struct PfDialog {
 }
 
 struct Toast {
+    id: u64,
     text: String,
     error: bool,
     at: Instant,
+    /// How many times this message came in while on screen.
+    count: usize,
 }
 
 /// Something the user asked for on a resource. Applies to the active cluster tab.
@@ -518,6 +526,8 @@ pub enum PopupKind {
     LogTail(usize),
     /// A log tab's container picker.
     LogContainer(usize),
+    /// A dock tab's right-click menu (index into logs, then shells).
+    DockTab(usize),
 }
 
 struct Popup {
@@ -550,6 +560,7 @@ pub enum Message {
     WindowResized(Size),
     CloseRequested,
     CursorMoved(Point),
+    MousePressed,
     MouseReleased,
     /// A key nobody else handled: the key, its Latin letter (layout-independent), modifiers.
     Key(Key, Option<char>, keyboard::Modifiers),
@@ -602,6 +613,7 @@ pub enum Message {
     // Generic
     Copy(String),
     OpenUrl(String),
+    DismissToast(u64),
     Noop,
 
     // Updates and "What's new"
@@ -615,6 +627,9 @@ pub enum Message {
     // Bottom dock: logs and shells
     DockSelect(usize),
     DockClose(usize),
+    DockCloseOthers(usize),
+    DockCloseLeft(usize),
+    DockCloseRight(usize),
     DockCloseAll,
     SetLogMode(LogPanelMode),
     ToggleSplit,
@@ -631,6 +646,12 @@ pub enum Message {
     YamlIndent(bool),
     YamlComment,
     YamlEnter,
+    YamlBackspace,
+    /// A bracket or quote typed (they close themselves).
+    YamlType(char),
+    YamlLine(code_editor::LineOp),
+    YamlUndo,
+    YamlRedo,
     Find(code_editor::FindMsg),
 
     // Dialogs
@@ -659,6 +680,8 @@ pub struct App {
     shells: Vec<ShellView>,
     /// Index into the dock's tabs: logs, then shells.
     active_log: usize,
+    /// The bottom panel was clicked (or a tab opened in it) last, so ⌘W closes its tab.
+    dock_focused: bool,
     /// In split view: the log tab (left) and shell tab (right) last picked.
     split_log: usize,
     split_shell: usize,
@@ -743,6 +766,7 @@ impl App {
             logs: Vec::new(),
             shells: Vec::new(),
             active_log: 0,
+            dock_focused: false,
             split_log: 0,
             split_shell: 0,
             yaml: None,
@@ -897,6 +921,7 @@ impl App {
                 iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
                 }
+                iced::Event::Mouse(mouse::Event::ButtonPressed(_)) => Some(Message::MousePressed),
                 iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                     Some(Message::MouseReleased)
                 }
@@ -961,6 +986,7 @@ impl App {
                     self.drag_to(drag, p);
                 }
             }
+            Message::MousePressed => self.dock_focused = self.over_dock(self.cursor),
             Message::MouseReleased => {
                 if matches!(self.drag.take(), Some(Drag::Dock | Drag::Column { .. })) {
                     self.settings.save();
@@ -1161,6 +1187,7 @@ impl App {
                 self.toast("Quit and reopen Kube UI to use the new version.", false);
             }
             Message::ShowChangelog(open) => self.changelog_open = open,
+            Message::DismissToast(id) => self.toasts.retain(|t| t.id != id),
             Message::ToggleLive => {
                 self.settings.live_updates = !self.settings.live_updates;
                 self.settings.save();
@@ -1170,8 +1197,15 @@ impl App {
                 self.active_log = i;
                 self.show_logs();
             }
-            Message::DockClose(i) => self.close_dock_tab(i),
+            Message::DockClose(i) => {
+                self.popup = None;
+                self.close_dock_tab(i);
+            }
+            Message::DockCloseOthers(i) => self.close_dock_tabs(i, |j| j == i),
+            Message::DockCloseLeft(i) => self.close_dock_tabs(i, |j| j >= i),
+            Message::DockCloseRight(i) => self.close_dock_tabs(i, |j| j <= i),
             Message::DockCloseAll => {
+                self.popup = None;
                 self.logs.clear();
                 self.shells.clear();
             }
@@ -1187,6 +1221,7 @@ impl App {
             Message::YamlEdit => {
                 if let Some(y) = self.yaml.as_mut() {
                     y.editing = true;
+                    y.history = Default::default();
                     y.content.move_to(text_editor::Cursor {
                         position: text_editor::Position { line: 0, column: 0 },
                         selection: None,
@@ -1204,6 +1239,7 @@ impl App {
                         y.dirty = false;
                         y.save_error = None;
                         y.parse_error = None;
+                        y.history = Default::default();
                         if let Some(Ok(t)) = &y.text {
                             y.content = text_editor::Content::with_text(t);
                         }
@@ -1226,6 +1262,13 @@ impl App {
             }
             Message::YamlComment => self.yaml_edit_with(code_editor::toggle_comment),
             Message::YamlEnter => self.yaml_enter(),
+            Message::YamlBackspace => self.yaml_backspace(),
+            Message::YamlType(c) => self.yaml_type(c),
+            Message::YamlLine(op) => {
+                self.yaml_edit_with(|text, range| code_editor::line_op(text, range, op))
+            }
+            Message::YamlUndo => self.yaml_history(false),
+            Message::YamlRedo => self.yaml_history(true),
             Message::Find(msg) => return self.find_message(msg),
 
             Message::PfRemote(text) => {
@@ -1393,6 +1436,8 @@ impl App {
             }
             's' if self.yaml.as_ref().is_some_and(|y| y.editing) => self.yaml_apply(),
             #[cfg(not(target_os = "macos"))]
+            'w' if m.shift() => self.close_active_dock_tab(),
+            #[cfg(not(target_os = "macos"))]
             'w' => self.close_frontmost(),
             #[cfg(not(target_os = "macos"))]
             'r' => {
@@ -1442,6 +1487,7 @@ impl App {
                 }
             }
             MenuCommand::Close => self.close_frontmost(),
+            MenuCommand::ClosePanelTab => self.close_active_dock_tab(),
             MenuCommand::Reload => {
                 if let Some(ws) = self.ws_mut() {
                     ws.refresh();
@@ -1494,6 +1540,8 @@ impl App {
             }
         } else if self.changelog_open {
             self.changelog_open = false;
+        } else if self.dock_focused && self.dock_height().is_some() {
+            self.close_active_dock_tab();
         } else if let Some(ws) = self.ws_mut().filter(|ws| ws.has_drawer()) {
             ws.close_drawer();
         } else if self.workspaces.len() > 1 {
@@ -1604,12 +1652,28 @@ impl App {
         self.next_id
     }
 
+    /// Shows a notification. A repeat of one already on screen replaces it (with a count),
+    /// and only the newest [`MAX_TOASTS`] stay.
     fn toast(&mut self, text: impl Into<String>, error: bool) {
+        let text = text.into();
+        let mut count = 1;
+        if let Some(i) = self
+            .toasts
+            .iter()
+            .position(|t| t.text == text && t.error == error)
+        {
+            count += self.toasts.remove(i).count;
+        }
+        let id = self.next_id();
         self.toasts.push(Toast {
-            text: text.into(),
+            id,
+            text,
             error,
             at: Instant::now(),
+            count,
         });
+        let extra = self.toasts.len().saturating_sub(MAX_TOASTS);
+        self.toasts.drain(..extra);
     }
 
     fn ws(&self) -> Option<&Workspace> {
@@ -2070,6 +2134,7 @@ impl App {
             save_error: None,
             parse_error: None,
             create: true,
+            history: Default::default(),
         });
         operation::focus(view::YAML_EDITOR)
     }
@@ -2094,6 +2159,7 @@ impl App {
             save_error: None,
             parse_error: None,
             create: false,
+            history: Default::default(),
         });
         let bus = self.bus.clone();
         self.rt.spawn(async move {
@@ -2114,8 +2180,114 @@ impl App {
         if is_edit && (!y.editing || y.saving) {
             return; // The viewer is read-only; selection and scrolling still work.
         }
+        if is_edit {
+            y.history
+                .record(code_editor::EditKind::of(&action), &y.content);
+        } else if !matches!(action, text_editor::Action::Scroll { .. }) {
+            y.history.break_step();
+        }
         y.content.perform(action);
         if is_edit {
+            Self::yaml_changed(y);
+            self.refresh_find();
+        }
+    }
+
+    /// The edit buffer, when it can be edited.
+    fn yaml_editable(&mut self) -> Option<&mut YamlView> {
+        self.yaml.as_mut().filter(|y| y.editing && !y.saving)
+    }
+
+    /// Applies editor actions as one undo step of the given kind.
+    fn yaml_perform(&mut self, kind: code_editor::EditKind, actions: Vec<text_editor::Action>) {
+        let Some(y) = self.yaml_editable() else {
+            return;
+        };
+        y.history.record(kind, &y.content);
+        for a in actions {
+            y.content.perform(a);
+        }
+        Self::yaml_changed(y);
+        self.refresh_find();
+    }
+
+    /// The cursor's line split at the cursor, and whether there is a selection.
+    fn yaml_cursor_line(y: &YamlView) -> (String, String, bool) {
+        let cursor = y.content.cursor();
+        let line = y
+            .content
+            .line(cursor.position.line)
+            .map(|l| l.text.to_string())
+            .unwrap_or_default();
+        let mut col = cursor.position.column.min(line.len());
+        while !line.is_char_boundary(col) {
+            col -= 1;
+        }
+        let has_selection = cursor.selection.is_some_and(|s| s != cursor.position);
+        (
+            line[..col].to_string(),
+            line[col..].to_string(),
+            has_selection,
+        )
+    }
+
+    /// Brackets and quotes: close, skip over, or wrap the selection.
+    fn yaml_type(&mut self, c: char) {
+        use code_editor::{EditKind, Typed};
+        use text_editor::{Action, Edit, Motion};
+        let Some(y) = self.yaml_editable() else {
+            return;
+        };
+        let (before, after, has_selection) = Self::yaml_cursor_line(y);
+        let actions = match code_editor::on_type(&before, &after, has_selection, c) {
+            Typed::Insert => vec![Action::Edit(Edit::Insert(c))],
+            Typed::Skip => {
+                y.content.perform(Action::Move(Motion::Right));
+                return;
+            }
+            Typed::Pair(close) => vec![
+                Action::Edit(Edit::Insert(c)),
+                Action::Edit(Edit::Insert(close)),
+                Action::Move(Motion::Left),
+            ],
+            Typed::Wrap(close) => {
+                let sel = y.content.selection().unwrap_or_default();
+                vec![Action::Edit(Edit::Paste(Arc::new(format!(
+                    "{c}{sel}{close}"
+                ))))]
+            }
+        };
+        self.yaml_perform(EditKind::Typing, actions);
+    }
+
+    /// Backspace: removes an empty pair at once, and an indent level in leading spaces.
+    fn yaml_backspace(&mut self) {
+        use text_editor::{Action, Edit};
+        let Some(y) = self.yaml_editable() else {
+            return;
+        };
+        let (before, after, has_selection) = Self::yaml_cursor_line(y);
+        let (back, forward) = if has_selection {
+            (1, 0)
+        } else {
+            code_editor::on_backspace(&before, &after)
+        };
+        let actions = std::iter::repeat_n(Action::Edit(Edit::Delete), forward)
+            .chain(std::iter::repeat_n(Action::Edit(Edit::Backspace), back))
+            .collect();
+        self.yaml_perform(code_editor::EditKind::Deleting, actions);
+    }
+
+    fn yaml_history(&mut self, redo: bool) {
+        let Some(y) = self.yaml_editable() else {
+            return;
+        };
+        let changed = if redo {
+            y.history.redo(&mut y.content)
+        } else {
+            y.history.undo(&mut y.content)
+        };
+        if changed {
             Self::yaml_changed(y);
             self.refresh_find();
         }
@@ -2148,6 +2320,11 @@ impl App {
         let mut text = y.content.text();
         let range = code_editor::char_range(&text, y.content.cursor());
         let new = f(&mut text, range);
+        if text == y.content.text() {
+            y.content.move_to(code_editor::cursor_for(&text, new));
+            return;
+        }
+        y.history.record(code_editor::EditKind::Other, &y.content);
         y.content = text_editor::Content::with_text(&text);
         y.content.move_to(code_editor::cursor_for(&text, new));
         Self::yaml_changed(y);
@@ -2167,6 +2344,7 @@ impl App {
             .unwrap_or_default();
         let before = &line[..cursor.position.column.min(line.len())];
         let insert = code_editor::newline_insert(before);
+        y.history.record(code_editor::EditKind::Other, &y.content);
         y.content
             .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
                 Arc::new(insert),
@@ -2271,6 +2449,7 @@ impl App {
         view.start(id, self.rt.handle(), &self.bus);
         self.logs.push(view);
         self.active_log = self.logs.len() - 1;
+        self.dock_focused = true;
     }
 
     /// Opens a shell tab into a pod's container. A container already open gets a second tab:
@@ -2291,6 +2470,7 @@ impl App {
         view.start(self.rt.handle(), &self.bus);
         self.shells.push(view);
         self.active_log = self.logs.len() + self.shells.len() - 1;
+        self.dock_focused = true;
         self.show_logs();
     }
 
@@ -2328,6 +2508,52 @@ impl App {
         if self.active_log > i || self.active_log >= total {
             self.active_log = self.active_log.saturating_sub(1);
         }
+    }
+
+    /// ⇧⌘W (and ⌘W while the panel has focus): closes the bottom panel's selected tab.
+    fn close_active_dock_tab(&mut self) {
+        let total = self.logs.len() + self.shells.len();
+        if total == 0 {
+            self.toast("No logs or terminals open.", false);
+        } else {
+            self.close_dock_tab(self.active_log.min(total - 1));
+        }
+        if self.logs.is_empty() && self.shells.is_empty() {
+            self.dock_focused = false;
+        }
+    }
+
+    /// Whether `p` is over the bottom panel (right of the sidebar, along the window's foot).
+    fn over_dock(&self, p: Point) -> bool {
+        !self.workspaces.is_empty()
+            && p.x >= NAV_WIDTH
+            && self
+                .dock_height()
+                .is_some_and(|h| p.y >= self.window_size.height - h)
+    }
+
+    /// Closes every dock tab for which `keep` is false. The active tab stays active when
+    /// kept; otherwise tab `focus` (which must be kept) becomes active.
+    fn close_dock_tabs(&mut self, focus: usize, keep: impl Fn(usize) -> bool) {
+        self.popup = None;
+        let n_logs = self.logs.len();
+        let total = n_logs + self.shells.len();
+        if focus >= total {
+            return;
+        }
+        let active = self.active_log.min(total - 1);
+        let anchor = if keep(active) { active } else { focus };
+        self.active_log = (0..anchor).filter(|&j| keep(j)).count();
+        let mut j = 0;
+        self.logs.retain(|_| {
+            j += 1;
+            keep(j - 1)
+        });
+        let mut j = n_logs;
+        self.shells.retain(|_| {
+            j += 1;
+            keep(j - 1)
+        });
     }
 
     fn set_log_mode(&mut self, mode: LogPanelMode) {

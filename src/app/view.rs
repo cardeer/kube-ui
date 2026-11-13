@@ -660,6 +660,21 @@ impl App {
     // Bottom dock: logs and shells
     // -----------------------------------------------------------------------
 
+    /// The bottom panel's height (with its top edge), or `None` when it has no tabs.
+    pub(super) fn dock_height(&self) -> Option<f32> {
+        if self.logs.is_empty() && self.shells.is_empty() {
+            return None;
+        }
+        Some(match self.settings.log_mode {
+            LogPanelMode::Collapsed => LOG_COLLAPSED_HEIGHT,
+            LogPanelMode::Expanded => self.dock_max_height(),
+            LogPanelMode::Normal => self
+                .settings
+                .log_height
+                .clamp(LOG_MIN_HEIGHT, self.dock_max_height()),
+        })
+    }
+
     fn view_dock(&self) -> Option<El<'_>> {
         let total = self.logs.len() + self.shells.len();
         if total == 0 {
@@ -721,10 +736,22 @@ impl App {
                         mouse_area(label)
                             .on_press(Message::DockSelect(i))
                             .on_middle_press(Message::DockClose(i))
+                            .on_right_press(Message::OpenPopup(
+                                PopupKind::DockTab(i),
+                                widget::Id::new("dock-tab-menu"),
+                            ))
                             .interaction(iced::mouse::Interaction::Pointer),
-                        format!("{hover}\nMiddle-click to close"),
+                        format!("{hover}\nMiddle-click to close · right-click for more"),
                     ),
-                    theme::icon_button(icon::X, "Close", Some(Message::DockClose(i))),
+                    theme::icon_button(
+                        icon::X,
+                        if i == active {
+                            "Close (⇧⌘W)"
+                        } else {
+                            "Close"
+                        },
+                        Some(Message::DockClose(i)),
+                    ),
                 ]
                 .spacing(4)
                 .align_y(iced::Center),
@@ -803,19 +830,9 @@ impl App {
         .spacing(8)
         .align_y(iced::Center);
 
-        let (height, body): (f32, Option<El<'_>>) = match mode {
-            LogPanelMode::Collapsed => (LOG_COLLAPSED_HEIGHT, None),
-            LogPanelMode::Expanded => (
-                self.dock_max_height(),
-                Some(self.dock_body(shown_log, shown_shell)),
-            ),
-            LogPanelMode::Normal => (
-                self.settings
-                    .log_height
-                    .clamp(LOG_MIN_HEIGHT, self.dock_max_height()),
-                Some(self.dock_body(shown_log, shown_shell)),
-            ),
-        };
+        let height = self.dock_height().unwrap_or(LOG_COLLAPSED_HEIGHT);
+        let body =
+            (mode != LogPanelMode::Collapsed).then(|| self.dock_body(shown_log, shown_shell));
         let mut col = column![header].spacing(6);
         if let Some(body) = body {
             col = col.push(theme::hline());
@@ -1077,27 +1094,40 @@ impl App {
                     ));
                 }
                 col = col.push(bar);
+                // Notices that come and go (find bar, warnings, errors) share one slot, so the
+                // editor keeps its place in the widget tree. Otherwise a notice appearing (an
+                // unclosed quote makes the YAML invalid) resets its scroll position and focus.
+                let mut notices = column![].spacing(6);
+                let has_notice = self.find.open
+                    || (y.editing && original.contains("app.kubernetes.io/managed-by: Helm"))
+                    || y.save_error.is_some()
+                    || (y.editing && y.parse_error.is_some());
                 if self.find.open {
-                    col = col.push(self.find.bar());
+                    notices = notices.push(self.find.bar());
                 }
                 if y.editing && original.contains("app.kubernetes.io/managed-by: Helm") {
-                    col = col.push(theme::colored(
+                    notices = notices.push(theme::colored(
                         "Managed by Helm: the next helm upgrade will overwrite changes made here.",
                         YELLOW,
                     ));
                 }
                 if let Some(e) = &y.save_error {
-                    col = col.push(theme::colored(e.clone(), RED));
+                    notices = notices.push(theme::colored(e.clone(), RED));
                     if e.contains("modified") || e.contains("Conflict") {
-                        col = col.push(theme::faint(
+                        notices = notices.push(theme::faint(
                             "Someone changed it since you opened it. Copy your edits, Reload, and apply them again.",
                         ));
                     }
                 }
                 if let Some((line, msg)) = y.parse_error.as_ref().filter(|_| y.editing) {
-                    col = col.push(code_editor::error_line(*line, msg));
+                    notices = notices.push(code_editor::error_line(*line, msg));
                 }
-                col = col.push(self.yaml_editor(y));
+                let gap = if has_notice { 6.0 } else { 0.0 };
+                col = col.push(
+                    column![notices, self.yaml_editor(y)]
+                        .spacing(gap)
+                        .height(Length::Fill),
+                );
             }
         }
         container(col)
@@ -1154,7 +1184,7 @@ impl App {
                 .width(Length::Fill)
                 .height(Length::Fill),
         );
-        container(
+        container(axis_lock::axis_lock(
             scrollable(row![
                 code_editor::gutter(lines, cursor_line, error_line),
                 container(Space::new().width(1).height(Length::Fill))
@@ -1166,7 +1196,7 @@ impl App {
             .style(theme::scrollbar)
             .width(Length::Fill)
             .height(Length::Fill),
-        )
+        ))
         .style(theme::boxed(theme::CONTENT, theme::BORDER, 4.0))
         .height(Length::Fill)
         .into()
@@ -1189,12 +1219,21 @@ impl App {
             PopupKind::Forward(id) => (self.popup_forward(*id), 200.0),
             PopupKind::LogTail(i) => (self.popup_log_tail(*i), 100.0),
             PopupKind::LogContainer(i) => (self.popup_log_container(*i), 160.0),
+            PopupKind::DockTab(i) => (self.popup_dock_tab(*i), 200.0),
         };
         let a = p.anchor;
         let width = a.width.max(min_w);
         let x = a.x.min(self.window_size.width - width - 8.0).max(8.0);
         let below = a.y + a.height + 4.0;
-        let max_h = (self.window_size.height - below - 12.0).max(160.0);
+        let room_below = self.window_size.height - below - 12.0;
+        let room_above = a.y - 4.0 - 12.0;
+        // Near the bottom edge (e.g. the dock's tabs) the menu opens upward instead.
+        let upward = room_below < 240.0 && room_above > room_below;
+        let max_h = if upward {
+            room_above
+        } else {
+            room_below.max(160.0)
+        };
         let menu = container(
             scrollable(content)
                 .direction(theme::thin())
@@ -1206,7 +1245,17 @@ impl App {
         .style(theme::card);
         let backdrop = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
             .on_press(Message::ClosePopup);
-        Some(stack![backdrop, pin(opaque(menu)).x(x).y(below)].into())
+        let placed: El<'_> = if upward {
+            pin(container(opaque(menu))
+                .height(a.y - 4.0)
+                .align_y(iced::alignment::Vertical::Bottom))
+            .x(x)
+            .y(0.0)
+            .into()
+        } else {
+            pin(opaque(menu)).x(x).y(below).into()
+        };
+        Some(stack![backdrop, placed].into())
     }
 
     fn search_input<'a>(query: &str) -> El<'a> {
@@ -1402,6 +1451,47 @@ impl App {
         .into()
     }
 
+    /// A dock tab's right-click menu.
+    fn popup_dock_tab(&self, i: usize) -> El<'_> {
+        let total = self.logs.len() + self.shells.len();
+        let on = |enabled: bool, msg: Message| enabled.then_some(msg);
+        column![
+            theme::menu_entry(
+                Some(icon::X),
+                "Close",
+                theme::TEXT,
+                on(i < total, Message::DockClose(i)),
+            ),
+            theme::menu_entry(
+                None,
+                "Close others",
+                theme::TEXT,
+                on(total > 1 && i < total, Message::DockCloseOthers(i)),
+            ),
+            theme::menu_entry(
+                Some(icon::ARROW_LEFT),
+                "Close tabs to the left",
+                theme::TEXT,
+                on(i > 0 && i < total, Message::DockCloseLeft(i)),
+            ),
+            theme::menu_entry(
+                Some(icon::ARROW_RIGHT),
+                "Close tabs to the right",
+                theme::TEXT,
+                on(i + 1 < total, Message::DockCloseRight(i)),
+            ),
+            container(theme::hline()).padding([3, 0]),
+            theme::menu_entry(
+                Some(icon::X_CIRCLE),
+                "Close all",
+                theme::TEXT,
+                Some(Message::DockCloseAll),
+            ),
+        ]
+        .spacing(2)
+        .into()
+    }
+
     fn popup_forward(&self, id: u64) -> El<'_> {
         let Some(f) = self.forwards.iter().find(|f| f.id == id) else {
             return Space::new().into();
@@ -1476,22 +1566,65 @@ impl App {
             } else {
                 (GREEN, icon::CHECK_CIRCLE)
             };
-            container(
-                row![
-                    text(glyph).font(theme::ICONS).size(16.0).color(color),
-                    theme::txt(t.text.as_str()).width(Length::Fill),
-                ]
-                .spacing(8),
-            )
-            .padding([10, 14])
-            .width(Length::Fill)
-            .style(theme::card)
-            .into()
+            let mut line = row![
+                text(glyph).font(theme::ICONS).size(16.0).color(color),
+                theme::txt(toast_text(&t.text)).width(Length::Fill),
+            ]
+            .spacing(8)
+            .align_y(iced::Center);
+            if t.count > 1 {
+                line = line.push(theme::faint(format!("×{}", t.count)));
+            }
+            line = line.push(theme::icon_button(
+                icon::X,
+                "Dismiss",
+                Some(Message::DismissToast(t.id)),
+            ));
+            container(line)
+                .padding(Padding {
+                    left: 14.0,
+                    right: 6.0,
+                    top: 6.0,
+                    bottom: 6.0,
+                })
+                .width(Length::Fill)
+                .style(theme::card)
+                .into()
         });
         container(column(cards).spacing(6).width(420))
             .align_right(Length::Fill)
             .align_bottom(Length::Fill)
             .padding(16)
             .into()
+    }
+}
+
+/// Notification text, cut short so one long error can't fill the screen.
+fn toast_text(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    const MAX_LINES: usize = 4;
+    let mut out: String = text
+        .lines()
+        .take(MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(MAX_CHARS)
+        .collect();
+    if out.len() < text.trim_end().len() {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toast_text;
+
+    #[test]
+    fn toast_text_is_cut_short() {
+        assert_eq!(toast_text("Copied"), "Copied");
+        assert_eq!(toast_text("a\nb\nc\nd\ne"), "a\nb\nc\nd…");
+        assert_eq!(toast_text(&"x".repeat(300)).chars().count(), 241);
     }
 }

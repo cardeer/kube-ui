@@ -20,6 +20,8 @@ pub enum MenuCommand {
     NewTab,
     OpenKubeconfig,
     Close,
+    /// Close the selected log or terminal tab in the bottom panel.
+    ClosePanelTab,
     Reload,
     ToggleBottomPanel,
     Go(Tab),
@@ -86,6 +88,11 @@ impl MenuBar {
                 ),
                 &PredefinedMenuItem::separator(),
                 &item(MenuCommand::Close, "Close", key(cmd, Code::KeyW)),
+                &item(
+                    MenuCommand::ClosePanelTab,
+                    "Close Logs/Terminal Tab",
+                    key(cmd_shift, Code::KeyW),
+                ),
             ],
         )
         .ok()?;
