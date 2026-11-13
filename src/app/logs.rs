@@ -1,11 +1,22 @@
 //! Log tabs. A tab streams one pod, or every pod behind a selector/controller merged into
 //! one timeline (each line tagged with its pod), like `stern`.
+//!
+//! PORTING STUB (gpui-kit branch): rendering and scrolling were removed; see `git show
+//! main:src/app/logs.rs`. The logs part re-adds them on GPUI (virtualised lines).
 
-use iced::{
-    Element, Length, Task,
-    widget::{
-        self, Space, button, column, container, operation, rich_text, row, scrollable, span, text,
+use std::ops::Range;
+
+use gpui_kit::{
+    AnyElement, HighlightStyle, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, StyledText, Subscription, div,
+    component::{
+        Sizable as _, h_flex, v_flex,
+        input::{Input, InputEvent, InputState},
+        scroll::ScrollableElement as _,
     },
+    prelude::FluentBuilder as _,
+    px,
 };
 
 use super::filter::Matcher;
@@ -254,10 +265,17 @@ pub(super) struct LogView {
     older_pending: usize,
     older_found: bool,
     tasks: Vec<JoinHandle<()>>,
-    scroll_id: widget::Id,
-    /// The line view's scroll state from its last scroll event.
+    /// The line view's scroll state from its last report (see `prepare`).
     offset: f32,
     view_h: f32,
+    content_h: f32,
+    /// Scroll state of the line view; owned here so follow mode can drive it.
+    scroll: ScrollHandle,
+    /// The filter field and its subscription, created in `prepare`.
+    filter_input: Option<Entity<InputState>>,
+    subs: Vec<Subscription>,
+    /// Whether the field's placeholder currently says "regex".
+    hint_regex: bool,
     /// Scrolled to the end: new lines keep it there while following.
     at_bottom: bool,
     /// Lines arrived since the last update.
@@ -313,9 +331,13 @@ impl LogView {
             older_pending: 0,
             older_found: false,
             tasks: Vec::new(),
-            scroll_id: widget::Id::unique(),
             offset: 0.0,
             view_h: 0.0,
+            content_h: 0.0,
+            scroll: ScrollHandle::new(),
+            filter_input: None,
+            subs: Vec::new(),
+            hint_regex: false,
             at_bottom: true,
             new_lines: false,
             pending_offset: None,
@@ -552,22 +574,16 @@ impl LogView {
 
     /// After a batch of messages: refilter, keep a followed log at the bottom, and keep
     /// the view steady when older lines were prepended.
-    pub(super) fn after_update(&mut self) -> Task<Message> {
+    pub(super) fn after_update(&mut self) -> Task {
         self.refilter();
         let new_lines = std::mem::take(&mut self.new_lines);
         if let Some(y) = self.pending_offset.take() {
             self.offset = y;
-            return operation::scroll_to(
-                self.scroll_id.clone(),
-                operation::AbsoluteOffset {
-                    x: None,
-                    y: Some(y),
-                },
-            );
+            let at = self.scroll.offset();
+            self.scroll.set_offset(gpui::point(at.x, px(-y)));
+            return Task::none();
         }
         if self.follow && self.at_bottom && new_lines {
-            // Scrolling by operation reports no scroll event, so track the offset here.
-            self.offset = self.end_offset();
             return self.snap_to_bottom();
         }
         Task::none()
@@ -663,22 +679,21 @@ impl LogView {
     }
 
     /// Scrolls to the last line, leaving the sideways position where the user put it.
-    fn snap_to_bottom(&self) -> Task<Message> {
-        operation::snap_to(
-            self.scroll_id.clone(),
-            operation::RelativeOffset {
-                x: None,
-                y: Some(1.0),
-            },
-        )
+    fn snap_to_bottom(&mut self) -> Task {
+        // Set the estimate now so the next frame already draws the end, then let the
+        // scroll area settle exactly on the real end once it has laid the content out.
+        self.offset = self.end_offset();
+        let at = self.scroll.offset();
+        self.scroll.set_offset(gpui::point(at.x, px(-self.offset)));
+        self.scroll.scroll_to_bottom();
+        Task::none()
     }
 
     /// The scroll offset of the last line (the banner row counts too).
     fn end_offset(&self) -> f32 {
-        let view_h = if self.view_h > 0.0 {
-            self.view_h
-        } else {
-            300.0
+        let view_h = match f32::from(self.scroll.bounds().size.height) {
+            h if h > 0.0 => h,
+            _ => 300.0,
         };
         ((self.shown_len() + 1) as f32 * LINE - view_h).max(0.0)
     }
@@ -715,7 +730,7 @@ impl LogView {
         next_id: u64,
         rt: &Handle,
         bus: &Bus,
-    ) -> Task<Message> {
+    ) -> Task {
         match msg {
             LogMsg::SetContainer(c) => {
                 if c != self.container {
@@ -734,7 +749,6 @@ impl LogView {
                 self.follow = !self.follow;
                 if self.follow {
                     self.at_bottom = true;
-                    self.offset = self.end_offset();
                     return self.snap_to_bottom();
                 }
             }
@@ -785,6 +799,7 @@ impl LogView {
                 let up = offset < self.offset;
                 self.offset = offset;
                 self.view_h = view_h;
+                self.content_h = content_h;
                 self.at_bottom = offset + view_h >= content_h - LINE * 1.5;
                 // Scrolling up into the banner loads the page before.
                 if up && offset <= LINE && self.shown_len() > 0 {
@@ -799,82 +814,154 @@ impl LogView {
     // Rendering
     // -----------------------------------------------------------------------
 
+    /// Creates this tab's retained state (filter field) as needed, keeps the field in step
+    /// with the filter, and reports the lines' scroll state so follow mode, "at the bottom"
+    /// and "scrolled to the top" keep working.
+    pub(super) fn prepare(&mut self, window: &mut Window, cx: &mut Context<App>) {
+        if self.filter_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Filter lines")
+                    .default_value(self.filter.clone())
+            });
+            let key = self.key.clone();
+            self.subs.push(cx.subscribe_in(
+                &input,
+                window,
+                move |app: &mut App, state, event: &InputEvent, window, cx| {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let value = state.read(cx).value().to_string();
+                    if let Some(i) = app.logs.iter().position(|l| l.key == key) {
+                        app.dispatch(Message::Log(i, LogMsg::Filter(value)), window, cx);
+                    }
+                },
+            ));
+            self.hint_regex = false;
+            self.filter_input = Some(input);
+        }
+        if let Some(input) = self.filter_input.clone() {
+            if self.hint_regex != self.regex {
+                self.hint_regex = self.regex;
+                let hint = if self.regex {
+                    "Filter (regex)"
+                } else {
+                    "Filter lines"
+                };
+                input.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+            }
+            // Only when set from outside (the dev hook): typing keeps them equal.
+            if input.read(cx).value().as_ref() != self.filter {
+                let value = self.filter.clone();
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        }
+
+        let view_h = f32::from(self.scroll.bounds().size.height);
+        if view_h > 0.0 {
+            let offset = -f32::from(self.scroll.offset().y);
+            let content_h = f32::from(self.scroll.max_offset().y) + view_h;
+            if (offset, view_h, content_h) != (self.offset, self.view_h, self.content_h) {
+                let key = self.key.clone();
+                cx.defer_in(window, move |app, window, cx| {
+                    if let Some(i) = app.logs.iter().position(|l| l.key == key) {
+                        let msg = LogMsg::Scrolled(offset, view_h, content_h);
+                        app.dispatch(Message::Log(i, msg), window, cx);
+                    }
+                });
+            }
+        }
+    }
+
+    fn eid(&self, what: &str) -> SharedString {
+        format!("log-{what}-{}", self.key).into()
+    }
+
     /// Toolbar, pod chips and the scrolling lines. `index` is the tab's place in the dock.
-    pub(super) fn view(&self, index: usize, popup: Option<&PopupKind>) -> Element<'_, Message> {
+    pub(super) fn view(&self, index: usize, popup: Option<&PopupKind>) -> AnyElement {
         let msg = move |m: LogMsg| Message::Log(index, m);
-        let mut bar = row![].spacing(8).align_y(iced::Center);
+        let mut bar = h_flex().flex_wrap().items_center().gap(px(8.0)).gap_y(px(6.0));
         if self.containers.len() > 1 {
-            let id = format!("log-container-{index}");
-            bar = bar.push(
-                container(theme::dropdown_button(
+            bar = bar.child(crate::app::view::trigger(
+                PopupKind::LogContainer(index),
+                theme::dropdown_button(
+                    self.eid("container"),
                     self.container.clone(),
                     150.0,
                     popup == Some(&PopupKind::LogContainer(index)),
-                    Message::OpenPopup(
-                        PopupKind::LogContainer(index),
-                        widget::Id::from(id.clone()),
-                    ),
-                ))
-                .id(id),
-            );
+                    Message::OpenPopup(PopupKind::LogContainer(index)),
+                ),
+            ));
         } else {
-            bar = bar.push(theme::muted(self.container.clone()));
+            bar = bar.child(theme::muted(self.container.clone()));
         }
-        bar = bar.push(theme::vline(18.0));
-        bar = bar.push(theme::muted("Initial lines"));
-        let tail_id = format!("log-tail-{index}");
-        bar = bar.push(theme::tip(
-            container(theme::dropdown_button(
-                tail_label(self.tail),
-                76.0,
-                popup == Some(&PopupKind::LogTail(index)),
-                Message::OpenPopup(PopupKind::LogTail(index), widget::Id::from(tail_id.clone())),
+        bar = bar
+            .child(theme::vline(18.0))
+            .child(theme::muted("Initial lines"))
+            .child(crate::app::view::trigger(
+                PopupKind::LogTail(index),
+                theme::tip(
+                    theme::dropdown_button(
+                        self.eid("tail"),
+                        tail_label(self.tail),
+                        76.0,
+                        popup == Some(&PopupKind::LogTail(index)),
+                        Message::OpenPopup(PopupKind::LogTail(index)),
+                    ),
+                    "Lines per pod to start from. Scroll to the top to load older lines.",
+                ),
             ))
-            .id(tail_id),
-            "Lines per pod to start from. Scroll to the top to load older lines.",
-        ));
-        bar = bar.push(theme::checkbox(
-            self.timestamps,
-            "Timestamps",
-            msg(LogMsg::ToggleTimestamps),
-        ));
-        bar = bar.push(theme::checkbox(
-            self.follow,
-            "Auto-scroll",
-            msg(LogMsg::ToggleFollow),
-        ));
-        bar = bar.push(theme::segmented(
-            &["Current", "Previous"],
-            self.previous as usize,
-            "Current run, or the run before the last restart (--previous)",
-            move |i| msg(LogMsg::SetPrevious(i == 1)),
-        ));
+            .child(theme::checkbox(
+                self.eid("timestamps"),
+                self.timestamps,
+                "Timestamps",
+                msg(LogMsg::ToggleTimestamps),
+            ))
+            .child(theme::checkbox(
+                self.eid("follow"),
+                self.follow,
+                "Auto-scroll",
+                msg(LogMsg::ToggleFollow),
+            ))
+            .child(theme::segmented(
+                self.eid("previous"),
+                &["Current", "Previous"],
+                self.previous as usize,
+                "Current run, or the run before the last restart (--previous)",
+                move |i| msg(LogMsg::SetPrevious(i == 1)),
+            ));
         if self.previous {
             if let Some(exit) = self
                 .last_exit
                 .get(&self.container)
                 .filter(|e| !e.is_empty())
             {
-                bar = bar.push(theme::colored(format!("Last run: {exit}"), YELLOW));
+                bar = bar.child(theme::colored(format!("Last run: {exit}"), YELLOW));
             }
         }
-        let hint = if self.regex {
-            "Filter (regex)"
-        } else {
-            "Filter lines"
-        };
-        bar = bar.push(theme::search_field(&self.filter, hint, 200.0, move |f| {
-            msg(LogMsg::Filter(f))
-        }));
-        bar = bar.push(theme::toggle_button(
+        if let Some(input) = &self.filter_input {
+            bar = bar.child(
+                div().w(px(200.0)).child(
+                    Input::new(input)
+                        .small()
+                        .prefix(theme::icon(icon::MAGNIFYING_GLASS).text_size(px(13.0))),
+                ),
+            );
+        }
+        bar = bar.child(theme::toggle_button(
+            self.eid("regex"),
             ".*",
             self.regex,
             "Regular expression (case-insensitive)",
             msg(LogMsg::ToggleRegex),
         ));
         if let Some(err) = &self.matcher.error {
-            bar = bar.push(theme::tip(
-                theme::icon_label(icon::WARNING, "Invalid regex").map(|m: Message| m),
+            bar = bar.child(theme::tip(
+                div()
+                    .id(self.eid("regex-error"))
+                    .text_color(RED)
+                    .child(theme::icon_label(icon::WARNING, "Invalid regex")),
                 err.clone(),
             ));
         }
@@ -883,57 +970,65 @@ impl LogView {
         } else {
             "Restart stream"
         };
-        bar = bar.push(theme::icon_button(
-            icon::ARROW_CLOCKWISE,
-            restart_hint,
-            Some(msg(LogMsg::Restart)),
-        ));
-        bar = bar.push(theme::icon_button(
-            icon::COPY,
-            "Copy visible lines",
-            Some(msg(LogMsg::Copy)),
-        ));
-        bar = bar.push(theme::icon_button(
-            icon::BROOM,
-            "Clear",
-            Some(msg(LogMsg::Clear)),
-        ));
+        bar = bar
+            .child(theme::icon_button(
+                self.eid("restart"),
+                icon::ARROW_CLOCKWISE,
+                restart_hint,
+                Some(msg(LogMsg::Restart)),
+            ))
+            .child(theme::icon_button(
+                self.eid("copy"),
+                icon::COPY,
+                "Copy visible lines",
+                Some(msg(LogMsg::Copy)),
+            ))
+            .child(theme::icon_button(
+                self.eid("clear"),
+                icon::BROOM,
+                "Clear",
+                Some(msg(LogMsg::Clear)),
+            ));
         // Kept short so it never runs over the controls; a stream's message gets its own line below.
-        let mut status = row![theme::faint(format!("{} lines", self.lines.len()))]
-            .spacing(8)
-            .align_y(iced::Center);
+        let mut status = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .child(theme::faint(format!("{} lines", self.lines.len())));
         if self.live() {
-            status = status.push(
-                row![theme::dot(GREEN), theme::colored("live", GREEN)]
-                    .spacing(5)
-                    .align_y(iced::Center),
+            status = status.child(
+                h_flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(theme::dot(GREEN))
+                    .child(theme::colored("live", GREEN)),
             );
         } else if !self.sources.is_empty() {
-            status = status.push(theme::faint("stopped"));
+            status = status.child(theme::faint("stopped"));
         }
 
-        let mut col = column![
-            row![
-                container(bar.wrap().vertical_spacing(6)).width(Length::Fill),
-                status
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Start)
-        ]
-        .spacing(6);
+        let mut col = v_flex().size_full().gap(px(6.0)).child(
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap(px(8.0))
+                .child(bar.flex_1().min_w_0())
+                .child(status),
+        );
 
         // Pod chips: click to show/hide a pod's lines.
         if self.is_group() {
-            let mut chips = row![].spacing(4).align_y(iced::Center);
+            let mut chips = h_flex().flex_wrap().items_center().gap(px(4.0));
             if self.resolving {
-                chips = chips.push(theme::faint("Finding pods…"));
+                chips = chips.child(theme::faint("Finding pods…"));
             }
             if let Some(e) = &self.error {
-                chips = chips.push(theme::colored(e.clone(), RED));
+                chips = chips.child(theme::colored(e.clone(), RED));
             }
             let all_visible = self.sources.iter().all(|s| s.visible);
             if self.sources.len() > 1 && !all_visible {
-                chips = chips.push(theme::small_button(
+                chips = chips.child(theme::small_button(
+                    self.eid("show-all"),
                     None,
                     "Show all",
                     Some(msg(LogMsg::ShowAll)),
@@ -956,27 +1051,35 @@ impl LogView {
                 }
                 hover.push_str("\nClick to show/hide");
                 let visible = s.visible;
-                chips = chips.push(theme::tip(
-                    button(
-                        row![
-                            text(glyph).font(theme::ICONS).size(11.0).color(color),
-                            text(s.short.clone())
-                                .font(theme::MONO)
-                                .size(theme::MONO_SIZE)
-                                .color(color),
-                        ]
-                        .spacing(4)
-                        .align_y(iced::Center),
+                let chip = h_flex()
+                    .id(self.eid(&format!("chip-{}", s.pod)))
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(theme::RADIUS_SMALL))
+                    .cursor_pointer()
+                    .when(visible, |d| d.bg(theme::alpha(color, 0.12)))
+                    .hover(|d| d.bg(theme::FIELD_HOVER))
+                    .child(
+                        theme::icon(glyph)
+                            .text_size(px(11.0))
+                            .line_height(px(11.0))
+                            .text_color(color),
                     )
-                    .padding([2, 6])
-                    .style(theme::menu_item(visible, color))
-                    .on_press(msg(LogMsg::ToggleSource(i))),
-                    hover,
-                ));
+                    .child(
+                        div()
+                            .font_family(theme::MONO)
+                            .text_size(px(theme::MONO_SIZE))
+                            .text_color(color)
+                            .child(s.short.clone()),
+                    )
+                    .on_click(on(msg(LogMsg::ToggleSource(i))));
+                chips = chips.child(theme::tip(chip, hover));
             }
-            col = col.push(chips.wrap());
+            col = col.child(chips);
         } else if let Some(e) = &self.error {
-            col = col.push(theme::colored(e.clone(), RED));
+            col = col.child(theme::colored(e.clone(), RED));
         } else if let Some(st) = self
             .sources
             .first()
@@ -988,29 +1091,29 @@ impl LogView {
             } else {
                 YELLOW
             };
-            col = col.push(theme::colored(st.clone(), color));
+            col = col.child(theme::colored(st.clone(), color));
         }
-        col = col.push(theme::hline());
-        col = col.push(self.lines_view(index));
-        col.height(Length::Fill).into()
+        col = col.child(theme::hline()).child(self.lines_view(index));
+        col.into_any_element()
     }
 
-    /// The lines, drawn only where they're visible. Row 0 is the "older lines" banner.
-    fn lines_view(&self, index: usize) -> Element<'_, Message> {
+    /// The lines, built only where they're visible. Row 0 is the "older lines" banner.
+    fn lines_view(&self, index: usize) -> AnyElement {
         let total = self.shown_len();
         if total == 0 && self.live() {
-            return container(theme::faint("Waiting for log lines…"))
-                .height(Length::Fill)
-                .into();
+            return div()
+                .flex_1()
+                .child(theme::faint("Waiting for log lines…"))
+                .into_any_element();
         }
         let rows_total = total + 1;
-        let view_h = if self.view_h > 0.0 {
-            self.view_h
-        } else {
-            800.0
+        let view_h = match f32::from(self.scroll.bounds().size.height) {
+            h if h > 0.0 => h,
+            _ => 800.0,
         };
+        let offset = -f32::from(self.scroll.offset().y);
         // A margin either side covers an offset that is a little out of date.
-        let top = ((self.offset / LINE).floor().max(0.0) as usize).min(rows_total);
+        let top = ((offset / LINE).floor().max(0.0) as usize).min(rows_total);
         let first = top.saturating_sub(40);
         let last = (top + (view_h / LINE).ceil() as usize + 40).min(rows_total);
         let multi = self.sources.len() > 1;
@@ -1021,71 +1124,113 @@ impl LogView {
             .max()
             .unwrap_or(0);
 
-        let mut col = column![Space::new().height(first as f32 * LINE)];
+        // Rows are drawn without wrapping, so the content is as wide as the longest line
+        // (estimated from the mono advance) to give the sideways scroll its extent.
+        let longest = self.lines.iter().map(|l| l.line.text.len()).max().unwrap_or(0)
+            + if multi { tag_width + 1 } else { 0 }
+            + if self.timestamps { 31 } else { 0 };
+        let width = (longest.min(20_000) as f32 * theme::MONO_SIZE * 0.6 + 24.0).ceil();
+
+        let mut rows = v_flex()
+            .flex_none()
+            .w_full()
+            .min_w(px(width))
+            .child(div().h(px(first as f32 * LINE)).flex_none());
         for i in first..last {
             if i == 0 {
-                let banner: Element<'_, Message> = match self.older {
-                    Older::Loading => theme::faint("Loading older lines…").size(12.5).into(),
-                    Older::Done => theme::faint("Beginning of log").size(12.5).into(),
-                    Older::Idle => {
-                        button(theme::icon_label(icon::ARROW_LINE_UP, "Load older lines"))
-                            .padding(0)
-                            .style(theme::link(theme::ACCENT_HOVER))
-                            .on_press(Message::Log(index, LogMsg::LoadOlder))
-                            .into()
-                    }
+                let banner: AnyElement = match self.older {
+                    Older::Loading => theme::faint("Loading older lines…")
+                        .text_size(px(12.5))
+                        .into_any_element(),
+                    Older::Done => theme::faint("Beginning of log")
+                        .text_size(px(12.5))
+                        .into_any_element(),
+                    Older::Idle => div()
+                        .id(self.eid("older"))
+                        .text_color(theme::ACCENT)
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(theme::ACCENT_HOVER))
+                        .child(theme::icon_label(icon::ARROW_LINE_UP, "Load older lines"))
+                        .on_click(on(Message::Log(index, LogMsg::LoadOlder)))
+                        .into_any_element(),
                 };
-                col = col.push(container(banner).height(LINE).center_y(LINE));
+                rows = rows.child(
+                    div()
+                        .h(px(LINE))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px(px(6.0))
+                        .child(banner),
+                );
                 continue;
             }
             let Some(vl) = self.shown_line(i - 1) else {
                 continue;
             };
-            let mut spans: Vec<text::Span<'_, ()>> = Vec::new();
-            if multi {
-                if let Some(s) = self.sources.get(vl.src) {
-                    spans.push(span(format!("{:<tag_width$} ", s.short)).color(s.color));
-                }
-            }
-            if self.timestamps && !vl.line.ts.is_empty() {
-                spans.push(span(format!("{} ", vl.line.ts)).color(theme::TEXT_MUTED));
-            }
-            if vl.spans.is_empty() {
-                spans.push(span(vl.line.text.as_str()).color(vl.tint));
-            } else {
-                for s in &vl.spans {
-                    spans.push(
-                        span(&vl.line.text[s.range.clone()]).color(s.color.unwrap_or(vl.tint)),
-                    );
-                }
-            }
-            col = col.push(
-                rich_text(spans)
-                    .font(theme::MONO)
-                    .size(theme::MONO_SIZE)
-                    .line_height(text::LineHeight::Absolute(LINE.into()))
-                    .wrapping(text::Wrapping::None)
-                    .height(LINE),
-            );
+            rows = rows.child(self.line_row(vl, multi, tag_width));
         }
-        col = col.push(Space::new().height((rows_total - last) as f32 * LINE));
-        scrollable(col.width(Length::Shrink))
-            .id(self.scroll_id.clone())
-            .direction(theme::thin_both())
-            .style(theme::scrollbar)
-            .on_scroll(move |v| {
-                Message::Log(
-                    index,
-                    LogMsg::Scrolled(
-                        v.absolute_offset().y,
-                        v.bounds().height,
-                        v.content_bounds().height,
-                    ),
-                )
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        rows = rows.child(div().h(px((rows_total - last) as f32 * LINE)).flex_none());
+
+        div()
+            .id(self.eid("lines"))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .relative()
+            .track_scroll(&self.scroll)
+            .overflow_scroll()
+            .vertical_scrollbar(&self.scroll)
+            .horizontal_scrollbar(&self.scroll)
+            .child(rows)
+            .into_any_element()
+    }
+
+    /// One log line: optional pod tag and timestamp, then the text in its ANSI colours.
+    fn line_row(&self, vl: &ViewLine, multi: bool, tag_width: usize) -> AnyElement {
+        let mut text = String::new();
+        let mut marks: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let mut push = |text: &mut String, s: &str, color: Color| {
+            let start = text.len();
+            text.push_str(s);
+            marks.push((
+                start..text.len(),
+                HighlightStyle {
+                    color: Some(color.into()),
+                    ..Default::default()
+                },
+            ));
+        };
+        if multi {
+            if let Some(s) = self.sources.get(vl.src) {
+                push(&mut text, &format!("{:<tag_width$} ", s.short), s.color);
+            }
+        }
+        if self.timestamps && !vl.line.ts.is_empty() {
+            push(&mut text, &format!("{} ", vl.line.ts), theme::TEXT_MUTED);
+        }
+        if vl.spans.is_empty() {
+            text.push_str(&vl.line.text);
+        } else {
+            for s in &vl.spans {
+                push(
+                    &mut text,
+                    &vl.line.text[s.range.clone()],
+                    s.color.unwrap_or(vl.tint),
+                );
+            }
+        }
+        div()
+            .h(px(LINE))
+            .flex_none()
+            .px(px(6.0))
+            .font_family(theme::MONO)
+            .text_size(px(theme::MONO_SIZE))
+            .line_height(px(LINE))
+            .text_color(vl.tint)
+            .whitespace_nowrap()
+            .child(StyledText::new(text).with_highlights(marks))
+            .into_any_element()
     }
 }
 
@@ -1096,7 +1241,6 @@ pub(super) fn tail_label(n: i64) -> String {
         n.to_string()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,14 +1,21 @@
 //! Resource tables: a sortable header and rows drawn only where they're visible, so lists
 //! of thousands of pods stay quick. Wide tables scroll sideways instead of clipping columns.
+//!
+//! Views are plain functions, so the body is virtualised by hand: the scroll handles live in
+//! the workspace (see `Retained`), and each frame renders the rows the last frame's scroll
+//! offset and viewport make visible, between two spacers that stand in for the rest.
 
 use std::collections::BTreeMap;
 
-use iced::{
-    Element, Length, Size,
-    widget::{Space, column, container, mouse_area, responsive, row, scrollable, text},
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AnyElement, ElementId, InteractiveElement as _, IntoElement as _, MouseButton,
+    ParentElement as _, ScrollHandle, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 
-use super::{Drag, Message, ROW_HEIGHT, Sort, icons as icon, theme};
+use super::{Drag, Message, ROW_HEIGHT, Sort, icons as icon, on, send, theme};
 
 const HEADER_HEIGHT: f32 = 30.0;
 const CELL_PAD: f32 = 12.0;
@@ -43,9 +50,18 @@ impl Col {
     }
 }
 
+/// The scroll handles of one table: the body (vertical) and the whole table (sideways).
+#[derive(Clone, Default)]
+pub struct TableScroll {
+    pub vertical: ScrollHandle,
+    pub horizontal: ScrollHandle,
+}
+
 /// One row's cells, how it looks and what clicking it does.
-pub struct Row<'a> {
-    pub cells: Vec<Element<'a, Message>>,
+pub struct Row {
+    /// Identifies the row (derived from the resource, never the index).
+    pub key: String,
+    pub cells: Vec<AnyElement>,
     pub selected: bool,
     pub on_click: Message,
     pub on_double_click: Option<Message>,
@@ -62,22 +78,20 @@ pub struct Table<'a, F> {
     /// Column widths the user dragged, keyed `"<page>/<column>"`.
     pub widths: &'a BTreeMap<String, f32>,
     pub len: usize,
-    /// The body's scroll offset from the last scroll event.
-    pub scroll: f32,
-    pub hovered: Option<usize>,
+    pub scroll: &'a TableScroll,
     /// Builds row `i`, given each column's width.
     pub row: F,
 }
 
-impl<'a, F> Table<'a, F>
+impl<F> Table<'_, F>
 where
-    F: Fn(usize, &[f32]) -> Row<'a> + 'a,
+    F: Fn(usize, &[f32]) -> Row,
 {
-    pub fn view(self) -> Element<'a, Message> {
-        responsive(move |size: Size| self.layout(size)).into()
-    }
+    pub fn view(self) -> AnyElement {
+        // The viewport as of the last frame (zero on the very first one).
+        let viewport = self.scroll.horizontal.bounds().size;
+        let (view_w, view_h) = (f32::from(viewport.width), f32::from(self.scroll.vertical.bounds().size.height));
 
-    fn layout(&self, size: Size) -> Element<'a, Message> {
         // A column the user resized keeps that width.
         let cols: Vec<Width> = self
             .cols
@@ -109,7 +123,7 @@ where
             .filter(|c| matches!(c, Width::Fill(_)))
             .count()
             .max(1) as f32;
-        let total = size.width.max(fixed + fill_min).floor();
+        let total = view_w.max(fixed + fill_min).floor();
         let spare = (total - fixed - fill_min).max(0.0) / fills;
         let widths: Vec<f32> = cols
             .iter()
@@ -118,127 +132,150 @@ where
                 Width::Fill(m) => m + spare,
             })
             .collect();
-        let wide = total > size.width + 0.5;
+        let wide = total > view_w + 0.5 && view_w > 0.0;
 
-        let header = row(self
-            .cols
-            .iter()
-            .zip(&widths)
-            .map(|(c, w)| self.header_cell(&c.title, *w)))
-        .height(HEADER_HEIGHT)
-        .width(total);
+        let header = h_flex()
+            .w(px(total))
+            .h(px(HEADER_HEIGHT))
+            .flex_none()
+            .children(
+                self.cols
+                    .iter()
+                    .zip(&widths)
+                    .map(|(c, w)| self.header_cell(&c.title, *w)),
+            );
 
-        // Leave room for the sideways scrollbar when there is one.
-        let body_h = (size.height - HEADER_HEIGHT - if wide { 8.0 } else { 0.0 }).max(ROW_HEIGHT);
-        let first = ((self.scroll / ROW_HEIGHT).floor().max(0.0) as usize).min(self.len);
-        let visible = (body_h / ROW_HEIGHT).ceil() as usize + 2;
-        let last = (first + visible).min(self.len);
-        let mut rows = column![Space::new().height(first as f32 * ROW_HEIGHT)];
+        let body_h = if view_h > 0.0 { view_h } else { 1200.0 };
+        // A shorter list (filtered, another page) can leave the old offset past the end,
+        // which would show nothing until the next scroll: pull it back.
+        let max_offset = (self.len as f32 * ROW_HEIGHT - body_h).max(0.0);
+        let mut offset = -f32::from(self.scroll.vertical.offset().y);
+        if offset > max_offset + 0.5 {
+            offset = max_offset;
+            let mut o = self.scroll.vertical.offset();
+            o.y = px(-max_offset);
+            self.scroll.vertical.set_offset(o);
+        }
+        // The offset is last frame's, and a fast scroll moves further than a few rows
+        // per frame: render a whole viewport of rows above and below so none show blank.
+        let visible = (body_h / ROW_HEIGHT).ceil() as usize;
+        let top = (offset / ROW_HEIGHT).floor().max(0.0) as usize;
+        let first = top.saturating_sub(visible).min(self.len);
+        let last = (top + 2 * visible + 2).min(self.len);
+
+        let mut rows = v_flex()
+            .w(px(total))
+            .flex_none()
+            .child(div().h(px(first as f32 * ROW_HEIGHT)).flex_none());
         for i in first..last {
-            let r = (self.row)(i, &widths);
-            let selected = r.selected;
-            let hovered = self.hovered == Some(i);
-            let stripe = i % 2 == 1;
-            let cells = row(r.cells.into_iter().zip(&widths).map(|(cell, w)| {
-                container(cell)
-                    .width(*w)
-                    .height(ROW_HEIGHT)
-                    .padding([0.0, CELL_PAD])
-                    .center_y(ROW_HEIGHT)
-                    .clip(true)
-                    .into()
-            }));
-            let ground = container(cells)
-                .width(total)
-                .height(ROW_HEIGHT)
-                .style(move |_| {
-                    let fill = if selected {
-                        Some(theme::ACCENT_BG)
-                    } else if hovered {
-                        Some(theme::FIELD)
-                    } else if stripe {
-                        Some(theme::STRIPE)
-                    } else {
-                        None
-                    };
-                    container::Style {
-                        background: fill.map(Into::into),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                });
-            let mut area = mouse_area(ground)
-                .on_press(r.on_click)
-                .on_enter(Message::RowHover(Some(i)))
-                .on_exit(Message::RowLeave(i))
-                .interaction(iced::mouse::Interaction::Pointer);
-            if let Some(m) = r.on_double_click {
-                area = area.on_double_click(m);
-            }
-            rows = rows.push(area);
+            rows = rows.child(self.render_row(i, &widths, total));
         }
-        rows = rows.push(Space::new().height((self.len - last) as f32 * ROW_HEIGHT));
+        rows = rows.child(div().h(px((self.len - last) as f32 * ROW_HEIGHT)).flex_none());
 
-        let body = scrollable(rows.width(total))
-            .id(self.id)
-            .direction(theme::thin())
-            .on_scroll(|v| Message::ListScrolled(v.absolute_offset().y))
-            .style(theme::scrollbar)
-            .width(total)
-            .height(body_h);
-        let table = column![header, body].width(total);
-        if wide {
-            scrollable(table)
-                .direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::new().width(6).scroller_width(6),
-                ))
-                .style(theme::scrollbar)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            container(table)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        }
+        let body = div()
+            .id(ElementId::Name(format!("{}/body", self.id).into()))
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll.vertical)
+            .child(rows);
+        // The vertical scrollbar sits on the viewport edge, not the edge of a wide table.
+        let body = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w(px(total))
+            .child(body);
+
+        let table = v_flex().w(px(total)).h_full().child(header).child(body);
+        let scroller = div()
+            .id(ElementId::Name(format!("{}/scroll", self.id).into()))
+            .size_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll.horizontal)
+            .child(table);
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(scroller)
+            .vertical_scrollbar(&self.scroll.vertical)
+            .when(wide, |d| d.horizontal_scrollbar(&self.scroll.horizontal))
+            .into_any_element()
     }
-}
 
-impl<F> Table<'_, F> {
+    fn render_row(&self, i: usize, widths: &[f32], total: f32) -> AnyElement {
+        let r = (self.row)(i, widths);
+        let (selected, stripe) = (r.selected, i % 2 == 1);
+        let (click, double) = (r.on_click, r.on_double_click);
+        let cells = r.cells.into_iter().zip(widths).map(|(cell, w)| {
+            h_flex()
+                .w(px(*w))
+                .h(px(ROW_HEIGHT))
+                .px(px(CELL_PAD))
+                .flex_none()
+                .overflow_hidden()
+                .child(cell)
+        });
+        h_flex()
+            .id(ElementId::Name(format!("{}/row/{}", self.id, r.key).into()))
+            .w(px(total))
+            .h(px(ROW_HEIGHT))
+            .flex_none()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .when(selected, |d| d.bg(theme::ACCENT_BG))
+            .when(!selected, |d| {
+                d.when(stripe, |d| d.bg(theme::STRIPE))
+                    .hover(|s| s.bg(theme::FIELD))
+            })
+            .on_click(move |ev, window, cx| {
+                // A double click already selected the row with its first click.
+                match (&double, ev.click_count()) {
+                    (Some(m), 2) => send(m.clone(), window, cx),
+                    _ => send(click.clone(), window, cx),
+                }
+            })
+            .children(cells)
+            .into_any_element()
+    }
+
     /// A column header: click to sort ascending, again for descending, again to clear.
     /// Its right edge drags to resize the column; double-click it to reset.
-    fn header_cell<'b>(&self, label: &str, width: f32) -> Element<'b, Message> {
+    fn header_cell(&self, label: &str, width: f32) -> AnyElement {
         let active = self.sort.filter(|s| s.col == label);
         let color = if active.is_some() {
             theme::TEXT
         } else {
             theme::TEXT_MUTED
         };
-        let mut content = row![
-            theme::label_small(label.to_string())
-                .color(color)
-                .wrapping(text::Wrapping::None)
-        ]
-        .spacing(4)
-        .align_y(iced::Center);
-        if let Some(s) = active {
-            content = content.push(
-                text(if s.asc {
-                    icon::CARET_UP
-                } else {
-                    icon::CARET_DOWN
-                })
-                .font(theme::ICONS)
-                .size(11.0)
-                .color(color),
-            );
-        }
-        let title: Element<'b, Message> = if label.is_empty() || !self.sortable {
-            content.into()
+        let content = h_flex()
+            .gap(px(4.0))
+            .child(theme::label_small(label.to_string()).text_color(color))
+            .when_some(active, |d, s| {
+                d.child(
+                    theme::icon(if s.asc {
+                        icon::CARET_UP
+                    } else {
+                        icon::CARET_DOWN
+                    })
+                    .text_size(px(11.0))
+                    .text_color(color),
+                )
+            });
+        let id = format!("{}/hdr/{label}", self.id);
+        let title = div()
+            .id(ElementId::Name(id.clone().into()))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(CELL_PAD))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .child(content);
+        let title = if label.is_empty() || !self.sortable {
+            title.into_any_element()
         } else {
             let hint = match active {
                 Some(s) if s.asc => format!("Sorted by {label}, ascending. Click for descending."),
@@ -246,42 +283,50 @@ impl<F> Table<'_, F> {
                 None => format!("Sort by {label}"),
             };
             theme::tip(
-                mouse_area(content)
-                    .on_press(Message::Sort(self.tab, label.to_string()))
-                    .interaction(iced::mouse::Interaction::Pointer),
+                title
+                    .cursor_pointer()
+                    .on_click(on(Message::Sort(self.tab, label.to_string()))),
                 hint,
             )
+            .into_any_element()
         };
         let key = width_key(self.tab, label);
+        let reset = key.clone();
         let handle = theme::tip(
-            mouse_area(
-                container(
-                    container(Space::new().width(1).height(14))
-                        .style(theme::fill(theme::BORDER_STRONG)),
-                )
-                .center(Length::Fill)
-                .width(HANDLE_W),
-            )
-            .on_press(Message::DragStart(Drag::Column {
-                key: key.clone(),
-                start: width,
-            }))
-            .on_double_click(Message::ResetColumn(key))
-            .interaction(iced::mouse::Interaction::ResizingHorizontally),
+            div()
+                .id(ElementId::Name(format!("{id}/grip").into()))
+                .w(px(HANDLE_W))
+                .h_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_col_resize()
+                .child(theme::vline(14.0))
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    send(
+                        Message::DragStart(Drag::Column {
+                            key: key.clone(),
+                            start: width,
+                        }),
+                        window,
+                        cx,
+                    )
+                })
+                .on_click(move |ev, window, cx| {
+                    if ev.click_count() >= 2 {
+                        send(Message::ResetColumn(reset.clone()), window, cx)
+                    }
+                }),
             "Drag to resize · double-click to reset",
         );
-        row![
-            container(title)
-                .width(Length::Fill)
-                .height(HEADER_HEIGHT)
-                .padding([0.0, CELL_PAD])
-                .center_y(HEADER_HEIGHT)
-                .clip(true),
-            handle,
-        ]
-        .width(width)
-        .height(HEADER_HEIGHT)
-        .into()
+        h_flex()
+            .w(px(width))
+            .h(px(HEADER_HEIGHT))
+            .flex_none()
+            .child(title)
+            .child(handle)
+            .into_any_element()
     }
 }
 
@@ -292,39 +337,33 @@ pub fn width_key(tab: super::Tab, col: &str) -> String {
 
 /// A resource name that fits its cell: Kubernetes names differ at the end (the ReplicaSet
 /// hash and pod suffix), so shorten from the middle and keep the tail. Full name on hover.
-pub fn name_cell<'a>(name: &str, width: f32) -> Element<'a, Message> {
-    let fits = ((width - 2.0 * CELL_PAD - 4.0) / (theme::MONO_SIZE * 0.6))
-        .floor()
-        .max(8.0) as usize;
-    let chars: Vec<char> = name.chars().collect();
-    if chars.len() <= fits {
-        return theme::mono(name.to_string()).into();
-    }
-    let tail = (fits / 3).clamp(5, 16);
-    let head = fits.saturating_sub(tail + 1);
-    let short: String = chars[..head]
-        .iter()
-        .chain(['…'].iter())
-        .chain(chars[chars.len() - tail..].iter())
-        .collect();
-    theme::tip(theme::mono(short), name.to_string())
+pub fn name_cell(name: &str) -> AnyElement {
+    theme::tip(
+        theme::mono(name.to_string())
+            .id(ElementId::Name(format!("name/{name}").into()))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis_middle(),
+        name.to_string(),
+    )
+    .into_any_element()
 }
 
 /// Text cut to its cell with an ellipsis (full text on hover).
-pub fn truncated<'a>(
-    s: &str,
-    width: f32,
-    char_w: f32,
-    make: impl Fn(String) -> text::Text<'a>,
-) -> Element<'a, Message> {
-    let fits = ((width - 2.0 * CELL_PAD) / char_w).floor().max(4.0) as usize;
-    if s.chars().count() <= fits {
-        return make(s.to_string()).wrapping(text::Wrapping::None).into();
+pub fn truncated(s: &str, make: impl Fn(String) -> gpui_kit::Div) -> AnyElement {
+    let el = make(s.to_string())
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .text_ellipsis();
+    if s.chars().count() > 10 {
+        theme::tip(
+            el.id(ElementId::Name(format!("cell/{s}").into())),
+            s.to_string(),
+        )
+        .into_any_element()
+    } else {
+        el.into_any_element()
     }
-    let short: String = s
-        .chars()
-        .take(fits.saturating_sub(1))
-        .chain(['…'])
-        .collect();
-    theme::tip(make(short).wrapping(text::Wrapping::None), s.to_string())
 }

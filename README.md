@@ -1,6 +1,6 @@
 # Kube UI
 
-A native Kubernetes desktop UI written in Rust ([iced](https://iced.rs) + [kube-rs](https://kube.rs)).
+A native Kubernetes desktop UI written in Rust ([GPUI Kit](https://gpui-kit.com) + [kube-rs](https://kube.rs)).
 
 ```bash
 cargo run --release
@@ -75,4 +75,4 @@ When launched from Finder, the app reads your login shell's `PATH` so kubeconfig
 
 ## Design
 
-The visual system (tokens, fonts, controls) is in `src/app/theme.rs` and documented in `DESIGN.md`. For a quick visual check, `KUBE_UI_SCREENSHOT=out.png cargo run` waits for pods to load, opens the first pod's drawer and logs, saves a PNG of the window and quits.
+The visual system (tokens, fonts, controls) is in `src/app/theme.rs` and documented in `DESIGN.md`. For a quick visual check, `KUBE_UI_SCREENSHOT=out.png cargo run` waits for pods to load, opens the first pod's drawer and logs, saves a PNG of the window (via macOS `screencapture`, which needs Screen Recording permission) and quits.

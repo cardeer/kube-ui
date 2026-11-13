@@ -67,6 +67,8 @@ pub(super) struct Workspace {
     /// Secrets the user chose to reveal, keyed by (namespace, name). Cleared when the drawer changes.
     secrets: HashMap<(String, String), Result<BTreeMap<String, String>, String>>,
     secrets_loading: HashSet<(String, String)>,
+    /// GPUI state kept between frames (inputs, scroll handles).
+    ui: view::Retained,
 }
 
 impl Workspace {
@@ -112,6 +114,7 @@ impl Workspace {
             details: None,
             secrets: HashMap::new(),
             secrets_loading: HashSet::new(),
+            ui: Default::default(),
         };
         ws.load_kubeconfig(path, context, settings);
         ws

@@ -1,15 +1,36 @@
-//! The native macOS menu bar. Items that need the app send a [`MenuCommand`] through the
-//! message bus; window and app-level items (Hide, Minimize, Full Screen…) are handled by AppKit.
+//! The native menu bar, built from GPUI actions. Each item is an action bound to its
+//! shortcut; the window's root view turns it into a [`MenuCommand`] (see `App::render`).
 //!
-//! Menu shortcuts reach AppKit before iced sees the key, so none of them may reuse a key the
-//! app handles itself: ⌘F/⌘G/⌘⇧G (find), ⌘S and ⌘/ (YAML editor), and the text-editing keys.
+//! None of the shortcuts may reuse a key the app handles itself: ⌘F/⌘G/⌘⇧G (find), ⌘S and
+//! ⌘/ (YAML editor), and the text-editing keys.
 
-use muda::{
-    AboutMetadata, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
-    accelerator::{Accelerator, Code, Modifiers},
-};
+use gpui_kit::{self as gpui, KeyBinding, Menu, MenuItem};
 
-use super::{Bus, Msg, Tab, update};
+use super::Tab;
+
+gpui_kit::actions!(
+    kube_ui,
+    [
+        CheckForUpdates,
+        WhatsNew,
+        OpenSettings,
+        Quit,
+        NewTab,
+        OpenKubeconfig,
+        Close,
+        Reload,
+        ToggleBottomPanel,
+        GoOverview,
+        GoPods,
+        GoDeployments,
+        GoServices,
+        GoForwards,
+        NextTab,
+        PreviousTab,
+        OpenGitHub,
+        OpenUpdateLog,
+    ]
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCommand {
@@ -29,161 +50,107 @@ pub enum MenuCommand {
     OpenUpdateLog,
 }
 
-/// Keeps the menu alive; AppKit only holds a weak reference to its items.
-pub struct MenuBar {
-    _menu: Menu,
+/// Installs the menu bar and its shortcuts. Call once at startup.
+pub fn install(cx: &mut gpui::App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-o", OpenKubeconfig, None),
+        KeyBinding::new("cmd-w", Close, None),
+        KeyBinding::new("cmd-r", Reload, None),
+        KeyBinding::new("cmd-j", ToggleBottomPanel, None),
+        KeyBinding::new("cmd-alt-1", GoOverview, None),
+        KeyBinding::new("cmd-alt-2", GoPods, None),
+        KeyBinding::new("cmd-alt-3", GoDeployments, None),
+        KeyBinding::new("cmd-alt-4", GoServices, None),
+        KeyBinding::new("cmd-alt-5", GoForwards, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PreviousTab, None),
+    ]);
+    cx.set_menus(vec![
+        Menu {
+            name: "Kube UI".into(),
+            items: vec![
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::action("What's New", WhatsNew),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Kube UI", Quit),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Tab", NewTab),
+                MenuItem::action("Open Kubeconfig…", OpenKubeconfig),
+                MenuItem::separator(),
+                MenuItem::action("Close", Close),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Reload", Reload),
+                MenuItem::action("Show/Hide Logs & Terminal", ToggleBottomPanel),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Go".into(),
+            items: vec![
+                MenuItem::action("Overview", GoOverview),
+                MenuItem::action("Pods", GoPods),
+                MenuItem::action("Deployments", GoDeployments),
+                MenuItem::action("Services", GoServices),
+                MenuItem::action("Port Forwards", GoForwards),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Show Next Tab", NextTab),
+                MenuItem::action("Show Previous Tab", PreviousTab),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Help".into(),
+            items: vec![
+                MenuItem::action("Kube UI on GitHub", OpenGitHub),
+                MenuItem::action("Show Update Log", OpenUpdateLog),
+            ],
+            disabled: false,
+        },
+    ]);
 }
 
-impl MenuBar {
-    /// Installs the menu bar, replacing winit's default one. Call once the app has launched.
-    pub(super) fn install(bus: Bus) -> Option<Self> {
-        let mut commands: Vec<(MenuId, MenuCommand)> = Vec::new();
-        let mut item = |cmd: MenuCommand, text: &str, accel: Option<Accelerator>| {
-            let id = MenuId::new(format!("{cmd:?}"));
-            commands.push((id.clone(), cmd));
-            MenuItem::with_id(id, text, true, accel)
-        };
-        let key = |mods: Modifiers, code| Some(Accelerator::new(Some(mods), code));
-        let cmd = Modifiers::SUPER;
-        let cmd_alt = Modifiers::SUPER | Modifiers::ALT;
-        let cmd_shift = Modifiers::SUPER | Modifiers::SHIFT;
-
-        let about = AboutMetadata {
-            name: Some("Kube UI".into()),
-            version: Some(update::CURRENT.into()),
-            ..Default::default()
-        };
-        let app_menu = Submenu::with_items(
-            "Kube UI",
-            true,
-            &[
-                &PredefinedMenuItem::about(Some("About Kube UI"), Some(about)),
-                &item(MenuCommand::CheckForUpdates, "Check for Updates…", None),
-                &item(MenuCommand::WhatsNew, "What's New", None),
-                &PredefinedMenuItem::separator(),
-                &item(MenuCommand::Settings, "Settings…", key(cmd, Code::Comma)),
-                &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::services(None),
-                &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::hide(Some("Hide Kube UI")),
-                &PredefinedMenuItem::hide_others(None),
-                &PredefinedMenuItem::show_all(None),
-                &PredefinedMenuItem::separator(),
-                // Our own item rather than AppKit's, so the app saves its state and exits normally.
-                &item(MenuCommand::Quit, "Quit Kube UI", key(cmd, Code::KeyQ)),
-            ],
-        )
-        .ok()?;
-        let file_menu = Submenu::with_items(
-            "File",
-            true,
-            &[
-                &item(MenuCommand::NewTab, "New Tab", key(cmd, Code::KeyT)),
-                &item(
-                    MenuCommand::OpenKubeconfig,
-                    "Open Kubeconfig…",
-                    key(cmd, Code::KeyO),
-                ),
-                &PredefinedMenuItem::separator(),
-                &item(MenuCommand::Close, "Close", key(cmd, Code::KeyW)),
-            ],
-        )
-        .ok()?;
-        let view_menu = Submenu::with_items(
-            "View",
-            true,
-            &[
-                &item(MenuCommand::Reload, "Reload", key(cmd, Code::KeyR)),
-                &item(
-                    MenuCommand::ToggleBottomPanel,
-                    "Show/Hide Logs & Terminal",
-                    key(cmd, Code::KeyJ),
-                ),
-            ],
-        )
-        .ok()?;
-        let go_menu = Submenu::with_items(
-            "Go",
-            true,
-            &[
-                &item(
-                    MenuCommand::Go(Tab::Overview),
-                    "Overview",
-                    key(cmd_alt, Code::Digit1),
-                ),
-                &item(
-                    MenuCommand::Go(Tab::Pods),
-                    "Pods",
-                    key(cmd_alt, Code::Digit2),
-                ),
-                &item(
-                    MenuCommand::Go(Tab::Deployments),
-                    "Deployments",
-                    key(cmd_alt, Code::Digit3),
-                ),
-                &item(
-                    MenuCommand::Go(Tab::Services),
-                    "Services",
-                    key(cmd_alt, Code::Digit4),
-                ),
-                &item(
-                    MenuCommand::Go(Tab::Forwards),
-                    "Port Forwards",
-                    key(cmd_alt, Code::Digit5),
-                ),
-            ],
-        )
-        .ok()?;
-        let window_menu = Submenu::with_items(
-            "Window",
-            true,
-            &[
-                &PredefinedMenuItem::minimize(None),
-                &PredefinedMenuItem::maximize(Some("Zoom")),
-                &PredefinedMenuItem::fullscreen(None),
-                &PredefinedMenuItem::separator(),
-                &item(
-                    MenuCommand::NextTab,
-                    "Show Next Tab",
-                    key(cmd_shift, Code::BracketRight),
-                ),
-                &item(
-                    MenuCommand::PreviousTab,
-                    "Show Previous Tab",
-                    key(cmd_shift, Code::BracketLeft),
-                ),
-                &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::bring_all_to_front(None),
-            ],
-        )
-        .ok()?;
-        let help_menu = Submenu::with_items(
-            "Help",
-            true,
-            &[
-                &item(MenuCommand::OpenGitHub, "Kube UI on GitHub", None),
-                &item(MenuCommand::OpenUpdateLog, "Show Update Log", None),
-            ],
-        )
-        .ok()?;
-
-        let menu = Menu::with_items(&[
-            &app_menu,
-            &file_menu,
-            &view_menu,
-            &go_menu,
-            &window_menu,
-            &help_menu,
-        ])
-        .ok()?;
-        menu.init_for_nsapp();
-        window_menu.set_as_windows_menu_for_nsapp();
-
-        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let Some((_, cmd)) = commands.iter().find(|(id, _)| id == event.id()) {
-                bus.send(Msg::Menu(*cmd));
-            }
-        }));
-        Some(Self { _menu: menu })
+/// Adds a handler for every menu action to the root element, each sending its command.
+pub fn handle_actions<E: gpui::InteractiveElement>(el: E) -> E {
+    use super::{Message, send};
+    fn cmd<A: 'static>(c: MenuCommand) -> impl Fn(&A, &mut gpui::Window, &mut gpui::App) {
+        move |_, window, cx| send(Message::Menu(c), window, cx)
     }
+    el.on_action::<CheckForUpdates>(cmd(MenuCommand::CheckForUpdates))
+        .on_action::<WhatsNew>(cmd(MenuCommand::WhatsNew))
+        .on_action::<OpenSettings>(cmd(MenuCommand::Settings))
+        .on_action::<Quit>(cmd(MenuCommand::Quit))
+        .on_action::<NewTab>(cmd(MenuCommand::NewTab))
+        .on_action::<OpenKubeconfig>(cmd(MenuCommand::OpenKubeconfig))
+        .on_action::<Close>(cmd(MenuCommand::Close))
+        .on_action::<Reload>(cmd(MenuCommand::Reload))
+        .on_action::<ToggleBottomPanel>(cmd(MenuCommand::ToggleBottomPanel))
+        .on_action::<GoOverview>(cmd(MenuCommand::Go(Tab::Overview)))
+        .on_action::<GoPods>(cmd(MenuCommand::Go(Tab::Pods)))
+        .on_action::<GoDeployments>(cmd(MenuCommand::Go(Tab::Deployments)))
+        .on_action::<GoServices>(cmd(MenuCommand::Go(Tab::Services)))
+        .on_action::<GoForwards>(cmd(MenuCommand::Go(Tab::Forwards)))
+        .on_action::<NextTab>(cmd(MenuCommand::NextTab))
+        .on_action::<PreviousTab>(cmd(MenuCommand::PreviousTab))
+        .on_action::<OpenGitHub>(cmd(MenuCommand::OpenGitHub))
+        .on_action::<OpenUpdateLog>(cmd(MenuCommand::OpenUpdateLog))
 }

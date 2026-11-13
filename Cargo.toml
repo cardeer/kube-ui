@@ -20,7 +20,4 @@ serde_yaml = "0.9.34"
 tokio = { version = "1.54.1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 vt100 = "0.18.1"
-iced = { version = "0.14.0", features = ["tokio", "advanced", "canvas", "image", "highlighter", "lazy", "svg", "selector"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-muda = { version = "0.17", default-features = false }
+gpui-kit = { version = "0.9.1", features = ["tree-sitter-yaml"] }

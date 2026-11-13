@@ -3,33 +3,41 @@ mod details;
 mod kube_ops;
 mod settings;
 
-fn main() -> iced::Result {
+use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
+
+fn main() {
     inherit_shell_path();
     // Reopen at the size the window had last time.
     let saved = settings::Settings::load();
     let min = app::MIN_WINDOW_SIZE;
-    let size = saved
+    let default = app::DEFAULT_WINDOW_SIZE;
+    let [w, h] = saved
         .window_size
-        .map(|[w, h]| iced::Size::new(w.max(min.width), h.max(min.height)))
-        .unwrap_or(iced::Size::new(1360.0, 860.0));
-    let mut app = iced::application(app::App::new, app::App::update, app::App::view)
-        .title(app::App::title)
-        .theme(app::App::theme)
-        .subscription(app::App::subscription)
-        .window(iced::window::Settings {
-            size,
-            min_size: Some(min),
-            icon: iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None)
-                .ok(),
-            ..Default::default()
-        })
-        .exit_on_close_request(false)
-        .antialiasing(true)
-        .default_font(app::theme_font());
-    for font in app::fonts() {
-        app = app.font(font);
-    }
-    app.run()
+        .map(|[w, h]| [w.max(min.width), h.max(min.height)])
+        .unwrap_or([default.width, default.height]);
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            app::install(cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(w), px(h)),
+                    cx,
+                ))),
+                window_min_size: Some(size(px(min.width), px(min.height))),
+                app_id: Some("kube-ui".into()),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                window.set_window_title("Kube UI");
+                cx.new(|cx| app::App::new(window, cx))
+            })
+            .expect("failed to open the window");
+            cx.activate(true);
+        });
 }
 
 /// Apps launched from Finder get a minimal PATH, so kubeconfig exec plugins

@@ -1,12 +1,28 @@
-//! Rendering for a cluster tab: the resource lists, the Overview and the detail drawer.
+//! Rendering for a cluster tab: the resource lists, the Overview and the detail drawer
+//! (`view/drawer.rs`).
+//!
+//! Views are plain `&self -> AnyElement` functions. What GPUI has to keep between frames
+//! (the filter and env search fields, the table scroll handles) lives in [`Retained`] and
+//! is created lazily in [`Workspace::prepare`].
 
-use iced::{
-    Element, Length,
-    widget::{Space, button, column, container, mouse_area, responsive, row, scrollable, text},
+mod drawer;
+
+use std::collections::HashMap;
+
+use gpui_kit::component::{
+    Sizable as _, h_flex,
+    input::{Input, InputEvent, InputState},
+    v_flex,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AnyElement, ElementId, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    ScrollHandle, Size as GSize, StatefulInteractiveElement as _, Styled as _, Subscription, div,
+    px, relative,
 };
 
 use super::*;
-use crate::app::table::{self, Col, Row, Table};
+use crate::app::table::{self, Col, Row, Table, TableScroll};
 
 /// What the tab's views need from the app around them.
 pub(in crate::app) struct ViewCtx<'a> {
@@ -26,125 +42,263 @@ impl ViewCtx<'_> {
     }
 }
 
-type El<'a> = Element<'a, Message>;
+/// GPUI state a cluster tab keeps between frames.
+#[derive(Default)]
+pub(in crate::app) struct Retained {
+    /// The filter field above a list; shows the current page's filter.
+    filter: Option<Entity<InputState>>,
+    /// Whether the field's placeholder describes the regex mode.
+    filter_regex: Option<bool>,
+    /// One env search field per container (they all show the same, shared text).
+    env: HashMap<String, Entity<InputState>>,
+    subs: Vec<Subscription>,
+    /// Scroll handles of the current page's table.
+    list: TableScroll,
+    /// Reports the width the Overview's cards have to share.
+    cards: ScrollHandle,
+    /// The page the scroll handles were last used for.
+    page: Option<Tab>,
+    /// Sizes seen last frame; a change means the next layout needs another frame.
+    sizes: [GSize<gpui_kit::Pixels>; 3],
+}
+
+type El = AnyElement;
 
 fn act(a: Action) -> Message {
     Message::Action(a)
 }
 
+/// An element id from text.
+fn eid(s: impl Into<String>) -> ElementId {
+    ElementId::Name(s.into().into())
+}
+
 impl Workspace {
+    /// Creates this tab's retained state (filter field, env search, list scroll) as needed
+    /// and keeps it in step with the model.
+    pub(in crate::app) fn prepare(&mut self, window: &mut Window, cx: &mut Context<App>) {
+        if self.ui.filter.is_none() {
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder(filter_hint(false)));
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |app: &mut App, state, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let text = state.read(cx).value().to_string();
+                        app.dispatch(Message::Filter(text), window, cx);
+                    }
+                },
+            );
+            self.ui.subs.push(sub);
+            self.ui.filter = Some(state);
+        }
+        // Filters are per page: show this page's.
+        if let Some(state) = self.ui.filter.clone() {
+            let want = self.filters.get(&self.tab).cloned().unwrap_or_default();
+            if state.read(cx).value().as_ref() != want {
+                state.update(cx, |s, cx| s.set_value(want, window, cx));
+            }
+            if self.ui.filter_regex != Some(self.filter_regex) {
+                self.ui.filter_regex = Some(self.filter_regex);
+                state.update(cx, |s, cx| {
+                    s.set_placeholder(filter_hint(self.filter_regex), window, cx)
+                });
+            }
+        }
+
+        // One env search per container of the open pod.
+        let names: Vec<String> = match self.loaded_details().map(|d| &d.body) {
+            Some(Body::Pod(p)) => p.containers.iter().map(|c| c.name.clone()).collect(),
+            _ => Vec::new(),
+        };
+        for name in names {
+            if self.ui.env.contains_key(&name) {
+                continue;
+            }
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder("Search env"));
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |app: &mut App, state, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let text = state.read(cx).value().to_string();
+                        app.dispatch(Message::EnvFilter(text), window, cx);
+                    }
+                },
+            );
+            self.ui.subs.push(sub);
+            self.ui.env.insert(name, state);
+        }
+
+        // A new page starts at the top.
+        if self.ui.page != Some(self.tab) {
+            self.ui.page = Some(self.tab);
+            let top = gpui_kit::point(px(0.0), px(0.0));
+            self.ui.list.vertical.set_offset(top);
+            self.ui.list.horizontal.set_offset(top);
+        }
+        // Tables size themselves from last frame's bounds; ask for another frame when
+        // those changed (window resize, a drawer opening, the first layout).
+        let sizes = [
+            self.ui.list.horizontal.bounds().size,
+            self.ui.list.vertical.bounds().size,
+            self.ui.cards.bounds().size,
+        ];
+        if sizes != self.ui.sizes {
+            self.ui.sizes = sizes;
+            cx.notify();
+        }
+    }
+
+    /// Makes the env search fields show `text` (the app's shared env filter).
+    pub(in crate::app) fn sync_env(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<App>,
+    ) {
+        for state in self.ui.env.values() {
+            if state.read(cx).value().as_ref() != text {
+                state.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Lists
     // -----------------------------------------------------------------------
 
     /// The current page (Overview or a list).
-    pub(in crate::app) fn view_page<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+    pub(in crate::app) fn view_page(&self, ctx: &ViewCtx<'_>) -> AnyElement {
         match self.tab {
             Tab::Overview => self.view_overview(ctx),
             Tab::Pods => self.view_pods(ctx),
             Tab::Services => self.view_services(ctx),
             Tab::Deployments => self.view_deployments(ctx),
             Tab::Workload(kind) => self.view_workloads(kind, ctx),
-            _ => Space::new().into(),
+            _ => div().into_any_element(),
         }
     }
 
-    fn filter_bar<'a>(&'a self, title: &'a str, shown: usize, total: Option<usize>) -> El<'a> {
-        let mut bar = row![theme::title(title)].spacing(10).align_y(iced::Center);
-        if let Some(n) = total {
-            let label = if shown < n {
-                format!("{shown} of {n}")
-            } else {
-                n.to_string()
-            };
-            bar = bar.push(text(label).size(15.0).color(theme::TEXT_FAINT));
-        }
-        bar = bar.push(theme::hspace(6.0));
-        let hint = if self.filter_regex {
-            "Regex on name or namespace"
-        } else {
-            "Filter by name or namespace"
-        };
+    fn filter_bar(&self, title: &str, shown: usize, total: Option<usize>) -> El {
         let filter = self
             .filters
             .get(&self.tab)
             .map(String::as_str)
             .unwrap_or("");
-        bar = bar.push(theme::search_field(filter, hint, 300.0, Message::Filter));
-        bar = bar.push(theme::toggle_button(
-            ".*",
-            self.filter_regex,
-            "Regular expression (case-insensitive)",
-            Message::ToggleRegex,
-        ));
-        if !filter.is_empty() {
-            bar = bar.push(theme::icon_button(
-                icon::X,
-                "Clear filter",
-                Some(Message::ClearFilter),
-            ));
-        }
-        if let Some(err) = &self.matcher.error {
-            bar = bar.push(theme::tip(
-                row![
-                    theme::icon(icon::WARNING).color(theme::BAD),
-                    theme::colored("Invalid regex", theme::BAD)
-                ]
-                .spacing(5)
-                .align_y(iced::Center),
-                err.clone(),
-            ));
-        }
-        if let Some(kind) = self
+        let kind = self
             .tab
             .kinds()
             .first()
             .copied()
-            .filter(|_| self.tab.is_list())
-        {
-            bar = bar.push(theme::fill_space());
-            bar = bar.push(theme::tip(
-                theme::primary_button(
-                    Some(icon::PLUS),
-                    "Create",
-                    matches!(self.conn, Conn::Ready(_)).then(|| act(Action::Create(kind))),
-                ),
-                format!("New {} from a template", kind.label()),
-            ));
-        }
-        column![bar, theme::vspace(10.0)].into()
+            .filter(|_| self.tab.is_list());
+        let bar = h_flex()
+            .w_full()
+            .gap(px(10.0))
+            .child(theme::title(title.to_string()))
+            .when_some(total, |bar, n| {
+                let label = if shown < n {
+                    format!("{shown} of {n}")
+                } else {
+                    n.to_string()
+                };
+                bar.child(theme::colored(label, theme::TEXT_FAINT).text_size(px(15.0)))
+            })
+            .child(theme::hspace(6.0))
+            .when_some(self.ui.filter.as_ref(), |bar, input| {
+                bar.child(
+                    div().w(px(300.0)).child(
+                        Input::new(input)
+                            .small()
+                            .prefix(theme::icon(icon::MAGNIFYING_GLASS).text_size(px(13.0))),
+                    ),
+                )
+            })
+            .child(theme::toggle_button(
+                "filter-regex",
+                ".*",
+                self.filter_regex,
+                "Regular expression (case-insensitive)",
+                Message::ToggleRegex,
+            ))
+            .when(!filter.is_empty(), |bar| {
+                bar.child(theme::icon_button(
+                    "filter-clear",
+                    icon::X,
+                    "Clear filter",
+                    Some(Message::ClearFilter),
+                ))
+            })
+            .when_some(self.matcher.error.clone(), |bar, err| {
+                bar.child(theme::tip(
+                    h_flex()
+                        .id("filter-error")
+                        .gap(px(5.0))
+                        .child(theme::icon(icon::WARNING).text_color(theme::BAD))
+                        .child(theme::colored("Invalid regex", theme::BAD)),
+                    err,
+                ))
+            })
+            .when_some(kind, |bar, kind| {
+                bar.child(theme::fill_space()).child(theme::tip(
+                    theme::primary_button(
+                        "create",
+                        Some(icon::PLUS),
+                        "Create",
+                        matches!(self.conn, Conn::Ready(_)).then(|| act(Action::Create(kind))),
+                    ),
+                    format!("New {} from a template", kind.label()),
+                ))
+            });
+        v_flex()
+            .w_full()
+            .flex_none()
+            .child(bar)
+            .child(theme::vspace(10.0))
+            .into_any_element()
     }
 
     /// Connection problems and progress; `None` once connected.
-    fn conn_preamble<'a>(&self) -> Option<El<'a>> {
+    fn conn_preamble(&self) -> Option<El> {
         match &self.conn {
-            Conn::Failed(e) => Some(theme::colored(format!("Could not connect: {e}"), RED).into()),
-            Conn::Connecting => Some(theme::muted("Connecting to cluster…").into()),
-            Conn::Idle => Some(theme::muted("Select a context to begin.").into()),
+            Conn::Failed(e) => {
+                Some(theme::colored(format!("Could not connect: {e}"), RED).into_any_element())
+            }
+            Conn::Connecting => Some(theme::muted("Connecting to cluster…").into_any_element()),
+            Conn::Idle => Some(theme::muted("Select a context to begin.").into_any_element()),
             Conn::Ready(_) => None,
         }
     }
 
     /// The page under the filter bar: connection and list problems, empty and loading
     /// states, or the table.
-    fn list_body<'a, T>(&self, state: &'a ListState<T>, table: impl FnOnce() -> El<'a>) -> El<'a> {
+    fn list_body<T>(&self, state: &ListState<T>, table: impl FnOnce() -> El) -> El {
         if let Some(p) = self.conn_preamble() {
             return p;
         }
-        let mut col = column![];
+        let mut col = v_flex().w_full().flex_1().min_h_0().items_stretch();
         if let Some(e) = &state.error {
-            col = col.push(error_callout(e));
+            col = col.child(error_callout(e));
         }
         if !state.loaded {
-            col = col.push(theme::muted("Loading…"));
+            col = col.child(theme::muted("Loading…"));
         } else if state.items.is_empty() {
             if state.error.is_none() {
-                col = col.push(theme::muted("Nothing here."));
+                col = col.child(theme::muted("Nothing here."));
             }
         } else {
-            col = col.push(table());
+            col = col.child(table());
         }
-        col.height(Length::Fill).into()
+        col.into_any_element()
+    }
+
+    fn page(bar: El, body: El) -> El {
+        v_flex()
+            .size_full()
+            .items_stretch()
+            .child(bar)
+            .child(body)
+            .into_any_element()
     }
 
     fn is_selected(&self, kind: Kind, namespace: &str, name: &str) -> bool {
@@ -161,7 +315,7 @@ impl Workspace {
         }))
     }
 
-    fn view_pods<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+    fn view_pods(&self, ctx: &ViewCtx<'_>) -> El {
         let mut rows: Vec<&PodRow> = self
             .pods
             .items
@@ -205,45 +359,34 @@ impl Workspace {
                 sortable: true,
                 widths: ctx.widths,
                 len: rows.len(),
-                scroll: self.list_scroll,
-                hovered: ctx.hovered,
-                row: move |i, w: &[f32]| {
+                scroll: &self.ui.list,
+                row: |i, _w: &[f32]| {
                     let p: &PodRow = rows[i];
                     let color = status_color(&p.status);
                     // Problems read from across the room: tint anything not healthy.
                     let tint = if color == GREEN { theme::TEXT } else { color };
-                    let mut cells: Vec<El<'a>> = vec![
-                        table::name_cell(&p.name, w[0]),
-                        row![
-                            theme::dot(color),
-                            table::truncated(&p.status, w[1] - 14.0, 7.6, move |s| {
+                    let mut cells: Vec<El> = vec![
+                        table::name_cell(&p.name),
+                        h_flex()
+                            .gap(px(6.0))
+                            .min_w_0()
+                            .child(theme::dot(color))
+                            .child(table::truncated(&p.status, move |s| {
                                 theme::colored(s, tint)
-                            })
-                        ]
-                        .spacing(6)
-                        .align_y(iced::Center)
-                        .into(),
+                            }))
+                            .into_any_element(),
                         restarts_badge(p.restarts),
-                        theme::mono(p.ready.as_str()).into(),
-                        theme::mono_muted(p.age()).into(),
+                        theme::mono(p.ready.clone()).into_any_element(),
+                        theme::mono_muted(p.age()).into_any_element(),
                     ];
                     if show_ns {
-                        cells.push(table::truncated(
-                            &p.namespace.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&p.namespace, theme::mono_muted));
                     }
                     if show_node {
-                        cells.push(table::truncated(
-                            &p.node.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&p.node, theme::mono_muted));
                     }
                     Row {
+                        key: format!("{}/{}", p.namespace, p.name),
                         cells,
                         selected: self.is_selected(Kind::Pod, &p.namespace, &p.name),
                         on_click: Self::select_msg(Kind::Pod, &p.namespace, &p.name),
@@ -253,10 +396,10 @@ impl Workspace {
             }
             .view()
         });
-        column![bar, body].into()
+        Self::page(bar, body)
     }
 
-    fn view_services<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+    fn view_services(&self, ctx: &ViewCtx<'_>) -> El {
         let mut rows: Vec<&SvcRow> = self
             .services
             .items
@@ -298,34 +441,24 @@ impl Workspace {
                 sortable: true,
                 widths: ctx.widths,
                 len: rows.len(),
-                scroll: self.list_scroll,
-                hovered: ctx.hovered,
-                row: move |i, w: &[f32]| {
+                scroll: &self.ui.list,
+                row: |i, _w: &[f32]| {
                     let s: &SvcRow = rows[i];
-                    let mut cells: Vec<El<'a>> = vec![
-                        table::name_cell(&s.name, w[0]),
-                        table::truncated(&s.kind, w[1], 7.6, theme::muted),
-                        table::truncated(&s.ports_label(), w[2], 7.5, theme::mono),
-                        theme::mono_muted(s.cluster_ip.as_str()).into(),
-                        theme::mono_muted(s.age()).into(),
+                    let mut cells: Vec<El> = vec![
+                        table::name_cell(&s.name),
+                        table::truncated(&s.kind, theme::muted),
+                        table::truncated(&s.ports_label(), theme::mono),
+                        table::truncated(&s.cluster_ip, theme::mono_muted),
+                        theme::mono_muted(s.age()).into_any_element(),
                     ];
                     if show_ns {
-                        cells.push(table::truncated(
-                            &s.namespace.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&s.namespace, theme::mono_muted));
                     }
                     if show_external {
-                        cells.push(table::truncated(
-                            &s.external.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&s.external, theme::mono_muted));
                     }
                     Row {
+                        key: format!("{}/{}", s.namespace, s.name),
                         cells,
                         selected: self.is_selected(Kind::Service, &s.namespace, &s.name),
                         on_click: Self::select_msg(Kind::Service, &s.namespace, &s.name),
@@ -335,10 +468,10 @@ impl Workspace {
             }
             .view()
         });
-        column![bar, body].into()
+        Self::page(bar, body)
     }
 
-    fn view_deployments<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+    fn view_deployments(&self, ctx: &ViewCtx<'_>) -> El {
         let mut rows: Vec<&DeployRow> = self
             .deployments
             .items
@@ -380,33 +513,28 @@ impl Workspace {
                 sortable: true,
                 widths: ctx.widths,
                 len: rows.len(),
-                scroll: self.list_scroll,
-                hovered: ctx.hovered,
-                row: move |i, w: &[f32]| {
+                scroll: &self.ui.list,
+                row: |i, _w: &[f32]| {
                     let d: &DeployRow = rows[i];
                     let c = if d.ready >= d.replicas {
                         theme::TEXT
                     } else {
                         YELLOW
                     };
-                    let mut cells: Vec<El<'a>> = vec![
-                        table::name_cell(&d.name, w[0]),
+                    let mut cells: Vec<El> = vec![
+                        table::name_cell(&d.name),
                         theme::mono(format!("{}/{}", d.ready, d.replicas))
-                            .color(c)
-                            .into(),
-                        theme::mono_muted(d.updated.to_string()).into(),
-                        theme::mono_muted(d.available.to_string()).into(),
-                        theme::mono_muted(d.age()).into(),
+                            .text_color(c)
+                            .into_any_element(),
+                        theme::mono_muted(d.updated.to_string()).into_any_element(),
+                        theme::mono_muted(d.available.to_string()).into_any_element(),
+                        theme::mono_muted(d.age()).into_any_element(),
                     ];
                     if show_ns {
-                        cells.push(table::truncated(
-                            &d.namespace.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&d.namespace, theme::mono_muted));
                     }
                     Row {
+                        key: format!("{}/{}", d.namespace, d.name),
                         cells,
                         selected: self.is_selected(Kind::Deployment, &d.namespace, &d.name),
                         on_click: Self::select_msg(Kind::Deployment, &d.namespace, &d.name),
@@ -416,11 +544,11 @@ impl Workspace {
             }
             .view()
         });
-        column![bar, body].into()
+        Self::page(bar, body)
     }
 
     /// Daemon sets, stateful sets, replica sets, replication controllers, jobs, cron jobs.
-    fn view_workloads<'a>(&'a self, kind: Kind, ctx: &ViewCtx<'a>) -> El<'a> {
+    fn view_workloads(&self, kind: Kind, ctx: &ViewCtx<'_>) -> El {
         let state = self.workload(kind);
         let mut rows: Vec<&WorkRow> = state
             .items
@@ -469,14 +597,12 @@ impl Workspace {
                 sortable: true,
                 widths: ctx.widths,
                 len: rows.len(),
-                scroll: self.list_scroll,
-                hovered: ctx.hovered,
-                row: move |i, w: &[f32]| {
+                scroll: &self.ui.list,
+                row: |i, _w: &[f32]| {
                     let r: &WorkRow = rows[i];
-                    let mut cells: Vec<El<'a>> = vec![table::name_cell(&r.name, w[0])];
+                    let mut cells: Vec<El> = vec![table::name_cell(&r.name)];
                     for (j, cell) in r.cells.iter().enumerate() {
                         let value = cell.text();
-                        let width = w[j + 1];
                         cells.push(if Some(j) == state_col {
                             let color = health_color(r.health);
                             let c = if r.health == Health::Ok {
@@ -484,38 +610,31 @@ impl Workspace {
                             } else {
                                 color
                             };
-                            let label = table::truncated(&value, width, 7.5, move |s| {
-                                theme::mono(s).color(c)
+                            let label = table::truncated(&value, move |s| {
+                                theme::mono(s).text_color(c)
                             });
                             if columns[j].0 == "Status" {
-                                row![theme::dot(color), label]
-                                    .spacing(6)
-                                    .align_y(iced::Center)
-                                    .into()
+                                h_flex()
+                                    .gap(px(6.0))
+                                    .min_w_0()
+                                    .child(theme::dot(color))
+                                    .child(label)
+                                    .into_any_element()
                             } else {
                                 label
                             }
                         } else if j == 0 {
-                            table::truncated(&value, width, 7.5, theme::mono)
+                            table::truncated(&value, theme::mono)
                         } else {
-                            table::truncated(&value, width, 7.5, theme::mono_muted)
+                            table::truncated(&value, theme::mono_muted)
                         });
                     }
-                    cells.push(table::truncated(
-                        &r.age(),
-                        w[cells.len()],
-                        7.5,
-                        theme::mono_muted,
-                    ));
+                    cells.push(table::truncated(&r.age(), theme::mono_muted));
                     if show_ns {
-                        cells.push(table::truncated(
-                            &r.namespace.as_str(),
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(&r.namespace, theme::mono_muted));
                     }
                     Row {
+                        key: format!("{}/{}", r.namespace, r.name),
                         cells,
                         selected: self.is_selected(kind, &r.namespace, &r.name),
                         on_click: Self::select_msg(kind, &r.namespace, &r.name),
@@ -525,7 +644,7 @@ impl Workspace {
             }
             .view()
         });
-        column![bar, body].into()
+        Self::page(bar, body)
     }
 
     // -----------------------------------------------------------------------
@@ -574,39 +693,52 @@ impl Workspace {
     }
 
     /// Workload counts and health at a glance, plus everything that isn't healthy.
-    fn view_overview<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
-        let header = row![
-            theme::title("Overview"),
-            text(namespaces_label(&self.selected_ns, false))
-                .size(15.0)
-                .color(theme::TEXT_FAINT)
-        ]
-        .spacing(10)
-        .align_y(iced::Center);
+    fn view_overview(&self, ctx: &ViewCtx<'_>) -> El {
+        let header = h_flex()
+            .gap(px(10.0))
+            .child(theme::title("Overview"))
+            .child(
+                theme::colored(namespaces_label(&self.selected_ns, false), theme::TEXT_FAINT)
+                    .text_size(px(15.0)),
+            );
         if let Some(p) = self.conn_preamble() {
-            return column![header, theme::vspace(12.0), p].into();
+            return v_flex()
+                .size_full()
+                .items_start()
+                .child(header)
+                .child(theme::vspace(12.0))
+                .child(p)
+                .into_any_element();
         }
 
         // Cards share the width: four across when there's room, fewer on narrow windows.
+        const MIN_CARD_W: f32 = 232.0;
+        const GAP: f32 = 12.0;
+        let width = f32::from(self.ui.cards.bounds().size.width);
+        let per_row = if width > 0.0 {
+            (((width + GAP) / (MIN_CARD_W + GAP)).floor() as usize).clamp(1, 4)
+        } else {
+            4
+        };
         let kinds = Tab::Overview.kinds();
-        let cards = responsive(move |size| {
-            const MIN_CARD_W: f32 = 232.0;
-            let gap = 12.0;
-            let per_row = (((size.width + gap) / (MIN_CARD_W + gap)).floor() as usize).clamp(1, 4);
-            let mut grid = column![].spacing(gap);
-            for chunk in kinds.chunks(per_row) {
-                let mut r = row![].spacing(gap);
-                for kind in chunk {
-                    r = r.push(self.overview_card(*kind));
-                }
-                for _ in chunk.len()..per_row {
-                    r = r.push(Space::new().width(Length::Fill));
-                }
-                grid = grid.push(r);
+        let mut grid = v_flex().w_full().gap(px(GAP)).items_stretch();
+        for chunk in kinds.chunks(per_row) {
+            let mut r = h_flex().w_full().gap(px(GAP)).items_stretch();
+            for kind in chunk {
+                r = r.child(self.overview_card(*kind));
             }
-            grid.into()
-        })
-        .height(Length::Shrink);
+            for _ in chunk.len()..per_row {
+                r = r.child(div().flex_1());
+            }
+            grid = grid.child(r);
+        }
+        let cards = div()
+            .id("overview-cards")
+            .w_full()
+            .flex_none()
+            .overflow_hidden()
+            .track_scroll(&self.ui.cards)
+            .child(grid);
 
         // Everything that needs a look, worst first.
         let mut problems: Vec<(Kind, &str, &str, String, Health)> = Vec::new();
@@ -652,27 +784,26 @@ impl Workspace {
             });
         }
 
-        let mut attention = row![theme::semibold("Needs attention").size(15.0)]
-            .spacing(8)
-            .align_y(iced::Center);
-        if !problems.is_empty() {
-            attention = attention.push(
-                text(problems.len().to_string())
-                    .size(15.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        }
+        let attention = h_flex()
+            .gap(px(8.0))
+            .child(theme::semibold("Needs attention").text_size(px(15.0)))
+            .when(!problems.is_empty(), |d| {
+                d.child(
+                    theme::colored(problems.len().to_string(), theme::TEXT_FAINT)
+                        .text_size(px(15.0)),
+                )
+            });
         let all_loaded = Tab::Overview
             .kinds()
             .iter()
             .all(|k| self.health_counts(*k).is_some());
-        let list: El<'a> = if problems.is_empty() {
+        let list: El = if problems.is_empty() {
             theme::muted(if all_loaded {
                 "Everything is healthy."
             } else {
                 "Loading…"
             })
-            .into()
+            .into_any_element()
         } else {
             let show_ns = self.selected_ns.len() != 1;
             let mut cols = vec![
@@ -691,34 +822,26 @@ impl Workspace {
                 sortable: true,
                 widths: ctx.widths,
                 len: problems.len(),
-                scroll: self.list_scroll,
-                hovered: ctx.hovered,
-                row: move |i, w: &[f32]| {
+                scroll: &self.ui.list,
+                row: |i, _w: &[f32]| {
                     let (kind, ns, name, status, health): &(Kind, &str, &str, String, Health) =
                         &problems[i];
                     let color = health_color(*health);
-                    let mut cells: Vec<El<'a>> = vec![
-                        table::name_cell(name, w[0]),
-                        table::truncated(kind.label(), w[1], 7.6, theme::muted),
-                        row![
-                            theme::dot(color),
-                            table::truncated(status, w[2] - 14.0, 7.6, move |s| {
-                                theme::colored(s, color)
-                            })
-                        ]
-                        .spacing(6)
-                        .align_y(iced::Center)
-                        .into(),
+                    let mut cells: Vec<El> = vec![
+                        table::name_cell(name),
+                        table::truncated(kind.label(), theme::muted),
+                        h_flex()
+                            .gap(px(6.0))
+                            .min_w_0()
+                            .child(theme::dot(color))
+                            .child(table::truncated(status, move |s| theme::colored(s, color)))
+                            .into_any_element(),
                     ];
                     if show_ns {
-                        cells.push(table::truncated(
-                            &*ns,
-                            w[cells.len()],
-                            7.5,
-                            theme::mono_muted,
-                        ));
+                        cells.push(table::truncated(ns, theme::mono_muted));
                     }
                     Row {
+                        key: format!("{}/{}/{}", kind.label(), ns, name),
                         cells,
                         selected: false,
                         on_click: act(Action::OpenSelected(Selected {
@@ -732,58 +855,50 @@ impl Workspace {
             }
             .view()
         };
-        column![
-            header,
-            theme::vspace(12.0),
-            cards,
-            theme::vspace(22.0),
-            attention,
-            theme::vspace(8.0),
-            list
-        ]
-        .height(Length::Fill)
-        .into()
+        v_flex()
+            .size_full()
+            .items_stretch()
+            .child(header)
+            .child(theme::vspace(12.0))
+            .child(cards)
+            .child(theme::vspace(22.0))
+            .child(attention)
+            .child(theme::vspace(8.0))
+            .child(list)
+            .into_any_element()
     }
 
-    fn overview_card<'a>(&'a self, kind: Kind) -> El<'a> {
+    fn overview_card(&self, kind: Kind) -> El {
         let counts = self.health_counts(kind);
         let total = counts.map(|c| c.iter().sum::<usize>());
         let number = total.map(|t| t.to_string()).unwrap_or_else(|| "–".into());
 
         // Stacked health bar.
         let colors = [GREEN, YELLOW, RED, theme::IDLE];
-        let mut bar = row![].height(5).width(Length::Fill);
+        let mut bar = h_flex()
+            .w_full()
+            .h(px(5.0))
+            .flex_none()
+            .rounded(px(2.0))
+            .overflow_hidden();
         match (counts, total.filter(|t| *t > 0)) {
-            (Some(c), Some(_)) => {
+            (Some(c), Some(total)) => {
                 for (n, color) in c.iter().zip(colors) {
                     if *n == 0 {
                         continue;
                     }
-                    bar = bar.push(
-                        container(Space::new().height(5))
-                            .width(Length::FillPortion(*n as u16))
-                            .style(theme::fill(color)),
+                    bar = bar.child(
+                        div()
+                            .h_full()
+                            .w(relative(*n as f32 / total as f32))
+                            .bg(color),
                     );
                 }
             }
             _ => {
-                bar = bar.push(
-                    container(Space::new().height(5))
-                        .width(Length::Fill)
-                        .style(theme::fill(theme::FIELD_ACTIVE)),
-                );
+                bar = bar.child(div().h_full().w_full().bg(theme::FIELD_ACTIVE));
             }
         }
-        let bar = container(bar)
-            .width(Length::Fill)
-            .clip(true)
-            .style(|_| container::Style {
-                border: iced::Border {
-                    radius: 2.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
 
         // Legend: only the states that are present.
         let legend = match counts {
@@ -802,1742 +917,106 @@ impl Workspace {
             Some(c) if c[1] > 0 => YELLOW,
             _ => theme::TEXT_FAINT,
         };
-        let content = column![
-            row![
-                text(kind.plural()).size(13.0).color(theme::TEXT_MUTED),
-                theme::fill_space(),
-                text(kind_glyph(kind))
-                    .font(theme::ICONS)
-                    .size(15.0)
-                    .color(theme::TEXT_FAINT),
-            ],
-            text(number)
-                .size(24.0)
-                .font(theme::SEMIBOLD)
-                .color(theme::TEXT),
-            theme::vspace(6.0),
-            bar,
-            theme::vspace(6.0),
-            text(legend)
-                .size(12.0)
-                .color(color)
-                .wrapping(text::Wrapping::None),
-        ]
-        .spacing(2);
-        button(container(content).height(68).clip(true))
-            .width(Length::Fill)
-            .padding([12, 14])
-            .style(|_, status| {
-                let fill = match status {
-                    button::Status::Hovered | button::Status::Pressed => theme::FIELD,
-                    _ => theme::RAISED,
-                };
-                button::Style {
-                    background: Some(fill.into()),
-                    text_color: theme::TEXT,
-                    border: iced::Border {
-                        color: theme::BORDER,
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    ..Default::default()
-                }
-            })
-            .on_press(act(Action::Open(Tab::for_kind(kind))))
-            .into()
-    }
-
-    // -----------------------------------------------------------------------
-    // Detail drawer
-    // -----------------------------------------------------------------------
-
-    fn drawer_tabs(&self, sel: &Selected) -> Vec<(DrawerTab, String)> {
-        let details = self.loaded_details();
-        let n = |label: &str, count: Option<usize>| match count {
-            Some(c) => format!("{label} {c}"),
-            None => label.to_string(),
-        };
-        let events = n(
-            "Events",
-            details.and_then(|d| d.events.as_ref().ok()).map(Vec::len),
-        );
-        let mut tabs = vec![(DrawerTab::Overview, "Overview".to_string())];
-        match (sel.kind, details.map(|d| &d.body)) {
-            (Kind::Pod, body) => {
-                let pod = match body {
-                    Some(Body::Pod(p)) => Some(p),
-                    _ => None,
-                };
-                tabs.push((
-                    DrawerTab::Containers,
-                    n("Containers", pod.map(|p| p.containers.len())),
-                ));
-                tabs.push((
-                    DrawerTab::Volumes,
-                    n("Volumes", pod.map(|p| p.volumes.len())),
-                ));
-            }
-            (Kind::Service, body) => {
-                let count = match body {
-                    Some(Body::Service(s)) => Some(s.endpoints.len()),
-                    _ => None,
-                };
-                tabs.push((DrawerTab::Endpoints, n("Endpoints", count)));
-            }
-            _ => {}
-        }
-        tabs.push((DrawerTab::Events, events));
-        tabs
-    }
-
-    /// The drawer beside the list, or `None` when nothing is selected.
-    pub(in crate::app) fn view_drawer<'a>(&'a self, ctx: &ViewCtx<'a>) -> Option<El<'a>> {
-        let sel = self.selected.as_ref()?;
-        let loading = self.details.as_ref().is_some_and(|d| d.loading);
-        let header = row![
-            text(sel.name.as_str())
-                .size(16.5)
-                .font(theme::SEMIBOLD)
-                .color(theme::TEXT)
-                .width(Length::Fill),
-            if loading {
-                Element::from(theme::icon(icon::SPINNER).color(theme::TEXT_FAINT))
-            } else {
-                Space::new().into()
-            },
-            theme::icon_button(
-                icon::COPY,
-                "Copy name",
-                Some(Message::Copy(sel.name.clone()))
-            ),
-            theme::icon_button(icon::X, "Close (Esc)", Some(Message::CloseDrawer)),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Start);
-        let subtitle = row![
-            theme::icon(kind_glyph(sel.kind)),
-            theme::muted(format!("{} · {}", sel.kind.label(), sel.namespace))
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
-        let tabs = self.drawer_tabs(sel);
-        let current = tabs
-            .iter()
-            .position(|(t, _)| *t == self.drawer_tab)
-            .unwrap_or(0);
-        let tab_ids: Vec<DrawerTab> = tabs.iter().map(|(t, _)| *t).collect();
-        let strip = theme::underline_tabs(
-            tabs.into_iter().map(|(_, l)| l).collect(),
-            current,
-            move |i| Message::DrawerTab(tab_ids[i]),
-        );
-        let body: El<'a> = match (sel.kind, self.drawer_tab) {
-            (_, DrawerTab::Events) => self.drawer_events(),
-            (Kind::Pod, DrawerTab::Containers) => self.drawer_pod_containers(sel, ctx),
-            (Kind::Pod, DrawerTab::Volumes) => self.drawer_pod_volumes(),
-            (Kind::Service, DrawerTab::Endpoints) => self.drawer_service_endpoints(),
-            (Kind::Pod, _) => self.drawer_pod(sel, ctx),
-            (Kind::Service, _) => self.drawer_service(sel, ctx),
-            (Kind::Deployment, _) => self.drawer_deployment(sel, ctx),
-            _ => self.drawer_workload(sel, ctx),
-        };
-        let content = column![
-            header,
-            theme::vspace(2.0),
-            subtitle,
-            theme::vspace(14.0),
-            strip,
-            scrollable(
-                container(column![body, theme::vspace(12.0)]).padding(iced::Padding {
-                    right: 10.0,
-                    ..Default::default()
-                })
-            )
-            .direction(theme::thin())
-            .style(theme::scrollbar)
-            .height(Length::Fill),
-        ];
-        // The left edge drags to resize.
-        let handle = mouse_area(
-            container(Space::new().width(1).height(Length::Fill))
-                .padding([0, 2])
-                .style(theme::fill(theme::BORDER)),
-        )
-        .on_press(Message::DragStart(Drag::Drawer))
-        .interaction(iced::mouse::Interaction::ResizingHorizontally);
-        Some(
-            row![
-                handle,
-                container(content)
-                    .padding([14, 18])
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(theme::raised)
-            ]
-            .width(ctx.drawer_width)
-            .height(Length::Fill)
-            .into(),
-        )
-    }
-
-    /// Like `loaded_details`, but shows a message while they aren't available.
-    fn details_or_status<'a>(&'a self) -> Result<&'a Details, El<'a>> {
-        match self.details.as_ref().and_then(|d| d.data.as_ref()) {
-            Some(Ok(d)) => Ok(d),
-            Some(Err(e)) => Err(theme::colored(e.clone(), RED).into()),
-            None => Err(theme::faint("Loading details…").into()),
-        }
-    }
-
-    /// The "⋯" button that opens the drawer's menu.
-    fn drawer_menu_button<'a>(&self, ctx: &ViewCtx<'a>) -> El<'a> {
-        let open = ctx.popup == Some(&PopupKind::Drawer);
-        theme::tip(
-            container(
-                button(theme::icon(icon::DOTS_THREE).color(theme::TEXT).size(15.0))
-                    .padding([5, 9])
-                    .style(move |t, s| {
-                        if open {
-                            theme::toggled(true)(t, s)
-                        } else {
-                            theme::secondary(t, s)
-                        }
-                    })
-                    .on_press(Message::OpenPopup(
-                        PopupKind::Drawer,
-                        iced::widget::Id::new(DRAWER_MENU),
-                    )),
-            )
-            .id(DRAWER_MENU),
-            "More actions",
-        )
-    }
-
-    /// The drawer's "⋯" menu: (icon, label, colour, message), `None` for a separator.
-    pub(in crate::app) fn drawer_menu(
-        &self,
-    ) -> Vec<Option<(&'static str, String, Color, Message)>> {
-        let Some(sel) = &self.selected else {
-            return Vec::new();
-        };
-        let (kind, ns, name) = (sel.kind, sel.namespace.clone(), sel.name.clone());
-        let mut items = Vec::new();
-        match kind {
-            Kind::Deployment => {
-                items.push(Some((
-                    icon::ARROW_COUNTER_CLOCKWISE,
-                    "Rollout restart".to_string(),
-                    theme::TEXT,
-                    act(Action::Restart(kind, ns.clone(), name.clone())),
-                )));
-                // Paused state comes with the details; offer the toggle once it's known.
-                if let Some(Body::Deployment(det)) = self.loaded_details().map(|d| &d.body) {
-                    let (glyph, label) = if det.paused {
-                        (icon::PLAY, "Resume rollout")
-                    } else {
-                        (icon::PAUSE, "Pause rollout")
-                    };
-                    items.push(Some((
-                        glyph,
-                        label.to_string(),
-                        theme::TEXT,
-                        act(Action::Pause(ns.clone(), name.clone(), !det.paused)),
-                    )));
-                }
-                items.push(None);
-            }
-            k if k.restartable() => {
-                items.push(Some((
-                    icon::ARROW_COUNTER_CLOCKWISE,
-                    "Rollout restart".to_string(),
-                    theme::TEXT,
-                    act(Action::Restart(kind, ns.clone(), name.clone())),
-                )));
-                items.push(None);
-            }
-            _ => {}
-        }
-        // Edit YAML, View YAML and Delete: the end of every drawer's menu.
-        items.push(Some((
-            icon::PENCIL_SIMPLE,
-            "Edit YAML".to_string(),
-            theme::TEXT,
-            act(Action::EditYaml(kind, ns.clone(), name.clone())),
-        )));
-        items.push(Some((
-            icon::FILE_CODE,
-            "View YAML".to_string(),
-            theme::TEXT,
-            act(Action::Yaml(kind, ns.clone(), name.clone())),
-        )));
-        items.push(None);
-        items.push(Some((
-            icon::TRASH,
-            format!("Delete {}", kind.label().to_lowercase()),
-            RED,
-            act(Action::AskDelete(kind, ns, name)),
-        )));
-        items
-    }
-
-    /// The selected pod's regular containers, for the Shell menu.
-    pub(in crate::app) fn shell_menu(&self) -> Vec<(String, Message)> {
-        let Some(sel) = &self.selected else {
-            return Vec::new();
-        };
-        let Some(p) = self
-            .pods
-            .items
-            .iter()
-            .find(|p| p.namespace == sel.namespace && p.name == sel.name)
-        else {
-            return Vec::new();
-        };
-        p.containers
-            .iter()
-            .filter(|c| !c.init)
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    act(Action::Shell(p.clone(), Some(c.name.clone()))),
-                )
-            })
-            .collect()
-    }
-
-    fn drawer_pod<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
-        let Some(p) = self
-            .pods
-            .items
-            .iter()
-            .find(|p| p.namespace == sel.namespace && p.name == sel.name)
-        else {
-            return theme::faint(if self.pods.loaded {
-                "This pod no longer exists."
-            } else {
-                "Loading…"
-            })
-            .into();
-        };
-        let details = match self.loaded_details().map(|d| &d.body) {
-            Some(Body::Pod(d)) => Some(d),
-            _ => None,
-        };
-
-        let color = status_color(&p.status);
-        let summary = row![
-            theme::dot(color),
-            theme::colored(p.status.as_str(), color),
-            theme::vline(14.0),
-            theme::txt(format!("Ready {}", p.ready)),
-            theme::vline(14.0),
-            theme::txt(format!("Restarts {}", p.restarts)),
-            theme::vline(14.0),
-            theme::txt(format!("Age {}", p.age())),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
-
-        // A pod that restarted offers the previous run's logs; when it's failing that's
-        // where the reason is, so it takes the one primary button.
-        let restarted = p.restarts > 0;
-        let failing = pod_health(&p.status) == Health::Bad;
-        let previous_hint = match p.containers.iter().find(|c| !c.last_exit.is_empty()) {
-            Some(c) => format!(
-                "Logs from the run before the last restart\nLast run: {}",
-                c.last_exit
-            ),
-            None => "Logs from the run before the last restart".to_string(),
-        };
-        let logs = act(Action::OpenLogs(p.clone(), None, false));
-        let previous = act(Action::OpenLogs(p.clone(), None, true));
-        let mut actions = row![].spacing(6).align_y(iced::Center);
-        if restarted && failing {
-            actions = actions.push(theme::tip(
-                theme::primary_button(
-                    Some(icon::CLOCK_COUNTER_CLOCKWISE),
-                    "Previous logs",
-                    Some(previous),
-                ),
-                previous_hint,
-            ));
-            actions = actions.push(theme::secondary_button(
-                Some(icon::SCROLL),
-                "Logs",
-                Some(logs),
-            ));
-        } else {
-            actions = actions.push(theme::primary_button(
-                Some(icon::SCROLL),
-                "Logs",
-                Some(logs),
-            ));
-            if restarted {
-                actions = actions.push(theme::tip(
-                    theme::secondary_button(
-                        Some(icon::CLOCK_COUNTER_CLOCKWISE),
-                        "Previous logs",
-                        Some(previous),
+        let content = v_flex()
+            .w_full()
+            .h(px(68.0))
+            .gap(px(2.0))
+            .items_stretch()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .child(theme::muted(kind.plural()).text_size(px(13.0)))
+                    .child(theme::fill_space())
+                    .child(
+                        theme::icon(kind_glyph(kind))
+                            .text_size(px(15.0))
+                            .text_color(theme::TEXT_FAINT),
                     ),
-                    previous_hint,
-                ));
-            }
-        }
-        if !p.owner.is_empty() {
-            actions = actions.push(theme::tip(
-                theme::secondary_button(
-                    Some(icon::STACK),
-                    "All replicas",
-                    Some(act(Action::OpenGroupLogs {
-                        namespace: p.namespace.clone(),
-                        target: LogTarget::Owner(p.owner.clone()),
-                    })),
-                ),
-                format!("Logs from every pod of {}", p.owner),
-            ));
-        }
-        let running = p.status == "Running";
-        let regular = p.containers.iter().filter(|c| !c.init).count();
-        if regular > 1 && running {
-            actions = actions.push(
-                container(theme::secondary_button(
-                    Some(icon::TERMINAL_WINDOW),
-                    "Shell",
-                    Some(Message::OpenPopup(
-                        PopupKind::ShellContainers,
-                        iced::widget::Id::new(SHELL_MENU),
-                    )),
-                ))
-                .id(SHELL_MENU),
-            );
-        } else {
-            actions = actions.push(theme::tip(
-                theme::secondary_button(
-                    Some(icon::TERMINAL_WINDOW),
-                    "Shell",
-                    running.then(|| act(Action::Shell(p.clone(), None))),
-                ),
-                if running {
-                    "Open a shell in the container"
-                } else {
-                    "The pod isn't running"
-                },
-            ));
-        }
-        actions = actions.push(theme::secondary_button(
-            Some(icon::ARROWS_LEFT_RIGHT),
-            "Port forward",
-            Some(act(Action::ForwardPod(p.clone(), None))),
-        ));
-        actions = actions.push(self.drawer_menu_button(ctx));
-
-        let mut col = column![
-            summary,
-            theme::vspace(8.0),
-            actions.wrap().vertical_spacing(6)
-        ];
-
-        col = col.push(section("Details"));
-        let mut rows = vec![
-            ("Node", p.node.clone()),
-            ("Pod IP", p.ip.clone()),
-            ("Controlled by", p.owner.clone()),
-        ];
-        if let Some(d) = details {
-            rows.extend([
-                ("Host IP", d.host_ip.clone()),
-                ("QoS class", d.qos.clone()),
-                ("Service account", d.service_account.clone()),
-                ("Restart policy", d.restart_policy.clone()),
-                ("Priority class", d.priority_class.clone()),
-                ("Started", d.started.clone()),
-            ]);
-        }
-        col = col.push(details_grid(rows));
-
-        col = col.push(section("Containers"));
-        for c in &p.containers {
-            let color = if c.ready || c.state == "Completed" {
-                GREEN
-            } else {
-                status_color(&c.state)
-            };
-            let mut line = row![theme::dot(color), theme::semibold(c.name.as_str())]
-                .spacing(6)
-                .align_y(iced::Center);
-            if c.init {
-                line = line.push(theme::faint("init"));
-            }
-            line = line.push(theme::txt(c.state.as_str()));
-            line = line.push(theme::faint(format!("· {} restarts", c.restarts)));
-            col = col.push(container(line).padding([6, 0]));
-        }
-
-        if let Some(d) = details {
-            col = col.push(conditions(&d.conditions));
-        }
-
-        if !p.ports.is_empty() {
-            col = col.push(section("Ports"));
-            for port in &p.ports {
-                col = col.push(
-                    row![
-                        theme::mono(port.to_string()),
-                        theme::small_button(
-                            Some(icon::ARROWS_LEFT_RIGHT),
-                            "Forward",
-                            Some(act(Action::ForwardPod(p.clone(), Some(*port))))
-                        )
-                    ]
-                    .spacing(8)
-                    .align_y(iced::Center),
-                );
-            }
-        }
-
-        if !p.labels.is_empty() {
-            col = col.push(section("Labels"));
-            col = col.push(tags(p.labels.iter().map(|(k, v)| format!("{k}={v}"))));
-        }
-        if let Some(d) = details {
-            if !d.node_selector.is_empty() {
-                col = col.push(section("Node selector"));
-                col = col.push(tags(d.node_selector.iter().cloned()));
-            }
-            col = col.push(annotations(&d.annotations, ctx));
-        }
-        col.spacing(2).into()
-    }
-
-    fn drawer_pod_containers<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
-        let details = match self.details_or_status() {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        let Body::Pod(pod) = &details.body else {
-            return Space::new().into();
-        };
-        let row_info = self
-            .pods
-            .items
-            .iter()
-            .find(|p| p.namespace == sel.namespace && p.name == sel.name);
-
-        let mut col = column![].spacing(10);
-        for c in &pod.containers {
-            let info = row_info.and_then(|p| p.containers.iter().find(|i| i.name == c.name));
-            let color = match info {
-                Some(i) if i.ready || i.state == "Completed" => GREEN,
-                Some(i) => status_color(&i.state),
-                None => theme::IDLE,
-            };
-            let mut head = row![
-                theme::dot(color),
-                theme::semibold(c.name.as_str()).size(15.0)
-            ]
-            .spacing(8)
-            .align_y(iced::Center);
-            if c.init {
-                head = head.push(theme::badge("init", theme::IDLE, false));
-            }
-            if let Some(i) = info {
-                head = head.push(theme::badge(i.state.clone(), color, false));
-                if i.restarts > 0 {
-                    head = head.push(theme::tip(
-                        restarts_badge(i.restarts),
-                        format!("{} restarts", i.restarts),
-                    ));
-                }
-            }
-            head = head.push(theme::fill_space());
-            if let Some(p) = row_info {
-                if info.is_some_and(|i| i.restarts > 0) {
-                    head = head.push(theme::tip(
-                        theme::small_button(
-                            Some(icon::CLOCK_COUNTER_CLOCKWISE),
-                            "Previous",
-                            Some(act(Action::OpenLogs(p.clone(), Some(c.name.clone()), true))),
-                        ),
-                        "Logs from the run before the last restart",
-                    ));
-                }
-                head = head.push(theme::small_button(
-                    Some(icon::SCROLL),
-                    "Logs",
-                    Some(act(Action::OpenLogs(
-                        p.clone(),
-                        Some(c.name.clone()),
-                        false,
-                    ))),
-                ));
-                let can_shell = !c.init && p.status == "Running";
-                head = head.push(theme::small_button(
-                    Some(icon::TERMINAL_WINDOW),
-                    "Shell",
-                    can_shell.then(|| act(Action::Shell(p.clone(), Some(c.name.clone())))),
-                ));
-            }
-            let mut card = column![head].spacing(10);
-            if !c.last_termination.is_empty() {
-                card = card.push(
-                    row![
-                        theme::icon(icon::WARNING_CIRCLE).color(YELLOW),
-                        theme::colored(format!("Last terminated: {}", c.last_termination), YELLOW)
-                            .size(theme::SMALL)
-                    ]
-                    .spacing(6)
-                    .align_y(iced::Center),
-                );
-            }
-
-            // Image, pull policy, working dir and ports in one aligned key/value grid.
-            let mut props = column![prop_row("Image", image_label(&c.image))].spacing(14);
-            props = props.push(prop_row(
-                "Pull policy",
-                theme::mono(c.pull_policy.clone()).into(),
-            ));
-            if !c.working_dir.is_empty() {
-                props = props.push(prop_row(
-                    "Working dir",
-                    theme::mono(c.working_dir.clone())
-                        .wrapping(text::Wrapping::WordOrGlyph)
-                        .into(),
-                ));
-            }
-            if !c.ports.is_empty() {
-                props = props.push(prop_row("Ports", tags(c.ports.iter().cloned())));
-            }
-            card = card.push(theme::hline());
-            card = card.push(props);
-
-            if !c.command.is_empty() || !c.args.is_empty() {
-                card = card.push(sub_section("Command"));
-                let line = c
-                    .command
-                    .iter()
-                    .chain(c.args.iter())
-                    .map(|s| shell_quote(s))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                card = card.push(code_block(line));
-            }
-            if !c.requests.is_empty() || !c.limits.is_empty() {
-                card = card.push(sub_section("Resources"));
-                card = card.push(resources_grid(&c.requests, &c.limits));
-            }
-
-            let env_count = c.env.len() + c.env_from_secrets.len();
-            card = card.push(theme::hline());
-            card = card.push(collapsible(
-                ctx,
-                format!("env/{}", c.name),
-                true,
-                format!("Environment ({env_count})"),
-                || self.env_list(&sel.namespace, c, ctx),
-            ));
-            if !c.mounts.is_empty() {
-                card = card.push(collapsible(
-                    ctx,
-                    format!("mounts/{}", c.name),
-                    false,
-                    format!("Mounts ({})", c.mounts.len()),
-                    || {
-                        column(c.mounts.iter().map(|(path, source)| {
-                            row![
-                                theme::mono(path.as_str()),
-                                theme::faint(format!("← {source}"))
-                            ]
-                            .spacing(6)
-                            .wrap()
-                            .into()
-                        }))
-                        .spacing(3)
-                        .into()
-                    },
-                ));
-            }
-            if !c.probes.is_empty() {
-                card = card.push(collapsible(
-                    ctx,
-                    format!("probes/{}", c.name),
-                    false,
-                    format!("Probes ({})", c.probes.len()),
-                    || {
-                        column(c.probes.iter().map(|(kind, desc)| {
-                            column![
-                                theme::semibold(kind.as_str()),
-                                theme::mono_muted(desc.as_str()).size(11.5)
-                            ]
-                            .spacing(2)
-                            .into()
-                        }))
-                        .spacing(6)
-                        .into()
-                    },
-                ));
-            }
-            col = col.push(container(card).padding([12, 14]).width(Length::Fill).style(
-                theme::boxed(
-                    theme::alpha(theme::FIELD, 0.55),
-                    theme::BORDER,
-                    theme::RADIUS,
-                ),
-            ));
-        }
-        col.into()
-    }
-
-    fn env_list<'a>(&'a self, ns: &str, c: &'a ContainerDetails, ctx: &ViewCtx<'a>) -> El<'a> {
-        if c.env.is_empty() && c.env_from_secrets.is_empty() {
-            return theme::faint("No environment variables").into();
-        }
-        let secret = |name: &str| self.secrets.get(&(ns.to_string(), name.to_string()));
-        // One search shared by every container's list.
-        let mut col = column![theme::search_field(
-            ctx.env_filter,
-            "Search env",
-            220.0,
-            Message::EnvFilter
-        )]
-        .spacing(4);
-        let needle = ctx.env_filter.trim().to_lowercase();
-        let mut shown = 0usize;
-        // The variables as a striped two-column table.
-        let mut table = column![];
-        // Everything with a known value, for "Copy as .env".
-        let mut dotenv = Vec::new();
-
-        for name in &c.env_from_secrets {
-            table = table.push(
-                container(
-                    row![
-                        theme::small(format!("All keys from Secret {name}")),
-                        theme::fill_space(),
-                        self.secret_toggle(ns, name)
-                    ]
-                    .spacing(6)
-                    .align_y(iced::Center),
-                )
-                .padding([5, 8])
-                .width(Length::Fill)
-                .style(theme::fill(theme::RAISED)),
-            );
-            if let Some(Ok(values)) = secret(name) {
-                let source = format!("Secret {name}");
-                for (k, v) in values {
-                    if !env_matches(&needle, k, Some(v), Some(&source)) {
-                        continue;
-                    }
-                    shown += 1;
-                    table = table.push(env_item(
-                        k,
-                        Some(v.clone()),
-                        Some(source.clone()),
-                        None,
-                        shown,
-                    ));
-                    dotenv.push(format!("{k}={v}"));
-                }
-            }
-        }
-
-        for e in &c.env {
-            let (value, source, secret_name) = match &e.source {
-                EnvSource::Literal => (e.value.clone(), None, None),
-                EnvSource::ConfigMap { name, key } => (
-                    Some(
-                        e.value
-                            .clone()
-                            .unwrap_or_else(|| "(ConfigMap not readable)".into()),
-                    ),
-                    Some(format!("ConfigMap {name} · {key}")),
-                    None,
-                ),
-                EnvSource::Secret { name, key } => {
-                    let value = match secret(name) {
-                        Some(Ok(values)) => Some(
-                            values
-                                .get(key)
-                                .cloned()
-                                .unwrap_or_else(|| "(missing key)".into()),
-                        ),
-                        _ => None,
-                    };
-                    (
-                        value,
-                        Some(format!("Secret {name} · {key}")),
-                        Some(name.as_str()),
-                    )
-                }
-                EnvSource::Field(path) => (None, Some(format!("field {path}")), None),
-                EnvSource::Resource(r) => (None, Some(format!("resource {r}")), None),
-            };
-            if !env_matches(&needle, &e.name, value.as_deref(), source.as_deref()) {
-                continue;
-            }
-            shown += 1;
-            if let Some(v) = &value {
-                dotenv.push(format!("{}={v}", e.name));
-            }
-            let toggle = secret_name.map(|name| self.secret_toggle(ns, name));
-            table = table.push(env_item(
-                &e.name,
-                value,
-                source,
-                toggle.map(|t| (t, secret_name.is_some())),
-                shown,
-            ));
-        }
-        col = col.push(
-            container(table)
-                .width(Length::Fill)
-                .clip(true)
-                .style(theme::boxed(
-                    theme::CONTENT,
-                    theme::BORDER,
-                    theme::RADIUS_SMALL,
-                )),
-        );
-
-        if !needle.is_empty() && shown == 0 {
-            let hidden = c
-                .env_from_secrets
-                .iter()
-                .any(|n| !matches!(secret(n), Some(Ok(_))));
-            col = col.push(theme::faint(if hidden {
-                "No variables match (reveal secrets to search their keys)"
-            } else {
-                "No variables match"
-            }));
-        }
-        let copy_label = if needle.is_empty() {
-            "Copy as .env"
-        } else {
-            "Copy matches as .env"
-        };
-        col = col.push(theme::vspace(2.0));
-        col = col.push(theme::small_button(
-            Some(icon::COPY),
-            copy_label,
-            Some(Message::Copy(dotenv.join("\n"))),
-        ));
-        col.into()
-    }
-
-    fn secret_toggle<'a>(&self, ns: &str, name: &str) -> El<'a> {
-        let key = (ns.to_string(), name.to_string());
-        if self.secrets_loading.contains(&key) {
-            return theme::faint("Reading…").into();
-        }
-        match self.secrets.get(&key) {
-            Some(Ok(_)) => theme::small_button(
-                Some(icon::EYE_SLASH),
-                "Hide",
-                Some(act(Action::HideSecret(key.0, key.1))),
-            ),
-            Some(Err(e)) => theme::tip(
-                row![
-                    theme::icon(icon::WARNING_CIRCLE).color(RED),
-                    text("not readable").size(theme::SMALL).color(RED)
-                ]
-                .spacing(4)
-                .align_y(iced::Center),
-                e.clone(),
-            ),
-            None => theme::tip(
-                theme::small_button(
-                    Some(icon::EYE),
-                    "Reveal",
-                    Some(act(Action::RevealSecret(key.0, key.1))),
-                ),
-                "Read this secret",
-            ),
-        }
-    }
-
-    fn drawer_pod_volumes<'a>(&'a self) -> El<'a> {
-        let details = match self.details_or_status() {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        let Body::Pod(pod) = &details.body else {
-            return Space::new().into();
-        };
-        if pod.volumes.is_empty() {
-            return theme::faint("No volumes").into();
-        }
-        let mut col = column![].spacing(8);
-        for (name, desc) in &pod.volumes {
-            let mounted_by: Vec<String> = pod
-                .containers
-                .iter()
-                .flat_map(|c| {
-                    c.mounts
-                        .iter()
-                        .filter(|(_, src)| {
-                            src == name
-                                || src.starts_with(&format!("{name}/"))
-                                || src.starts_with(&format!("{name} "))
-                        })
-                        .map(move |(path, _)| format!("{}:{path}", c.name))
-                })
-                .collect();
-            let mut entry = column![
-                row![theme::semibold(name.as_str()), theme::faint(desc.as_str())]
-                    .spacing(8)
-                    .wrap()
-            ]
-            .spacing(2);
-            for m in mounted_by {
-                entry = entry.push(theme::mono_muted(m).size(11.5));
-            }
-            col = col.push(entry);
-        }
-        col.into()
-    }
-
-    fn drawer_events<'a>(&'a self) -> El<'a> {
-        let details = match self.details_or_status() {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        let events = match &details.events {
-            Ok(e) => e,
-            Err(e) => return theme::faint(format!("Events unavailable: {e}")).into(),
-        };
-        if events.is_empty() {
-            return theme::faint("No recent events. Kubernetes keeps events for about an hour.")
-                .into();
-        }
-        let mut col = column![].spacing(8);
-        for e in events {
-            let (glyph, color) = if e.warning {
-                (icon::WARNING, YELLOW)
-            } else {
-                (icon::INFO, theme::TEXT_MUTED)
-            };
-            let count = if e.count > 1 {
-                format!(" ×{}", e.count)
-            } else {
-                String::new()
-            };
-            col = col.push(
-                column![
-                    row![
-                        theme::icon(glyph).color(color),
-                        theme::semibold(e.reason.as_str()),
-                        theme::fill_space(),
-                        theme::faint(format!("{} ago{count}", e.age)),
-                    ]
-                    .spacing(6)
-                    .align_y(iced::Center),
-                    theme::txt(e.message.as_str()),
-                    theme::vspace(2.0),
-                    theme::hline(),
-                ]
-                .spacing(4),
-            );
-        }
-        col.into()
-    }
-
-    fn drawer_service<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
-        let Some(s) = self
-            .services
-            .items
-            .iter()
-            .find(|s| s.namespace == sel.namespace && s.name == sel.name)
-        else {
-            return theme::faint("This service no longer exists.").into();
-        };
-        let details = match self.loaded_details().map(|d| &d.body) {
-            Some(Body::Service(d)) => Some(d),
-            _ => None,
-        };
-        let can_forward = !s.selector.is_empty();
-        let actions = row![
-            theme::tip(
-                theme::secondary_button(
-                    Some(icon::ARROWS_LEFT_RIGHT),
-                    "Port forward",
-                    (can_forward && !s.ports.is_empty())
-                        .then(|| act(Action::ForwardService(s.clone(), None))),
-                ),
-                if can_forward && !s.ports.is_empty() {
-                    ""
-                } else {
-                    "Service has no selector or ports"
-                },
-            ),
-            theme::tip(
-                theme::secondary_button(
-                    Some(icon::STACK),
-                    "Logs (all pods)",
-                    can_forward.then(|| act(Action::OpenGroupLogs {
-                        namespace: s.namespace.clone(),
-                        target: LogTarget::Selector {
-                            label: format!("svc/{}", s.name),
-                            selector: s.selector.clone(),
-                        },
-                    })),
-                ),
-                if can_forward {
-                    ""
-                } else {
-                    "Service has no selector"
-                },
-            ),
-            self.drawer_menu_button(ctx),
-        ]
-        .spacing(6)
-        .align_y(iced::Center);
-
-        let mut col = column![actions.wrap().vertical_spacing(6)];
-        col = col.push(section("Details"));
-        let mut rows = vec![
-            ("Type", s.kind.clone()),
-            ("Cluster IP", s.cluster_ip.clone()),
-            ("External", s.external.clone()),
-            ("Age", s.age()),
-        ];
-        if let Some(d) = details {
-            rows.extend([
-                ("Session affinity", d.session_affinity.clone()),
-                ("External traffic", d.external_traffic_policy.clone()),
-                ("Internal traffic", d.internal_traffic_policy.clone()),
-                ("IP families", d.ip_families.clone()),
-            ]);
-        }
-        col = col.push(details_grid(rows));
-
-        if let Some(d) = details {
-            let ready = d.endpoints.iter().filter(|e| e.ready).count();
-            col = col.push(theme::vspace(4.0));
-            col = col.push(
-                row![
-                    theme::dot(if ready > 0 { GREEN } else { RED }),
-                    theme::txt(format!("{ready} of {} endpoints ready", d.endpoints.len()))
-                ]
-                .spacing(6)
-                .align_y(iced::Center),
-            );
-        }
-
-        col = col.push(section("Ports"));
-        if s.ports.is_empty() {
-            col = col.push(theme::faint("No ports"));
-        }
-        for port in &s.ports {
-            let name = if port.name.is_empty() {
-                String::new()
-            } else {
-                format!("{} ", port.name)
-            };
-            let mut line = row![theme::mono(format!(
-                "{name}{} → {}/{}",
-                port.port, port.target, port.protocol
-            ))]
-            .spacing(8)
-            .align_y(iced::Center);
-            if let Some(np) = port.node_port {
-                line = line.push(theme::faint(format!("node {np}")));
-            }
-            line = line.push(theme::small_button(
-                Some(icon::ARROWS_LEFT_RIGHT),
-                "Forward",
-                can_forward.then(|| act(Action::ForwardService(s.clone(), Some(port.port)))),
-            ));
-            col = col.push(line);
-        }
-
-        col = col.push(section("Selector"));
-        if s.selector.is_empty() {
-            col = col.push(theme::faint("None"));
-        } else {
-            col = col.push(tags(s.selector.split(',').map(str::to_string)));
-        }
-        if let Some(d) = details {
-            if !d.labels.is_empty() {
-                col = col.push(section("Labels"));
-                col = col.push(tags(d.labels.iter().map(|(k, v)| format!("{k}={v}"))));
-            }
-            col = col.push(annotations(&d.annotations, ctx));
-        }
-        col.spacing(2).into()
-    }
-
-    fn drawer_service_endpoints<'a>(&'a self) -> El<'a> {
-        let details = match self.details_or_status() {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        let Body::Service(svc) = &details.body else {
-            return Space::new().into();
-        };
-        let mut col = column![].spacing(4);
-        if !svc.endpoint_ports.is_empty() {
-            col = col.push(sub_section("Ports"));
-            col = col.push(tags(svc.endpoint_ports.iter().cloned()));
-            col = col.push(theme::vspace(6.0));
-        }
-        if svc.endpoints.is_empty() {
-            return col
-                .push(theme::faint(
-                    "No endpoints. Check that the selector matches ready pods.",
-                ))
-                .into();
-        }
-        let ns = self
-            .selected
-            .as_ref()
-            .map(|s| s.namespace.clone())
-            .unwrap_or_default();
-        for e in &svc.endpoints {
-            let mut line = row![
-                theme::dot(if e.ready { GREEN } else { RED }),
-                theme::mono(e.ip.as_str())
-            ]
-            .spacing(8)
-            .align_y(iced::Center);
-            line = line.push(match e.target.strip_prefix("pod/") {
-                Some(pod) => theme::tip(
-                    button(text(e.target.as_str()).size(theme::BODY))
-                        .padding(0)
-                        .style(theme::link(theme::ACCENT_HOVER))
-                        .on_press(act(Action::GoToPod(ns.clone(), pod.to_string()))),
-                    "Open pod",
-                ),
-                None => theme::txt(e.target.as_str()).into(),
-            });
-            if !e.ready {
-                line = line.push(theme::colored("not ready", RED));
-            }
-            col = col.push(line);
-            if !e.node.is_empty() {
-                col = col.push(container(theme::small(format!("on {}", e.node))).padding(
-                    iced::Padding {
-                        left: 16.0,
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-        col.into()
-    }
-
-    fn replicas_control<'a>(kind: Kind, ns: &str, name: &str, replicas: i32) -> El<'a> {
-        let scale = |n: i32| act(Action::Scale(kind, ns.to_string(), name.to_string(), n));
-        row![
-            theme::txt("Replicas"),
-            theme::tip(
-                theme::secondary_button(
-                    Some(icon::MINUS),
-                    "",
-                    (replicas > 0).then(|| scale(replicas - 1))
-                ),
-                "Scale down"
-            ),
-            theme::semibold(replicas.to_string()),
-            theme::tip(
-                theme::secondary_button(Some(icon::PLUS), "", Some(scale(replicas + 1))),
-                "Scale up"
-            ),
-        ]
-        .spacing(6)
-        .align_y(iced::Center)
-        .into()
-    }
-
-    fn drawer_deployment<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
-        let Some(d) = self
-            .deployments
-            .items
-            .iter()
-            .find(|d| d.namespace == sel.namespace && d.name == sel.name)
-        else {
-            return theme::faint("This deployment no longer exists.").into();
-        };
-        let details = match self.loaded_details().map(|d| &d.body) {
-            Some(Body::Deployment(d)) => Some(d),
-            _ => None,
-        };
-        let color = if d.ready >= d.replicas { GREEN } else { YELLOW };
-        let summary = row![
-            theme::dot(color),
-            theme::colored(format!("Ready {}/{}", d.ready, d.replicas), color),
-            theme::vline(14.0),
-            theme::txt(format!("Up-to-date {}", d.updated)),
-            theme::vline(14.0),
-            theme::txt(format!("Available {}", d.available)),
-            theme::vline(14.0),
-            theme::txt(format!("Age {}", d.age())),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
-        let mut col = column![summary, theme::vspace(8.0)].spacing(2);
-        if !d.selector.is_empty() {
-            col = col.push(theme::secondary_button(
-                Some(icon::STACK),
-                "Logs (all pods)",
-                Some(act(Action::OpenGroupLogs {
-                    namespace: d.namespace.clone(),
-                    target: LogTarget::Selector {
-                        label: format!("deploy/{}", d.name),
-                        selector: d.selector.clone(),
-                    },
-                })),
-            ));
-            col = col.push(theme::vspace(4.0));
-        }
-        col = col.push(
-            row![
-                Self::replicas_control(Kind::Deployment, &d.namespace, &d.name, d.replicas),
-                theme::vline(18.0),
-                self.drawer_menu_button(ctx),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-        );
-
-        col = col.push(section("Details"));
-        let mut rows = vec![("Strategy", d.strategy.clone())];
-        if let Some(det) = details {
-            rows.extend([
-                ("Paused", if det.paused { "Yes" } else { "No" }.to_string()),
-                ("Min ready", det.min_ready_seconds.to_string()),
-                ("Revision history", det.revision_history.to_string()),
-            ]);
-        }
-        col = col.push(details_grid(rows));
-        if let Some(det) = details {
-            col = col.push(conditions(&det.conditions));
-        }
-        col = col.push(section("Images"));
-        for image in &d.images {
-            col = col.push(theme::mono(image.as_str()));
-        }
-        if !d.selector.is_empty() {
-            col = col.push(section("Selector"));
-            col = col.push(tags(d.selector.split(',').map(str::to_string)));
-        }
-        if let Some(det) = details {
-            if !det.labels.is_empty() {
-                col = col.push(section("Labels"));
-                col = col.push(tags(det.labels.iter().map(|(k, v)| format!("{k}={v}"))));
-            }
-            col = col.push(annotations(&det.annotations, ctx));
-        }
-        col.into()
-    }
-
-    fn drawer_workload<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
-        let Some(w) = self
-            .workload(sel.kind)
-            .items
-            .iter()
-            .find(|w| w.namespace == sel.namespace && w.name == sel.name)
-        else {
-            return theme::faint(format!("This {} no longer exists.", sel.kind.label())).into();
-        };
-        let details = match self.loaded_details().map(|d| &d.body) {
-            Some(Body::Workload(d)) => Some(d),
-            _ => None,
-        };
-        let color = health_color(w.health);
-        let summary = row![
-            theme::dot(color),
-            theme::colored(w.summary.as_str(), color),
-            theme::vline(14.0),
-            theme::txt(format!("Age {}", w.age())),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
-
-        // Separators only between groups that are actually shown.
-        let mut actions = row![].spacing(6).align_y(iced::Center);
-        let mut first = true;
-        if w.kind == Kind::CronJob {
-            first = false;
-            actions = actions.push(theme::tip(
-                theme::primary_button(
-                    Some(icon::PLAY),
-                    "Run now",
-                    Some(act(Action::Trigger(w.namespace.clone(), w.name.clone()))),
-                ),
-                "Start a job from this cron job's template",
-            ));
-        }
-        if let Some(suspended) = w.suspended.filter(|_| !w.finished) {
-            first = false;
-            let (glyph, label) = if suspended {
-                (icon::PLAY_CIRCLE, "Resume")
-            } else {
-                (icon::PAUSE, "Suspend")
-            };
-            let hint = match (w.kind, suspended) {
-                (Kind::CronJob, false) => "Stop scheduling new runs",
-                (Kind::CronJob, true) => "Start scheduling runs again",
-                (_, false) => "Stop the job's pods until resumed",
-                (_, true) => "Let the job run again",
-            };
-            actions = actions.push(theme::tip(
-                theme::secondary_button(
-                    Some(glyph),
-                    label,
-                    Some(act(Action::Suspend(
-                        w.kind,
-                        w.namespace.clone(),
-                        w.name.clone(),
-                        !suspended,
-                    ))),
-                ),
-                hint,
-            ));
-        }
-        if !w.selector.is_empty() && w.kind != Kind::CronJob {
-            if !first {
-                actions = actions.push(theme::vline(18.0));
-            }
-            first = false;
-        }
-        if !w.selector.is_empty() {
-            actions = actions.push(theme::secondary_button(
-                Some(icon::STACK),
-                "Logs (all pods)",
-                Some(act(Action::OpenGroupLogs {
-                    namespace: w.namespace.clone(),
-                    target: LogTarget::Selector {
-                        label: format!("{}/{}", w.kind.label().to_lowercase(), w.name),
-                        selector: w.selector.clone(),
-                    },
-                })),
-            ));
-        }
-        if let Some(replicas) = w.replicas.filter(|_| w.kind.scalable()) {
-            if !first {
-                actions = actions.push(theme::vline(18.0));
-            }
-            first = false;
-            actions = actions.push(Self::replicas_control(
-                w.kind,
-                &w.namespace,
-                &w.name,
-                replicas,
-            ));
-        }
-        if !first {
-            actions = actions.push(theme::vline(18.0));
-        }
-        actions = actions.push(self.drawer_menu_button(ctx));
-
-        let mut col = column![
-            summary,
-            theme::vspace(8.0),
-            actions.wrap().vertical_spacing(6)
-        ]
-        .spacing(2);
-        col = col.push(section("Details"));
-        let columns = kube_ops::columns(w.kind);
-        let mut rows: Vec<(&str, String)> = columns
-            .iter()
-            .map(|(t, _)| *t)
-            .zip(w.cells.iter().map(|c| c.text()))
-            .collect();
-        rows.extend(w.info.iter().map(|(k, v)| (*k, v.clone())));
-        if !w.owner.is_empty() {
-            rows.push(("Controlled by", w.owner.clone()));
-        }
-        col = col.push(details_grid(rows));
-        if let Some(det) = details {
-            col = col.push(conditions(&det.conditions));
-        }
-        if !w.images.is_empty() {
-            col = col.push(section("Images"));
-            for image in &w.images {
-                col = col.push(theme::mono(image.as_str()));
-            }
-        }
-        if !w.selector.is_empty() {
-            col = col.push(section("Selector"));
-            col = col.push(tags(w.selector.split(',').map(str::to_string)));
-        }
-        if let Some(det) = details {
-            if !det.labels.is_empty() {
-                col = col.push(section("Labels"));
-                col = col.push(tags(det.labels.iter().map(|(k, v)| format!("{k}={v}"))));
-            }
-            col = col.push(annotations(&det.annotations, ctx));
-        }
-        col.into()
-    }
-}
-
-pub(in crate::app) const DRAWER_MENU: &str = "drawer-menu";
-pub(in crate::app) const SHELL_MENU: &str = "shell-menu";
-
-// ---------------------------------------------------------------------------
-// Drawer pieces
-// ---------------------------------------------------------------------------
-
-fn section<'a>(title: &'a str) -> El<'a> {
-    column![
-        theme::vspace(28.0),
-        theme::label_small(title),
-        theme::vspace(10.0)
-    ]
-    .into()
-}
-
-fn sub_section<'a>(title: &'a str) -> El<'a> {
-    column![theme::vspace(14.0), theme::label_small(title), theme::vspace(4.0)].into()
-}
-
-fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
-    column(rows.into_iter().map(|(key, value)| {
-        let value = if value.is_empty() {
-            "-".to_string()
-        } else {
-            value
-        };
-        row![
-            theme::muted(key).width(136),
-            theme::tip(
-                theme::mono(value.clone()).wrapping(text::Wrapping::WordOrGlyph),
-                if value.chars().count() > 48 {
-                    value
-                } else {
-                    String::new()
-                },
             )
-        ]
-        .spacing(20)
-        .into()
-    }))
-    .spacing(14)
-    .into()
-}
-
-/// Pill-shaped labels that wrap onto new rows. Click copies one.
-fn tags<'a>(items: impl Iterator<Item = String>) -> El<'a> {
-    row(items.map(|item| {
-        theme::tip(
-            button(
-                text(item.clone())
-                    .font(theme::MONO)
-                    .size(11.5)
-                    .color(theme::TEXT),
-            )
-            .padding([4, 10])
-            .style(|_, status| {
-                let fill = match status {
-                    button::Status::Hovered | button::Status::Pressed => theme::FIELD_HOVER,
-                    _ => theme::STRIPE,
-                };
-                button::Style {
-                    background: Some(fill.into()),
-                    text_color: theme::TEXT,
-                    border: iced::Border {
-                        color: theme::BORDER,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }
-            })
-            .on_press(Message::Copy(item)),
-            "Click to copy",
-        )
-    }))
-    .spacing(8)
-    .wrap()
-    .vertical_spacing(8)
-    .into()
-}
-
-/// A header that folds its content away. `key` remembers the state for this drawer.
-fn collapsible<'a>(
-    ctx: &ViewCtx<'a>,
-    key: String,
-    default_open: bool,
-    title: String,
-    content: impl FnOnce() -> El<'a>,
-) -> El<'a> {
-    let open = ctx.open(&key, default_open);
-    let header = button(
-        row![
-            text(if open {
-                icon::CARET_DOWN
-            } else {
-                icon::CARET_RIGHT
-            })
-            .font(theme::ICONS)
-            .size(11.0)
-            .color(theme::TEXT_FAINT),
-            theme::semibold(title),
-        ]
-        .spacing(6)
-        .align_y(iced::Center),
-    )
-    .padding([4, 0])
-    .style(theme::link(theme::TEXT))
-    .on_press(Message::ToggleSection(key));
-    let mut col = column![header].spacing(4);
-    if open {
-        col = col.push(container(content()).padding(iced::Padding {
-            left: 17.0,
-            ..Default::default()
-        }));
+            .child(theme::semibold(number).text_size(px(24.0)))
+            .child(theme::vspace(6.0))
+            .child(bar)
+            .child(theme::vspace(6.0))
+            .child(
+                theme::colored(legend, color)
+                    .text_size(px(12.0))
+                    .overflow_hidden(),
+            );
+        div()
+            .id(eid(format!("card/{}", kind.plural())))
+            .flex_1()
+            .min_w_0()
+            .px(px(14.0))
+            .py(px(12.0))
+            .bg(theme::RAISED)
+            .border_1()
+            .border_color(theme::BORDER)
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::FIELD))
+            .on_click(on(act(Action::Open(Tab::for_kind(kind)))))
+            .child(content)
+            .into_any_element()
     }
-    col.into()
 }
 
-fn annotations<'a>(list: &'a [(String, String)], ctx: &ViewCtx<'a>) -> El<'a> {
-    if list.is_empty() {
-        return Space::new().into();
-    }
-    column![
-        theme::vspace(10.0),
-        collapsible(
-            ctx,
-            "annotations".into(),
-            false,
-            format!("Annotations ({})", list.len()),
-            || {
-                column(list.iter().map(|(k, v)| {
-                    column![theme::small(k.as_str()), value_label(v, theme::TEXT)]
-                        .spacing(2)
-                        .into()
-                }))
-                .spacing(6)
-                .into()
-            },
-        )
-    ]
-    .into()
-}
-
-fn conditions<'a>(list: &'a [details::Condition]) -> El<'a> {
-    if list.is_empty() {
-        return Space::new().into();
-    }
-    let mut col = column![section("Conditions")].spacing(9);
-    for c in list {
-        let mut line = row![
-            theme::dot(if c.ok { GREEN } else { YELLOW }),
-            theme::tip(theme::txt(c.type_.as_str()), c.message.clone()),
-        ]
-        .spacing(6)
-        .align_y(iced::Center);
-        if !c.reason.is_empty() {
-            line = line.push(theme::faint(c.reason.as_str()));
-        }
-        col = col.push(line);
-    }
-    col.into()
-}
-
-/// A value in monospace, wrapping, with long values cut short (full value on hover).
-fn value_label<'a>(value: &str, color: Color) -> El<'a> {
-    const MAX: usize = 400;
-    if value.is_empty() {
-        theme::faint("(empty)").into()
-    } else if value.chars().count() > MAX {
-        let short: String = value.chars().take(MAX).collect();
-        theme::tip(
-            theme::mono(format!("{short}…"))
-                .color(color)
-                .wrapping(text::Wrapping::WordOrGlyph),
-            value.to_string(),
-        )
+fn filter_hint(regex: bool) -> &'static str {
+    if regex {
+        "Regex on name or namespace"
     } else {
-        theme::mono(value.to_string())
-            .color(color)
-            .wrapping(text::Wrapping::WordOrGlyph)
-            .into()
+        "Filter by name or namespace"
     }
-}
-
-/// One environment variable as a table row: name and its source on the left, the value on
-/// the right. `index` alternates the row stripe.
-fn env_item<'a>(
-    name: &str,
-    value: Option<String>,
-    source: Option<String>,
-    secret: Option<(El<'a>, bool)>,
-    index: usize,
-) -> El<'a> {
-    let mut key = column![
-        theme::mono(name.to_string())
-            .font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..theme::MONO
-            })
-            .wrapping(text::Wrapping::WordOrGlyph)
-    ]
-    .spacing(2);
-    if let Some(s) = source {
-        key = key.push(theme::small(s).color(theme::TEXT_FAINT));
-    }
-    let is_secret = secret.as_ref().is_some_and(|(_, s)| *s);
-    if let Some((toggle, _)) = secret {
-        key = key.push(toggle);
-    }
-    let value: El<'a> = match value {
-        Some(v) => value_label(&v, theme::SYNTAX_STRING),
-        None if is_secret => theme::faint("••••••••").into(),
-        None => theme::faint("set at runtime").into(),
-    };
-    let stripe = if index % 2 == 0 {
-        theme::STRIPE
-    } else {
-        theme::CONTENT
-    };
-    container(
-        row![
-            key.width(Length::FillPortion(2)),
-            container(value).width(Length::FillPortion(3))
-        ]
-        .spacing(12),
-    )
-    .padding([5, 8])
-    .width(Length::Fill)
-    .style(theme::fill(stripe))
-    .into()
-}
-
-/// A label column and its value, for the container card's property grid.
-fn prop_row<'a>(label: &'a str, value: El<'a>) -> El<'a> {
-    row![
-        theme::muted(label).width(96),
-        container(value).width(Length::Fill)
-    ]
-    .spacing(12)
-    .into()
-}
-
-/// An image reference with its registry/repository path muted and `name:tag` emphasised.
-/// Click copies the whole reference.
-fn image_label<'a>(image: &str) -> El<'a> {
-    let (path, name) = match image.rfind('/') {
-        Some(i) => (&image[..=i], &image[i + 1..]),
-        None => ("", image),
-    };
-    let mut col = column![].spacing(1);
-    if !path.is_empty() {
-        col = col.push(
-            theme::mono_muted(path.to_string())
-                .size(theme::SMALL)
-                .wrapping(text::Wrapping::WordOrGlyph),
-        );
-    }
-    col = col.push(theme::mono(name.to_string()).wrapping(text::Wrapping::WordOrGlyph));
-    theme::tip(
-        button(col)
-            .padding(0)
-            .style(theme::link(theme::TEXT))
-            .on_press(Message::Copy(image.to_string())),
-        "Click to copy",
-    )
-}
-
-fn resources_grid<'a>(requests: &[(String, String)], limits: &[(String, String)]) -> El<'a> {
-    let mut names: Vec<&String> = requests
-        .iter()
-        .chain(limits.iter())
-        .map(|(k, _)| k)
-        .collect();
-    names.sort();
-    names.dedup();
-    let find = |list: &[(String, String)], name: &str| {
-        list.iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "-".into())
-    };
-    let cell = |e: El<'a>| container(e).width(Length::FillPortion(1));
-    let mut col = column![
-        container(
-            row![
-                cell(Space::new().into()),
-                cell(theme::label_small("Request").into()),
-                cell(theme::label_small("Limit").into())
-            ]
-            .spacing(8)
-        )
-        .padding([5, 8])
-        .style(theme::fill(theme::RAISED))
-    ];
-    for (i, name) in names.into_iter().enumerate() {
-        let stripe = if i % 2 == 0 {
-            theme::CONTENT
-        } else {
-            theme::STRIPE
-        };
-        col = col.push(
-            container(
-                row![
-                    cell(theme::txt(name.clone()).into()),
-                    cell(theme::mono(find(requests, name)).into()),
-                    cell(theme::mono(find(limits, name)).into()),
-                ]
-                .spacing(8),
-            )
-            .padding([5, 8])
-            .style(theme::fill(stripe)),
-        );
-    }
-    container(col)
-        .width(Length::Fill)
-        .clip(true)
-        .style(theme::boxed(
-            theme::CONTENT,
-            theme::BORDER,
-            theme::RADIUS_SMALL,
-        ))
-        .into()
-}
-
-fn code_block<'a>(line: String) -> El<'a> {
-    container(
-        theme::mono(line)
-            .size(11.5)
-            .wrapping(text::Wrapping::WordOrGlyph),
-    )
-    .padding(6)
-    .width(Length::Fill)
-    .style(theme::boxed(theme::CHROME, theme::CHROME, 4.0))
-    .into()
 }
 
 /// Restarts on a fixed severity ramp: none, tinted amber, filled red at five or more.
-fn restarts_badge<'a>(restarts: i32) -> El<'a> {
+fn restarts_badge(restarts: i32) -> El {
     match restarts {
-        0 => theme::mono("0").color(theme::TEXT_FAINT).into(),
-        1..=4 => theme::badge(restarts.to_string(), theme::WARN, false),
-        _ => theme::badge(restarts.to_string(), theme::BAD, true),
+        0 => theme::mono("0")
+            .text_color(theme::TEXT_FAINT)
+            .into_any_element(),
+        1..=4 => theme::badge(restarts.to_string(), theme::WARN, false).into_any_element(),
+        _ => theme::badge(restarts.to_string(), theme::BAD, true).into_any_element(),
     }
 }
 
 /// A list error as a tinted box, one row per message (one per failed namespace).
-fn error_callout<'a>(error: &str) -> El<'a> {
-    let lines = error.lines().filter(|l| !l.trim().is_empty()).map(|line| {
-        row![
-            theme::icon(icon::WARNING_CIRCLE).color(theme::BAD),
-            theme::txt(line.to_string()).wrapping(text::Wrapping::WordOrGlyph)
-        ]
-        .spacing(8)
-        .into()
-    });
-    column![
-        container(column(lines).spacing(4))
-            .padding([10, 12])
-            .width(Length::Fill)
-            .style(theme::boxed(
+fn error_callout(error: &str) -> El {
+    let lines = error
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            h_flex()
+                .gap(px(8.0))
+                .items_start()
+                .child(theme::icon(icon::WARNING_CIRCLE).text_color(theme::BAD))
+                .child(
+                    theme::txt(line.to_string())
+                        .whitespace_normal()
+                        .min_w_0()
+                        .flex_1(),
+                )
+        })
+        .collect::<Vec<_>>();
+    v_flex()
+        .w_full()
+        .flex_none()
+        .child(
+            theme::boxed(
                 theme::alpha(theme::BAD, 0.10),
                 theme::alpha(theme::BAD, 0.45),
-                theme::RADIUS
-            )),
-        theme::vspace(8.0)
-    ]
-    .into()
+                theme::RADIUS,
+            )
+            .w_full()
+            .px(px(12.0))
+            .py(px(10.0))
+            .child(v_flex().gap(px(4.0)).items_stretch().children(lines)),
+        )
+        .child(theme::vspace(8.0))
+        .into_any_element()
 }
+
+#[allow(dead_code)]
+pub(in crate::app) const DRAWER_MENU: &str = "drawer-menu";
+#[allow(dead_code)]
+pub(in crate::app) const SHELL_MENU: &str = "shell-menu";

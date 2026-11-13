@@ -3,7 +3,6 @@ mod code_editor;
 mod filter;
 mod icons;
 mod logs;
-#[cfg(target_os = "macos")]
 mod menu;
 mod shell;
 mod table;
@@ -11,6 +10,7 @@ mod theme;
 mod update;
 mod view;
 mod workspace;
+mod yaml;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -23,12 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use iced::{
-    Color, Point, Rectangle, Size, Subscription, Task,
-    keyboard::{self, Key, key::Named},
-    mouse,
-    widget::{self, operation, text_editor},
-    window,
+use gpui_kit::{
+    self as gpui, AppContext as _, Context, Entity, Global, InteractiveElement as _,
+    IntoElement, Keystroke, ParentElement as _, Render, Styled as _, WeakEntity, Window,
 };
 use kube::Client;
 use tokio::{
@@ -48,7 +45,9 @@ use crate::{
 use icons as icon;
 use logs::{LogTarget, LogView};
 use shell::ShellView;
+use theme::Color;
 use workspace::Workspace;
+use yaml::YamlView;
 
 /// How often the open drawer's details are re-fetched while live updates are on.
 /// Lists themselves don't poll: they're kept current by a watch.
@@ -64,6 +63,149 @@ const LOG_MIN_HEIGHT: f32 = 160.0;
 const LOG_COLLAPSED_HEIGHT: f32 = 44.0;
 const DRAWER_MIN_WIDTH: f32 = 340.0;
 pub const MIN_WINDOW_SIZE: Size = Size::new(1120.0, 600.0);
+pub const DEFAULT_WINDOW_SIZE: Size = Size::new(1360.0, 860.0);
+
+// ---------------------------------------------------------------------------
+// Geometry (logical pixels, as plain f32)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Point {
+    pub const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+impl From<gpui::Point<gpui::Pixels>> for Point {
+    fn from(p: gpui::Point<gpui::Pixels>) -> Self {
+        Self::new(f32::from(p.x), f32::from(p.y))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Size {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Size {
+    pub const fn new(width: f32, height: f32) -> Self {
+        Self { width, height }
+    }
+}
+
+impl From<gpui::Size<gpui::Pixels>> for Size {
+    fn from(s: gpui::Size<gpui::Pixels>) -> Self {
+        Self::new(f32::from(s.width), f32::from(s.height))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Rectangle {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rectangle {
+    pub fn new(origin: Point, size: Size) -> Self {
+        Self {
+            x: origin.x,
+            y: origin.y,
+            width: size.width,
+            height: size.height,
+        }
+    }
+}
+
+impl From<gpui::Bounds<gpui::Pixels>> for Rectangle {
+    fn from(b: gpui::Bounds<gpui::Pixels>) -> Self {
+        Self::new(b.origin.into(), b.size.into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up work (what iced called a Task)
+// ---------------------------------------------------------------------------
+
+/// Follow-up work an update asks for: more messages, or something that needs the window
+/// (focus, clipboard, quitting). Returned from handlers and run by [`App::dispatch`].
+#[must_use]
+#[derive(Default)]
+pub struct Task {
+    effects: Vec<Effect>,
+}
+
+enum Effect {
+    Msg(Message),
+    Copy(String),
+    Quit,
+    Window(Box<dyn FnOnce(&mut App, &mut Window, &mut Context<App>)>),
+}
+
+impl Task {
+    pub fn none() -> Self {
+        Self::default()
+    }
+    /// Handle `msg` next.
+    pub fn done(msg: Message) -> Self {
+        Self {
+            effects: vec![Effect::Msg(msg)],
+        }
+    }
+    pub fn batch(tasks: impl IntoIterator<Item = Task>) -> Self {
+        Self {
+            effects: tasks.into_iter().flat_map(|t| t.effects).collect(),
+        }
+    }
+    /// Put `text` on the clipboard.
+    pub fn copy(text: String) -> Self {
+        Self {
+            effects: vec![Effect::Copy(text)],
+        }
+    }
+    pub fn quit() -> Self {
+        Self {
+            effects: vec![Effect::Quit],
+        }
+    }
+    /// Run `f` with the window, e.g. to move focus: `Task::window(|app, window, cx| …)`.
+    pub fn window(f: impl FnOnce(&mut App, &mut Window, &mut Context<App>) + 'static) -> Self {
+        Self {
+            effects: vec![Effect::Window(Box::new(f))],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sending messages from views
+// ---------------------------------------------------------------------------
+
+/// The app's entity, so event handlers anywhere can reach it (see [`on`]).
+struct AppHandle(WeakEntity<App>);
+
+impl Global for AppHandle {}
+
+/// Handles `msg` in the app (from an event handler, a subscription or an async task
+/// that has the window).
+pub fn send(msg: Message, window: &mut Window, cx: &mut gpui::App) {
+    let Some(app) = cx.try_global::<AppHandle>().and_then(|h| h.0.upgrade()) else {
+        return;
+    };
+    app.update(cx, |app, cx| app.dispatch(msg, window, cx));
+}
+
+/// An event handler that sends `msg`: `.on_click(on(Message::Refresh))`.
+pub fn on<E: ?Sized>(msg: Message) -> impl Fn(&E, &mut Window, &mut gpui::App) + 'static {
+    move |_, window, cx| send(msg.clone(), window, cx)
+}
 
 const GREEN: Color = theme::OK;
 const YELLOW: Color = theme::WARN;
@@ -171,9 +313,6 @@ enum Msg {
         text: String,
         error: bool,
     },
-    /// An item in the native menu bar was chosen.
-    #[cfg(target_os = "macos")]
-    Menu(menu::MenuCommand),
     /// The latest release tag from GitHub; `manual` when the user asked (reports "up to date").
     UpdateChecked {
         result: Result<String, String>,
@@ -237,12 +376,6 @@ impl Bus {
     }
 }
 
-fn wake_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::futures::stream::unfold((), |()| async {
-        WAKE.notified().await;
-        Some((Message::Wake, ()))
-    })
-}
 
 // ---------------------------------------------------------------------------
 // UI state
@@ -396,30 +529,6 @@ enum Older {
     Done,
 }
 
-struct YamlView {
-    title: String,
-    /// The cluster tab and object it shows, so edits are saved to the right place.
-    ws: u64,
-    kind: Kind,
-    namespace: String,
-    name: String,
-    text: Option<Result<String, String>>,
-    /// The editor's document: the YAML being viewed, or the edit buffer while editing.
-    content: text_editor::Content,
-    /// Editing (vs. viewing).
-    editing: bool,
-    /// The buffer differs from the fetched YAML (always true when creating).
-    dirty: bool,
-    /// Open straight into editing once the YAML arrives.
-    edit_on_load: bool,
-    saving: bool,
-    save_error: Option<String>,
-    /// Live YAML check of the edit buffer: (1-based line, message).
-    parse_error: Option<(usize, String)>,
-    /// A new object (Apply creates it) rather than an existing one.
-    create: bool,
-}
-
 #[derive(PartialEq)]
 enum PfStatus {
     Starting,
@@ -546,14 +655,14 @@ pub enum Message {
     /// Background results are waiting on the bus.
     Wake,
     Tick,
-    WindowOpened(window::Id),
     WindowResized(Size),
     CloseRequested,
     CursorMoved(Point),
     MouseReleased,
-    /// A key nobody else handled: the key, its Latin letter (layout-independent), modifiers.
-    Key(Key, Option<char>, keyboard::Modifiers),
-    Screenshot(window::Screenshot),
+    /// A key press nobody else handled.
+    Key(Keystroke),
+    /// An item in the menu bar (or its shortcut) was chosen.
+    Menu(menu::MenuCommand),
 
     // Cluster tabs and pickers
     ActivateWorkspace(usize),
@@ -570,7 +679,9 @@ pub enum Message {
     RemoveKubeconfig(PathBuf),
 
     // Popups
-    OpenPopup(PopupKind, widget::Id),
+    /// Open (or toggle) a popup, anchored at the pointer until a view reports the
+    /// trigger's bounds with `PopupAnchored`.
+    OpenPopup(PopupKind),
     PopupAnchored(PopupKind, Rectangle),
     ClosePopup,
     /// Unfold one kubeconfig's contexts in the "+" menu.
@@ -622,16 +733,13 @@ pub enum Message {
     Shell(u64, shell::ShellMsg),
 
     // YAML window
-    YamlAction(text_editor::Action),
+    /// The editor's text changed.
     YamlEdit,
     YamlApply,
     YamlCancel,
     YamlReload,
     YamlClose,
-    YamlIndent(bool),
     YamlComment,
-    YamlEnter,
-    Find(code_editor::FindMsg),
 
     // Dialogs
     PfRemote(String),
@@ -642,11 +750,12 @@ pub enum Message {
 }
 
 pub struct App {
+    /// The root view's focus, so keys and menu actions reach it when nothing else has focus.
+    focus: gpui::FocusHandle,
     rt: Runtime,
     bus: Bus,
     rx: Receiver<Msg>,
     settings: Settings,
-    window: Option<window::Id>,
     window_size: Size,
     cursor: Point,
 
@@ -663,8 +772,6 @@ pub struct App {
     split_log: usize,
     split_shell: usize,
     yaml: Option<YamlView>,
-    /// Find bar of the YAML window (kept across windows so the last query is remembered).
-    find: code_editor::Find,
     forwards: Vec<Forward>,
     pf_dialog: Option<PfDialog>,
     /// (cluster tab, kind, namespace, name)
@@ -684,9 +791,6 @@ pub struct App {
     env_filter: String,
     /// Collapsible drawer sections whose state differs from their default.
     toggled_sections: HashSet<String>,
-    /// The native menu bar; kept so its items stay alive.
-    #[cfg(target_os = "macos")]
-    _menu_bar: Option<menu::MenuBar>,
     next_id: u64,
     /// When the window size last changed and hasn't been written to disk yet.
     window_dirty: Option<Instant>,
@@ -696,6 +800,8 @@ pub struct App {
     /// and `KUBE_UI_SCREENSHOT_EDIT=1` opens it in the YAML editor (nothing is saved).
     /// `KUBE_UI_SCREENSHOT_CHANGELOG=1` opens the "What's new" window.
     screenshot: Option<DevScreenshot>,
+    /// Chrome's retained inputs (popup search, port-forward dialog fields); see `view.rs`.
+    chrome: view::ChromeState,
 }
 
 struct DevScreenshot {
@@ -717,7 +823,9 @@ struct DevScreenshot {
 }
 
 impl App {
-    pub fn new() -> (Self, Task<Message>) {
+    /// Builds the app for its window and starts the background loops. Call from
+    /// `cx.new` inside the window's builder.
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -730,12 +838,14 @@ impl App {
             .map(|[w, h]| Size::new(w, h))
             .unwrap_or(Size::new(1360.0, 860.0));
 
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         let mut app = Self {
+            focus,
             rt,
             bus: Bus { tx },
             rx,
             settings,
-            window: None,
             window_size,
             cursor: Point::ORIGIN,
             workspaces: Vec::new(),
@@ -746,7 +856,6 @@ impl App {
             split_log: 0,
             split_shell: 0,
             yaml: None,
-            find: code_editor::Find::default(),
             forwards: Vec::new(),
             pf_dialog: None,
             confirm_delete: None,
@@ -760,10 +869,9 @@ impl App {
             hovered_row: None,
             env_filter: String::new(),
             toggled_sections: HashSet::new(),
-            #[cfg(target_os = "macos")]
-            _menu_bar: None,
             next_id: 1,
             window_dirty: None,
+            chrome: Default::default(),
             screenshot: std::env::var_os("KUBE_UI_SCREENSHOT").map(|p| DevScreenshot {
                 path: PathBuf::from(p),
                 started: Instant::now(),
@@ -855,65 +963,80 @@ impl App {
             Err(_) => {}
         }
         app.sync();
-        (app, Task::none())
+        app.start_loops(window, cx);
+        app
     }
 
-    pub fn title(&self) -> String {
-        "Kube UI".into()
-    }
-
-    pub fn theme(&self) -> iced::Theme {
-        theme::theme()
-    }
-
-    pub fn subscription(&self) -> Subscription<Message> {
-        let mut subs = vec![
-            Subscription::run(wake_stream),
-            window::open_events().map(Message::WindowOpened),
-            window::resize_events().map(|(_, size)| Message::WindowResized(size)),
-            window::close_requests().map(|_| Message::CloseRequested),
-            keyboard::listen().filter_map(|e| match e {
-                keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                } => {
-                    let latin = key.to_latin(physical_key);
-                    Some(Message::Key(key, latin, modifiers))
+    /// The background loops that replace iced's subscriptions: draining the bus when a
+    /// task wakes it, the once-a-second tick, and saving on close.
+    fn start_loops(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = AppHandle(cx.entity().downgrade());
+        cx.set_global(handle);
+        // Results from background tasks.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                WAKE.notified().await;
+                let alive = this.update_in(cx, |app, window, cx| {
+                    app.dispatch(Message::Wake, window, cx)
+                });
+                if alive.is_err() {
+                    break;
                 }
-                _ => None,
-            }),
-            iced::time::every(if self.screenshot.is_some() {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(1)
-            })
-            .map(|_| Message::Tick),
-        ];
-        // Pointer tracking: anchors fallbacks for popups and drives panel resizing.
-        subs.push(iced::event::listen_with(
-            |event, _status, _window| match event {
-                iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                    Some(Message::CursorMoved(position))
+            }
+        })
+        .detach();
+        // The tick.
+        let every = if self.screenshot.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(every).await;
+                let alive = this.update_in(cx, |app, window, cx| {
+                    app.dispatch(Message::Tick, window, cx)
+                });
+                if alive.is_err() {
+                    break;
                 }
-                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    Some(Message::MouseReleased)
-                }
-                _ => None,
-            },
-        ));
-        Subscription::batch(subs)
+            }
+        })
+        .detach();
+        // Closing the window quits (after saving), as the only window.
+        let handle = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            if let Some(app) = handle.upgrade() {
+                app.update(cx, |app, cx| app.dispatch(Message::CloseRequested, window, cx));
+            }
+            true
+        });
     }
 
     // -----------------------------------------------------------------------
     // Update
     // -----------------------------------------------------------------------
 
-    pub fn update(&mut self, message: Message) -> Task<Message> {
-        let task = self.handle(message);
-        self.sync();
-        task
+    /// Handles a message and whatever follow-up work it asks for, then redraws.
+    pub fn dispatch(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
+        // Pointer motion arrives constantly; only a drag in progress needs a redraw.
+        let quiet = matches!(message, Message::CursorMoved(_)) && self.drag.is_none();
+        let mut pending = VecDeque::from([Effect::Msg(message)]);
+        while let Some(effect) = pending.pop_front() {
+            match effect {
+                Effect::Msg(msg) => {
+                    let task = self.handle(msg);
+                    self.sync();
+                    pending.extend(task.effects);
+                }
+                Effect::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+                Effect::Quit => cx.quit(),
+                Effect::Window(f) => f(self, window, cx),
+            }
+        }
+        if !quiet {
+            cx.notify();
+        }
     }
 
     /// Keeps background state in line with what's on screen after every message: only the
@@ -936,20 +1059,10 @@ impl App {
         self.save_workspaces();
     }
 
-    fn handle(&mut self, message: Message) -> Task<Message> {
+    fn handle(&mut self, message: Message) -> Task {
         match message {
             Message::Wake => return self.handle_messages(),
             Message::Tick => return self.tick(),
-            Message::WindowOpened(id) => {
-                self.window = Some(id);
-                #[cfg(target_os = "macos")]
-                {
-                    // Installed once the app has launched, replacing winit's default menu.
-                    if self._menu_bar.is_none() {
-                        self._menu_bar = menu::MenuBar::install(self.bus.clone());
-                    }
-                }
-            }
             Message::WindowResized(size) => {
                 self.window_size = size;
                 self.track_window();
@@ -966,8 +1079,8 @@ impl App {
                     self.settings.save();
                 }
             }
-            Message::Key(key, latin, modifiers) => return self.key(key, latin, modifiers),
-            Message::Screenshot(shot) => self.save_screenshot(shot),
+            Message::Key(keystroke) => return self.key(&keystroke),
+            Message::Menu(cmd) => return self.menu_command(cmd),
 
             Message::ActivateWorkspace(i) => self.activate_workspace(i),
             Message::CloseWorkspace(i) => self.close_workspace(i),
@@ -1023,7 +1136,7 @@ impl App {
                 self.settings.save();
             }
 
-            Message::OpenPopup(kind, id) => {
+            Message::OpenPopup(kind) => {
                 if self.popup.as_ref().is_some_and(|p| p.kind == kind) {
                     self.popup = None;
                     return Task::none();
@@ -1031,15 +1144,11 @@ impl App {
                 // A submenu stays inside its parent's popup; anything else replaces it.
                 let anchor = Rectangle::new(self.cursor, Size::new(1.0, 1.0));
                 self.popup = Some(Popup {
-                    kind: kind.clone(),
+                    kind,
                     anchor,
                     query: String::new(),
                 });
-                let find = widget::selector::find(id).map(move |target| match target {
-                    Some(t) => Message::PopupAnchored(kind.clone(), t.bounds()),
-                    None => Message::Noop,
-                });
-                return Task::batch([find, operation::focus(view::POPUP_SEARCH)]);
+                return view::focus_popup_search();
             }
             Message::PopupAnchored(kind, bounds) => {
                 if let Some(p) = self.popup.as_mut().filter(|p| p.kind == kind) {
@@ -1144,7 +1253,7 @@ impl App {
 
             Message::Copy(text) => {
                 self.toast(copied_message(&text), false);
-                return iced::clipboard::write(text);
+                return Task::copy(text);
             }
             Message::OpenUrl(url) => {
                 self.popup = None;
@@ -1183,50 +1292,12 @@ impl App {
             Message::Log(i, msg) => return self.log_message(i, msg),
             Message::Shell(id, msg) => return self.shell_message(id, msg),
 
-            Message::YamlAction(action) => self.yaml_action(action),
-            Message::YamlEdit => {
-                if let Some(y) = self.yaml.as_mut() {
-                    y.editing = true;
-                    y.content.move_to(text_editor::Cursor {
-                        position: text_editor::Position { line: 0, column: 0 },
-                        selection: None,
-                    });
-                    return operation::focus(view::YAML_EDITOR);
-                }
-            }
-            Message::YamlApply => self.yaml_apply(),
-            Message::YamlCancel => {
-                if let Some(y) = self.yaml.as_mut() {
-                    if y.create {
-                        self.yaml = None;
-                    } else {
-                        y.editing = false;
-                        y.dirty = false;
-                        y.save_error = None;
-                        y.parse_error = None;
-                        if let Some(Ok(t)) = &y.text {
-                            y.content = text_editor::Content::with_text(t);
-                        }
-                    }
-                }
-            }
-            Message::YamlReload => {
-                if let Some(y) = &self.yaml {
-                    let (kind, ns, name, editing) =
-                        (y.kind, y.namespace.clone(), y.name.clone(), y.editing);
-                    self.open_yaml(kind, ns, name);
-                    if let Some(y) = self.yaml.as_mut() {
-                        y.edit_on_load = editing;
-                    }
-                }
-            }
-            Message::YamlClose => self.yaml = None,
-            Message::YamlIndent(outdent) => {
-                self.yaml_edit_with(|text, range| code_editor::indent_lines(text, range, outdent))
-            }
-            Message::YamlComment => self.yaml_edit_with(code_editor::toggle_comment),
-            Message::YamlEnter => self.yaml_enter(),
-            Message::Find(msg) => return self.find_message(msg),
+            Message::YamlEdit
+            | Message::YamlApply
+            | Message::YamlCancel
+            | Message::YamlReload
+            | Message::YamlClose
+            | Message::YamlComment => return self.yaml_message(message),
 
             Message::PfRemote(text) => {
                 if let Some(d) = self.pf_dialog.as_mut() {
@@ -1282,16 +1353,16 @@ impl App {
         Task::none()
     }
 
-    fn quit(&mut self) -> Task<Message> {
+    fn quit(&mut self) -> Task {
         if self.window_dirty.take().is_some() {
             self.settings.save();
         }
-        iced::exit()
+        Task::quit()
     }
 
     /// Once a second (every 100ms while taking a dev screenshot): expire toasts, refresh
     /// the open drawer, flush the window size.
-    fn tick(&mut self) -> Task<Message> {
+    fn tick(&mut self) -> Task {
         self.toasts.retain(|t| t.at.elapsed() < TOAST_FOR);
         if self.settings.live_updates {
             if let Some(ws) = self.ws_mut().filter(|ws| ws.client().is_some()) {
@@ -1349,16 +1420,14 @@ impl App {
         (self.window_size.height - 180.0).max(LOG_MIN_HEIGHT)
     }
 
-    fn key(&mut self, key: Key, latin: Option<char>, m: keyboard::Modifiers) -> Task<Message> {
+    fn key(&mut self, keystroke: &Keystroke) -> Task {
         if self.screenshot.is_some() {
             return Task::none();
         }
-        if let Key::Named(Named::Escape) = key {
+        let m = &keystroke.modifiers;
+        if keystroke.key == "escape" {
             if self.popup.take().is_some() {
                 return Task::none();
-            }
-            if self.yaml.is_some() && self.find.open {
-                return self.find_message(code_editor::FindMsg::Close);
             }
             if self.pf_dialog.take().is_some() || self.confirm_delete.take().is_some() {
                 return Task::none();
@@ -1371,15 +1440,21 @@ impl App {
             }
             return Task::none();
         }
-        if !m.command() {
+        let command = if cfg!(target_os = "macos") {
+            m.platform
+        } else {
+            m.control
+        };
+        if !command {
             return Task::none();
         }
-        let Some(c) = latin else {
+        let mut chars = keystroke.key.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
             return Task::none();
         };
         match c {
             // ⌘1…⌘8 pick a cluster tab and ⌘9 the last one, as in browsers.
-            '1'..='9' if !m.alt() => {
+            '1'..='9' if !m.alt => {
                 let i = c as usize - '1' as usize;
                 if i == 8 {
                     self.activate_workspace(self.workspaces.len().saturating_sub(1));
@@ -1387,18 +1462,9 @@ impl App {
                     self.activate_workspace(i);
                 }
             }
-            'f' if self.yaml.is_some() => return self.find_message(code_editor::FindMsg::Open),
-            'g' if self.yaml.is_some() && self.find.open => {
-                return self.find_message(code_editor::FindMsg::Step(m.shift()));
-            }
             's' if self.yaml.as_ref().is_some_and(|y| y.editing) => self.yaml_apply(),
-            #[cfg(not(target_os = "macos"))]
-            'w' => self.close_frontmost(),
-            #[cfg(not(target_os = "macos"))]
-            'r' => {
-                if let Some(ws) = self.ws_mut() {
-                    ws.refresh();
-                }
+            '/' if self.yaml.as_ref().is_some_and(|y| y.editing) => {
+                return self.yaml_message(Message::YamlComment);
             }
             _ => {}
         }
@@ -1409,8 +1475,7 @@ impl App {
     // Menu bar
     // -----------------------------------------------------------------------
 
-    #[cfg(target_os = "macos")]
-    fn menu_command(&mut self, cmd: menu::MenuCommand) -> Task<Message> {
+    fn menu_command(&mut self, cmd: menu::MenuCommand) -> Task {
         use menu::MenuCommand;
         match cmd {
             MenuCommand::CheckForUpdates => match &self.update {
@@ -1431,10 +1496,7 @@ impl App {
             },
             MenuCommand::Quit => return self.quit(),
             MenuCommand::NewTab if !self.workspaces.is_empty() => {
-                return self.handle(Message::OpenPopup(
-                    PopupKind::NewTab,
-                    widget::Id::new(view::NEW_TAB_BUTTON),
-                ));
+                return self.handle(Message::OpenPopup(PopupKind::NewTab));
             }
             MenuCommand::NewTab | MenuCommand::OpenKubeconfig => {
                 if let Some(path) = pick_kubeconfig() {
@@ -1502,7 +1564,6 @@ impl App {
     }
 
     /// Moves to the next (`1`) or previous (`-1`) cluster tab, wrapping around.
-    #[cfg(target_os = "macos")]
     fn cycle_workspace(&mut self, step: isize) {
         let n = self.workspaces.len() as isize;
         if n > 1 {
@@ -1684,7 +1745,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// Enter in a searchable picker takes the first match.
-    fn popup_submit(&mut self) -> Task<Message> {
+    fn popup_submit(&mut self) -> Task {
         let Some(p) = &self.popup else {
             return Task::none();
         };
@@ -1724,7 +1785,7 @@ impl App {
     // Background message handling
     // -----------------------------------------------------------------------
 
-    fn handle_messages(&mut self) -> Task<Message> {
+    fn handle_messages(&mut self) -> Task {
         let mut tasks = Vec::new();
         let mut touched_logs = HashSet::new();
         while let Ok(msg) = self.rx.try_recv() {
@@ -1758,71 +1819,10 @@ impl App {
                         w.changed();
                     }
                 }
-                Msg::Yaml { title, result } => {
-                    if let Some(y) = self.yaml.as_mut().filter(|y| y.title == title) {
-                        if let Ok(t) = &result {
-                            y.content = text_editor::Content::with_text(t);
-                        }
-                        if y.edit_on_load && result.is_ok() {
-                            y.edit_on_load = false;
-                            y.editing = true;
-                            tasks.push(operation::focus(view::YAML_EDITOR));
-                        }
-                        y.text = Some(result);
-                        if self.find.open {
-                            let _ = self
-                                .find
-                                .update(code_editor::FindMsg::Refresh, &mut y.content);
-                        }
-                    }
+                Msg::Yaml { .. } | Msg::YamlCreated { .. } | Msg::YamlApplied { .. } => {
+                    tasks.push(self.yaml_result(msg));
                 }
-                Msg::YamlCreated { title, result } => {
-                    let mut created = None;
-                    if let Some(y) = self.yaml.as_mut().filter(|y| y.title == title) {
-                        y.saving = false;
-                        match result {
-                            Ok(c) => created = Some((y.ws, c)),
-                            Err(e) => y.save_error = Some(e),
-                        }
-                    }
-                    if let Some((ws, (kind, namespace, name))) = created {
-                        self.yaml = None;
-                        self.toast(
-                            format!("Created {} {name}", kind.label().to_lowercase()),
-                            false,
-                        );
-                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws) {
-                            w.changed();
-                        }
-                        // Show it: its page, with the drawer open on it (it fills in as the watch sees it).
-                        tasks.push(self.apply(Action::OpenSelected(Selected {
-                            kind,
-                            namespace,
-                            name,
-                        })));
-                    }
-                }
-                Msg::YamlApplied { title, result } => {
-                    let mut saved = None;
-                    if let Some(y) = self.yaml.as_mut().filter(|y| y.title == title) {
-                        y.saving = false;
-                        match result {
-                            Ok(()) => {
-                                y.save_error = None;
-                                saved = Some((y.ws, y.kind, y.namespace.clone(), y.name.clone()));
-                            }
-                            Err(e) => y.save_error = Some(e),
-                        }
-                    }
-                    if let Some((ws, kind, ns, name)) = saved {
-                        self.toast(format!("Saved {name}"), false);
-                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws) {
-                            w.changed();
-                        }
-                        // Show what the server stored (defaults filled in, new resourceVersion).
-                        self.open_yaml(kind, ns, name);
-                    }
-                }
+                Msg::Toast { text, error } => self.toast(text, error),
                 Msg::PfListening { id, port } => {
                     if let Some(f) = self.forwards.iter_mut().find(|f| f.id == id) {
                         f.bound_port = Some(port);
@@ -1838,11 +1838,8 @@ impl App {
                     self.save_forwards();
                     self.toast(format!("Port forward failed: {error}"), true);
                 }
-                Msg::Toast { text, error } => self.toast(text, error),
                 Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
                 Msg::UpdateInstalled(result) => self.update_installed(result),
-                #[cfg(target_os = "macos")]
-                Msg::Menu(cmd) => tasks.push(self.menu_command(cmd)),
                 _ => {}
             }
         }
@@ -1859,7 +1856,7 @@ impl App {
     // Actions
     // -----------------------------------------------------------------------
 
-    fn apply(&mut self, action: Action) -> Task<Message> {
+    fn apply(&mut self, action: Action) -> Task {
         match action {
             Action::Select(sel) => {
                 if let Some(ws) = self.ws_mut() {
@@ -2041,192 +2038,6 @@ impl App {
         });
     }
 
-    /// The editor on a template for a new object, in the page's namespace.
-    fn open_create(&mut self, kind: Kind) -> Task<Message> {
-        let Some(ws) = self.ws() else {
-            return Task::none();
-        };
-        if ws.client().is_none() {
-            return Task::none();
-        }
-        let ns = ws
-            .selected_ns
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "default".into());
-        let text = kube_ops::template(kind, &ns);
-        self.yaml = Some(YamlView {
-            title: format!("New {}", kind.label()),
-            ws: ws.id,
-            kind,
-            namespace: ns,
-            name: String::new(),
-            content: text_editor::Content::with_text(&text),
-            text: Some(Ok(text)),
-            editing: true,
-            dirty: true,
-            edit_on_load: false,
-            saving: false,
-            save_error: None,
-            parse_error: None,
-            create: true,
-        });
-        operation::focus(view::YAML_EDITOR)
-    }
-
-    fn open_yaml(&mut self, kind: Kind, ns: String, name: String) {
-        let Some((ws, client)) = self.ws().and_then(|w| w.client().map(|c| (w.id, c))) else {
-            return;
-        };
-        let title = format!("{} {ns}/{name}", kind.label());
-        self.yaml = Some(YamlView {
-            title: title.clone(),
-            ws,
-            kind,
-            namespace: ns.clone(),
-            name: name.clone(),
-            text: None,
-            content: text_editor::Content::new(),
-            editing: false,
-            dirty: false,
-            edit_on_load: false,
-            saving: false,
-            save_error: None,
-            parse_error: None,
-            create: false,
-        });
-        let bus = self.bus.clone();
-        self.rt.spawn(async move {
-            let result = kube_ops::get_yaml(client, kind, ns, name)
-                .await
-                .map_err(err_string);
-            bus.send(Msg::Yaml { title, result });
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // YAML window
-    // -----------------------------------------------------------------------
-
-    fn yaml_action(&mut self, action: text_editor::Action) {
-        let Some(y) = self.yaml.as_mut() else { return };
-        let is_edit = action.is_edit();
-        if is_edit && (!y.editing || y.saving) {
-            return; // The viewer is read-only; selection and scrolling still work.
-        }
-        y.content.perform(action);
-        if is_edit {
-            Self::yaml_changed(y);
-            self.refresh_find();
-        }
-    }
-
-    /// Recounts find matches after the document changed.
-    fn refresh_find(&mut self) {
-        if let Some(y) = self.yaml.as_mut().filter(|_| self.find.open) {
-            let _ = self
-                .find
-                .update(code_editor::FindMsg::Refresh, &mut y.content);
-        }
-    }
-
-    /// After an edit: recompute dirty and the live YAML check.
-    fn yaml_changed(y: &mut YamlView) {
-        let text = y.content.text();
-        y.dirty = y.create || !matches!(&y.text, Some(Ok(t)) if *t == text);
-        y.parse_error = yaml_error(&text);
-    }
-
-    /// Applies a whole-document edit (indent, comment) to the selection's lines.
-    fn yaml_edit_with(
-        &mut self,
-        f: impl FnOnce(&mut String, std::ops::Range<usize>) -> std::ops::Range<usize>,
-    ) {
-        let Some(y) = self.yaml.as_mut().filter(|y| y.editing && !y.saving) else {
-            return;
-        };
-        let mut text = y.content.text();
-        let range = code_editor::char_range(&text, y.content.cursor());
-        let new = f(&mut text, range);
-        y.content = text_editor::Content::with_text(&text);
-        y.content.move_to(code_editor::cursor_for(&text, new));
-        Self::yaml_changed(y);
-        self.refresh_find();
-    }
-
-    /// Enter: newline plus the current line's indentation, deeper after `key:` or `- `.
-    fn yaml_enter(&mut self) {
-        let Some(y) = self.yaml.as_mut().filter(|y| y.editing && !y.saving) else {
-            return;
-        };
-        let cursor = y.content.cursor();
-        let line = y
-            .content
-            .line(cursor.position.line)
-            .map(|l| l.text.to_string())
-            .unwrap_or_default();
-        let before = &line[..cursor.position.column.min(line.len())];
-        let insert = code_editor::newline_insert(before);
-        y.content
-            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                Arc::new(insert),
-            )));
-        Self::yaml_changed(y);
-        self.refresh_find();
-    }
-
-    fn yaml_apply(&mut self) {
-        let Some(y) = self.yaml.as_mut() else { return };
-        if !(y.editing && y.dirty && !y.saving && y.parse_error.is_none()) {
-            return;
-        }
-        let yaml = y.content.text();
-        y.saving = true;
-        y.save_error = None;
-        let (title, ws, kind, ns, name) = (
-            y.title.clone(),
-            y.ws,
-            y.kind,
-            y.namespace.clone(),
-            y.name.clone(),
-        );
-        let client = self
-            .workspaces
-            .iter()
-            .find(|w| w.id == ws)
-            .and_then(Workspace::client);
-        let bus = self.bus.clone();
-        match client {
-            Some(client) if y.create => {
-                self.rt.spawn(async move {
-                    let result = kube_ops::create_yaml(client, ns, yaml)
-                        .await
-                        .map_err(err_string);
-                    bus.send(Msg::YamlCreated { title, result });
-                });
-            }
-            Some(client) => {
-                self.rt.spawn(async move {
-                    let result = kube_ops::apply_yaml(client, kind, ns, name, yaml)
-                        .await
-                        .map_err(err_string);
-                    bus.send(Msg::YamlApplied { title, result });
-                });
-            }
-            None => {
-                y.saving = false;
-                y.save_error = Some("That cluster tab is no longer connected.".into());
-            }
-        }
-    }
-
-    fn find_message(&mut self, msg: code_editor::FindMsg) -> Task<Message> {
-        let Some(y) = self.yaml.as_mut() else {
-            return Task::none();
-        };
-        self.find.update(msg, &mut y.content)
-    }
-
     // -----------------------------------------------------------------------
     // Logs and shells
     // -----------------------------------------------------------------------
@@ -2294,7 +2105,7 @@ impl App {
         self.show_logs();
     }
 
-    fn log_message(&mut self, i: usize, msg: logs::LogMsg) -> Task<Message> {
+    fn log_message(&mut self, i: usize, msg: logs::LogMsg) -> Task {
         if matches!(
             msg,
             logs::LogMsg::Restart | logs::LogMsg::SetTail(_) | logs::LogMsg::SetContainer(_)
@@ -2309,7 +2120,7 @@ impl App {
         }
     }
 
-    fn shell_message(&mut self, id: u64, msg: shell::ShellMsg) -> Task<Message> {
+    fn shell_message(&mut self, id: u64, msg: shell::ShellMsg) -> Task {
         let handle = self.rt.handle().clone();
         match self.shells.iter_mut().find(|s| s.id == id) {
             Some(s) => s.update(msg, &handle, &self.bus),
@@ -2502,7 +2313,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// Stages a representative scene, then captures the window to a PNG and quits.
-    fn dev_screenshot(&mut self) -> Task<Message> {
+    fn dev_screenshot(&mut self) -> Task {
         let Some(shot) = self.screenshot.as_ref() else {
             return Task::none();
         };
@@ -2546,10 +2357,6 @@ impl App {
             }
             if let Some(sel) = first.filter(|_| edit) {
                 tasks.push(self.apply(Action::EditYaml(sel.kind, sel.namespace, sel.name)));
-            }
-            // `KUBE_UI_SCREENSHOT_FIND=<text>` opens the YAML window's find bar with that query.
-            if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_FIND") {
-                self.find.preset(q);
             }
             // `KUBE_UI_SCREENSHOT_ENV=<text>` presets the drawer's env search.
             if let Ok(q) = std::env::var("KUBE_UI_SCREENSHOT_ENV") {
@@ -2624,26 +2431,30 @@ impl App {
                 .staged
                 .is_some_and(|t| t.elapsed() > Duration::from_secs(3))
         {
-            if let Some(id) = self.window {
-                shot.requested = true;
-                return window::screenshot(id).map(Message::Screenshot);
-            }
+            shot.requested = true;
+            return Task::window(|app, window, _| {
+                let bounds = Rectangle::from(window.bounds());
+                app.save_screenshot(bounds);
+            });
         }
         Task::none()
     }
 
-    fn save_screenshot(&mut self, shot: window::Screenshot) {
+    /// Captures the window's area of the screen (macOS `screencapture`) and quits.
+    fn save_screenshot(&mut self, bounds: Rectangle) {
         let Some(dev) = self.screenshot.as_ref() else {
             return;
         };
-        if let Err(e) = image::save_buffer(
-            &dev.path,
-            &shot.rgba,
-            shot.size.width,
-            shot.size.height,
-            image::ExtendedColorType::Rgba8,
-        ) {
-            eprintln!("screenshot failed: {e}");
+        let region = format!(
+            "{},{},{},{}",
+            bounds.x, bounds.y, bounds.width, bounds.height
+        );
+        let status = std::process::Command::new("screencapture")
+            .args(["-x", "-o", "-R", &region])
+            .arg(&dev.path)
+            .status();
+        if !status.as_ref().is_ok_and(|s| s.success()) {
+            eprintln!("screenshot failed: {status:?}");
         }
         std::process::exit(0);
     }
@@ -2893,14 +2704,61 @@ mod tests {
     }
 }
 
-/// The app's text font (Inter).
-pub fn theme_font() -> iced::Font {
-    theme::INTER
+/// One-time setup before the window opens: fonts and theme, the menu bar.
+pub fn install(cx: &mut gpui::App) {
+    theme::install(cx);
+    menu::install(cx);
 }
 
-/// Font files the app needs loaded.
-pub fn fonts() -> [&'static [u8]; 4] {
-    theme::fonts()
+impl App {
+    /// Before each frame: lets every part create the retained GPUI state it renders
+    /// (Kit inputs, scroll handles, the editor) and subscribe to it. Views themselves are
+    /// plain `&self` functions, so anything needing `window`/`cx` happens here.
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_chrome(window, cx);
+        for ws in &mut self.workspaces {
+            ws.prepare(window, cx);
+            ws.sync_env(&self.env_filter, window, cx);
+        }
+        for log in &mut self.logs {
+            log.prepare(window, cx);
+        }
+        for shell in &mut self.shells {
+            shell.prepare(window, cx);
+        }
+        self.prepare_yaml(window, cx);
+    }
+}
+
+impl Render for App {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = Size::from(window.viewport_size());
+        if size != self.window_size {
+            self.window_size = size;
+            self.track_window();
+        }
+        self.prepare(window, cx);
+        let root = gpui::div()
+            .id("root")
+            .size_full()
+            .relative()
+            .font_family(theme::INTER)
+            .text_size(gpui::px(theme::BODY))
+            .text_color(theme::TEXT)
+            .bg(theme::CONTENT)
+            .track_focus(&self.focus)
+            .on_key_down(|e: &gpui::KeyDownEvent, window, cx| {
+                send(Message::Key(e.keystroke.clone()), window, cx)
+            })
+            .on_mouse_move(|e: &gpui::MouseMoveEvent, window, cx| {
+                send(Message::CursorMoved(e.position.into()), window, cx)
+            })
+            .on_mouse_up(gpui::MouseButton::Left, |_, window, cx| {
+                send(Message::MouseReleased, window, cx)
+            })
+            .child(self.view(window, cx));
+        menu::handle_actions(root)
+    }
 }
 
 /// The toast shown after copying: short single-line values are quoted, the rest summarised.

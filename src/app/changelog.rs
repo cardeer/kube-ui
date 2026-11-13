@@ -1,11 +1,12 @@
 //! The "What's new" window: CHANGELOG.md compiled into the app and rendered by release.
 
-use iced::{
-    Color, Element, Length, Size,
-    widget::{column, container, row, scrollable, text},
+use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::{
+    AnyElement, FontWeight, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, div, px,
 };
 
-use super::{Message, icons as icon, theme, update};
+use super::{App, Message, Size, icons as icon, theme, theme::Color, update};
 
 const SOURCE: &str = include_str!("../../CHANGELOG.md");
 
@@ -76,79 +77,81 @@ fn section_color(heading: &str) -> Color {
     }
 }
 
-pub fn view<'a>(window: Size) -> Element<'a, Message> {
+/// The "What's new" window body, sized for the window.
+pub fn view(window: Size) -> AnyElement {
     let releases = releases();
-    let mut col = column![].spacing(4);
+    let mut col = v_flex().gap(px(4.0)).w_full();
     if releases.is_empty() {
-        col = col.push(theme::faint("No release notes."));
+        col = col.child(theme::faint("No release notes."));
     }
     for (i, r) in releases.iter().enumerate() {
         if i > 0 {
-            col = col.push(theme::vspace(10.0));
-            col = col.push(theme::hline());
-            col = col.push(theme::vspace(8.0));
+            col = col
+                .child(theme::vspace(10.0))
+                .child(theme::hline())
+                .child(theme::vspace(8.0));
         }
-        let mut head = row![
-            text(format!("v{}", r.version))
-                .size(16.0)
-                .font(theme::SEMIBOLD)
-                .color(theme::TEXT)
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
+        let mut head = h_flex().items_center().gap(px(8.0)).child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::TEXT)
+                .child(format!("v{}", r.version)),
+        );
         if r.version == update::CURRENT {
-            head = head.push(theme::badge("installed", theme::OK, false));
+            head = head.child(theme::badge("installed", theme::OK, false));
         }
         if let Some(d) = r.date {
-            head = head.push(theme::fill_space());
-            head = head.push(theme::faint(d));
+            head = head.child(theme::fill_space()).child(theme::faint(d));
         }
-        col = col.push(head);
+        col = col.child(head);
         for (heading, items) in &r.sections {
-            col = col.push(theme::vspace(4.0));
+            col = col.child(theme::vspace(4.0));
             if !heading.is_empty() {
-                col = col.push(theme::label_small(*heading).color(section_color(heading)));
+                col = col.child(theme::label_small(*heading).text_color(section_color(heading)));
             }
             for item in items {
-                col = col.push(
-                    row![
-                        text(icon::DOT_OUTLINE)
-                            .font(theme::ICONS)
-                            .size(14.0)
-                            .color(theme::TEXT_FAINT),
-                        theme::txt(item.clone()).width(Length::Fill),
-                    ]
-                    .spacing(6),
+                col = col.child(
+                    h_flex()
+                        .items_start()
+                        .gap(px(6.0))
+                        .child(
+                            theme::icon(icon::DOT_OUTLINE)
+                                .text_color(theme::TEXT_FAINT)
+                                .mt(px(2.0)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(theme::BODY))
+                                .text_color(theme::TEXT)
+                                .child(item.clone()),
+                        ),
                 );
             }
         }
     }
     let width = (window.width - 120.0).clamp(420.0, 600.0);
     let height = (window.height - 120.0).clamp(300.0, 620.0);
-    container(column![
-        row![
-            text("What's new")
-                .size(15.0)
-                .font(theme::SEMIBOLD)
-                .color(theme::TEXT),
-            theme::fill_space(),
-            theme::icon_button(icon::X, "Close", Some(Message::ShowChangelog(false))),
-        ]
-        .align_y(iced::Center),
-        theme::vspace(8.0),
-        scrollable(container(col).padding(iced::Padding {
-            right: 12.0,
-            ..Default::default()
-        }))
-        .direction(theme::thin())
-        .style(theme::scrollbar)
-        .height(Length::Fill),
-    ])
-    .padding(16)
-    .width(width)
-    .height(height)
-    .style(theme::dialog)
-    .into()
+    theme::dialog()
+        .p(px(16.0))
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .flex_col()
+        .child(App::dialog_title("What's new", Message::ShowChangelog(false)))
+        .child(theme::vspace(8.0))
+        .child(
+            div()
+                .id("changelog-scroll")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .child(div().pr(px(12.0)).child(col)),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
