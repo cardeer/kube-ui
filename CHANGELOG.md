@@ -5,6 +5,19 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Log lines can be selected with the mouse: drag across them, double-click a word,
+  triple-click a line, ⌘A to select them all, and ⌘C to copy. The Copy button takes the
+  selection when there is one, and all the visible lines otherwise.
+- Terminal selection is easier to see and use: drag to select, double-click a word,
+  triple-click a line, ⌘A to select the screen, and ⌘C copies it (with a "Copied"
+  notification).
+
+### Changed
+- The terminal has more padding, and a scrollback bar in its own gutter on the right, so
+  nothing draws over the text. Log lines keep room for their scrollbars too, so the last
+  line is no longer half-hidden under one.
+
 ## [1.1.0] - 2026-11-13
 
 ### Added

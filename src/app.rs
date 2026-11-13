@@ -6,6 +6,7 @@ mod icons;
 mod logs;
 #[cfg(target_os = "macos")]
 mod menu;
+mod select_area;
 mod shell;
 mod table;
 mod theme;
@@ -1435,6 +1436,16 @@ impl App {
                 return self.find_message(code_editor::FindMsg::Step(m.shift()));
             }
             's' if self.yaml.as_ref().is_some_and(|y| y.editing) => self.yaml_apply(),
+            // In the bottom panel, Copy and Select All act on the focused log tab.
+            // (A shell tab handles its own, since its canvas takes the key first.)
+            'c' if self.focused_log().is_some() => {
+                let i = self.focused_log().unwrap_or(0);
+                return self.log_message(i, logs::LogMsg::CopySelection);
+            }
+            'a' if self.focused_log().is_some() => {
+                let i = self.focused_log().unwrap_or(0);
+                return self.log_message(i, logs::LogMsg::SelectAll);
+            }
             #[cfg(not(target_os = "macos"))]
             'w' if m.shift() => self.close_active_dock_tab(),
             #[cfg(not(target_os = "macos"))]
@@ -2495,6 +2506,17 @@ impl App {
             Some(s) => s.update(msg, &handle, &self.bus),
             None => Task::none(),
         }
+    }
+
+    /// The log tab the bottom panel has focus on, if any.
+    fn focused_log(&self) -> Option<usize> {
+        if !self.dock_focused || self.dock_height().is_none() {
+            return None;
+        }
+        let i = self
+            .active_log
+            .min((self.logs.len() + self.shells.len()).saturating_sub(1));
+        (i < self.logs.len()).then_some(i)
     }
 
     fn close_dock_tab(&mut self, i: usize) {

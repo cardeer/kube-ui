@@ -18,8 +18,15 @@ const SCROLLBACK: usize = 5_000;
 /// JetBrains Mono's advance is 0.6em.
 const CHAR_W: f32 = theme::MONO_SIZE * 0.6;
 const LINE_H: f32 = 16.0;
-const PAD_X: f32 = 8.0;
-const PAD_Y: f32 = 6.0;
+const PAD_X: f32 = 12.0;
+const PAD_Y: f32 = 10.0;
+/// Room on the right for the scrollback bar, so it never covers text.
+const GUTTER: f32 = 12.0;
+/// Two clicks closer together than this make a double (or triple) click.
+const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// A press has to travel this far to become a drag, so a click that wobbles by a pixel
+/// doesn't select anything.
+const DRAG_SLOP: f32 = 4.0;
 
 #[derive(Clone, PartialEq)]
 pub(super) enum ShellStatus {
@@ -202,6 +209,8 @@ impl ShellView {
             }
             ShellMsg::Select(sel) => self.selection = sel,
             ShellMsg::Scroll(lines) => {
+                // The selection is in screen cells; scrolling would move it onto other text.
+                self.selection = None;
                 if !self.parser.screen().alternate_screen() {
                     let now = self.parser.screen().scrollback() as isize;
                     self.parser
@@ -226,7 +235,7 @@ impl ShellView {
             ShellMsg::Pasted(None) => {}
             ShellMsg::CopySelection => {
                 if let Some(text) = self.selected_text() {
-                    return iced::clipboard::write(text);
+                    return Task::done(Message::Copy(text));
                 }
             }
             ShellMsg::CopyScreen => {
@@ -248,6 +257,31 @@ impl ShellView {
                 .screen()
                 .contents_between(start.0, start.1, end.0, end.1 + 1),
         )
+    }
+
+    /// The run of word characters around a cell, as (first, last) columns; a click on
+    /// a space or punctuation selects just that cell.
+    fn word_at(&self, row: u16, col: u16) -> (u16, u16) {
+        let screen = self.parser.screen();
+        let is_word = |c: u16| {
+            screen.cell(row, c).is_some_and(|cell| {
+                let s = cell.contents();
+                !s.is_empty()
+                    && s.chars()
+                        .all(|ch| !ch.is_whitespace() && !"()[]{}<>'\"`,;|".contains(ch))
+            })
+        };
+        if !is_word(col) {
+            return (col, col);
+        }
+        let (mut a, mut b) = (col, col);
+        while a > 0 && is_word(a - 1) {
+            a -= 1;
+        }
+        while b + 1 < self.size.0 && is_word(b + 1) {
+            b += 1;
+        }
+        (a, b)
     }
 
     /// Status strip and terminal.
@@ -300,13 +334,18 @@ struct Terminal<'a> {
 #[derive(Default)]
 struct TermState {
     focused: bool,
-    /// Dragging out a selection from this cell.
-    anchor: Option<(u16, u16)>,
+    /// Dragging out a selection from this cell, and where the press landed.
+    anchor: Option<((u16, u16), Point)>,
+    /// The cursor has travelled past `DRAG_SLOP` since the press.
+    dragging: bool,
+    /// The last press, for double and triple clicks: when, where, and the click count.
+    last_click: Option<(std::time::Instant, (u16, u16), u8)>,
 }
 
 impl Terminal<'_> {
     fn grid(bounds: Rectangle) -> (u16, u16) {
-        let cols = (((bounds.width - 2.0 * PAD_X) / CHAR_W).floor() as u16).clamp(10, 1000);
+        let cols =
+            (((bounds.width - 2.0 * PAD_X - GUTTER) / CHAR_W).floor() as u16).clamp(10, 1000);
         let rows = (((bounds.height - 2.0 * PAD_Y) / LINE_H).floor() as u16).clamp(2, 500);
         (cols, rows)
     }
@@ -348,8 +387,32 @@ impl canvas::Program<Message> for Terminal<'_> {
                     Some(Some(p)) => {
                         state.focused = true;
                         let c = self.cell_at(bounds, p);
-                        state.anchor = Some(c);
-                        Some(self.msg(ShellMsg::Select(None)).and_capture())
+                        let now = std::time::Instant::now();
+                        let count = match state.last_click {
+                            Some((at, cell, n)) if now - at < MULTI_CLICK && cell == c => n % 3 + 1,
+                            _ => 1,
+                        };
+                        state.last_click = Some((now, c, count));
+                        let cols = self.view.size.0;
+                        let sel = match count {
+                            // Double click: the word under the cursor.
+                            2 => {
+                                state.anchor = None;
+                                let (a, b) = self.view.word_at(c.0, c.1);
+                                Some(((c.0, a), (c.0, b)))
+                            }
+                            // Triple click: the whole line.
+                            3 => {
+                                state.anchor = None;
+                                Some(((c.0, 0), (c.0, cols - 1)))
+                            }
+                            _ => {
+                                state.anchor = Some((c, p));
+                                state.dragging = false;
+                                None
+                            }
+                        };
+                        Some(self.msg(ShellMsg::Select(sel)).and_capture())
                     }
                     _ => {
                         state.focused = false;
@@ -358,12 +421,19 @@ impl canvas::Program<Message> for Terminal<'_> {
                 }
             }
             iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                let anchor = state.anchor?;
+                let (anchor, from) = state.anchor?;
+                if !state.dragging {
+                    if position.distance(from) < DRAG_SLOP {
+                        return None;
+                    }
+                    state.dragging = true;
+                }
                 let head = self.cell_at(bounds, *position);
                 Some(self.msg(ShellMsg::Select(Some((anchor, head)))))
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.anchor = None;
+                state.dragging = false;
                 None
             }
             iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -385,6 +455,11 @@ impl canvas::Program<Message> for Terminal<'_> {
                 if modifiers.command() && !modifiers.control() {
                     return match latin {
                         Some('c') => Some(self.msg(ShellMsg::CopySelection).and_capture()),
+                        Some('a') => {
+                            let (cols, rows) = self.view.size;
+                            let all = ((0, 0), (rows - 1, cols - 1));
+                            Some(self.msg(ShellMsg::Select(Some(all))).and_capture())
+                        }
                         Some('v') => Some(self.msg(ShellMsg::Paste).and_capture()),
                         // Other Cmd shortcuts stay with the app.
                         _ => None,
@@ -465,8 +540,10 @@ impl canvas::Program<Message> for Terminal<'_> {
                     }
                 }
                 if selected(r, c) {
-                    bg = theme::ACCENT_BG;
-                    fg = theme::ACCENT_TEXT;
+                    bg = SELECTION;
+                    if fg == theme::WELL {
+                        fg = theme::TEXT;
+                    }
                 }
                 if cell.dim() {
                     fg = fg.scale_alpha(0.6);
@@ -527,10 +604,33 @@ impl canvas::Program<Message> for Terminal<'_> {
                 );
             }
         }
+        // Scrollback bar in its own gutter: the thumb is the visible screen within history.
+        let history = screen.scrollback_len();
+        if history > 0 {
+            let track_h = bounds.height - 2.0 * PAD_Y;
+            let total = (history + rows as usize) as f32;
+            let thumb_h = (track_h * rows as f32 / total).max(24.0).min(track_h);
+            let back = screen.scrollback() as f32 / history as f32;
+            let top = PAD_Y + (track_h - thumb_h) * (1.0 - back);
+            let x = bounds.width - GUTTER + (GUTTER - 4.0) / 2.0;
+            let color = if screen.scrollback() > 0 {
+                theme::TEXT_MUTED.scale_alpha(0.6)
+            } else {
+                theme::TEXT_FAINT.scale_alpha(0.35)
+            };
+            frame.fill(
+                &canvas::Path::rounded_rectangle(
+                    Point::new(x, top),
+                    Size::new(4.0, thumb_h),
+                    2.0.into(),
+                ),
+                color,
+            );
+        }
         if screen.scrollback() > 0 {
             frame.fill_text(canvas::Text {
                 content: format!("↑ {} lines back · type to return", screen.scrollback()),
-                position: Point::new(bounds.width - 10.0, 8.0),
+                position: Point::new(bounds.width - GUTTER - 6.0, 8.0),
                 color: theme::TEXT_FAINT,
                 size: 12.0.into(),
                 font: theme::INTER,
@@ -618,6 +718,9 @@ fn key_bytes(
     })
 }
 
+/// Selected cells' background: the accent, see-through enough to keep text readable.
+const SELECTION: Color = Color::from_rgba8(0x4c, 0x8d, 0xff, 0.38);
+
 /// xterm colours mapped onto the app palette. Default background is transparent (the well).
 pub(super) fn term_color(c: vt100::Color, fg: bool, bold: bool) -> Color {
     const ANSI: [Color; 16] = [
@@ -682,6 +785,65 @@ mod tests {
         assert_eq!(key_bytes(&up, None, none, true), Some(b"\x1bOA".to_vec()));
         // Plain letters come through the key's text, not here.
         assert_eq!(key_bytes(&c, Some('c'), none, false), None);
+    }
+
+    #[test]
+    fn drag_selects() {
+        use canvas::Program;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        let cfg = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let client = Client::try_from(cfg).unwrap();
+        let mut view = ShellView::new(1, "c".into(), client, "ns".into(), "p".into(), None);
+        view.parser.process(b"hello world\r\nsecond line");
+        let bounds = Rectangle::new(Point::new(0.0, 300.0), Size::new(800.0, 200.0));
+        let grid = Terminal::grid(bounds);
+        view.size = grid;
+        view.parser.set_size(nz(grid.1), nz(grid.0));
+        let term = Terminal { view: &view };
+        let mut st = TermState::default();
+        let at = |c: f32, r: f32| {
+            Point::new(
+                bounds.x + PAD_X + c * CHAR_W + 1.0,
+                bounds.y + PAD_Y + r * LINE_H + 1.0,
+            )
+        };
+        let ev = |e| iced::Event::Mouse(e);
+        let pub_msg = |a: Option<CanvasAction<Message>>| {
+            a.and_then(|a| a.into_inner().0).map(|m| match m {
+                Message::Shell(_, m) => format!("{m:?}"),
+                _ => "other".into(),
+            })
+        };
+        let p0 = at(0.0, 0.0);
+        let r = term.update(
+            &mut st,
+            &ev(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            mouse::Cursor::Available(p0),
+        );
+        eprintln!("press: {:?}", pub_msg(r));
+        let p1 = at(4.0, 0.0);
+        let r = term.update(
+            &mut st,
+            &ev(mouse::Event::CursorMoved { position: p1 }),
+            bounds,
+            mouse::Cursor::Available(p1),
+        );
+        eprintln!("move: {:?}", pub_msg(r));
+    }
+
+    #[test]
+    fn a_click_without_movement_selects_nothing() {
+        let mut st = TermState::default();
+        st.anchor = Some(((0, 0), Point::new(10.0, 10.0)));
+        st.dragging = false;
+        // A wobble of a pixel is still a click.
+        let wobble = Point::new(11.0, 10.5);
+        assert!(wobble.distance(Point::new(10.0, 10.0)) < DRAG_SLOP);
+        // Moving further starts the drag.
+        let away = Point::new(20.0, 10.0);
+        assert!(away.distance(Point::new(10.0, 10.0)) >= DRAG_SLOP);
     }
 
     #[test]

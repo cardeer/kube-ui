@@ -2,15 +2,19 @@
 //! one timeline (each line tagged with its pod), like `stern`.
 
 use iced::{
-    Element, Length, Task,
+    Element, Length, Padding, Task,
     widget::{
         self, Space, button, column, container, operation, rich_text, row, scrollable, span, text,
     },
 };
 
 use super::filter::Matcher;
+use super::select_area::{SelectEvent, select_area};
 
 use super::*;
+
+/// Selected text's background: the accent, see-through enough to keep text readable.
+const SELECTION: Color = Color::from_rgba8(0x4c, 0x8d, 0xff, 0.38);
 
 /// Distinct, readable-on-dark colors for telling pods apart.
 const PALETTE: [Color; 8] = [
@@ -26,6 +30,10 @@ const PALETTE: [Color; 8] = [
 
 /// Row pitch of the log lines: about 1.35 line height for the 12.5px mono.
 const LINE: f32 = 17.0;
+/// JetBrains Mono's advance is 0.6em.
+const CHAR_W: f32 = theme::MONO_SIZE * 0.6;
+/// Room kept clear for a scrollbar, so it never sits on the text.
+const BAR_ROOM: f32 = 12.0;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum LogTarget {
@@ -61,6 +69,10 @@ pub enum LogMsg {
     ToggleRegex,
     Restart,
     Copy,
+    CopySelection,
+    SelectAll,
+    /// A press or drag over the lines, in content pixels, with the click count.
+    Point(SelectEvent),
     Clear,
     ToggleSource(usize),
     ShowAll,
@@ -264,6 +276,10 @@ pub(super) struct LogView {
     new_lines: bool,
     /// Older lines were prepended: scroll by this much to keep the view steady.
     pending_offset: Option<f32>,
+    /// Selected text: (row, column) anchor and head. Row 0 is the banner.
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// Where the current drag began, so a drag can run in either direction.
+    anchor: Option<(usize, usize)>,
 }
 
 impl Drop for LogView {
@@ -319,6 +335,8 @@ impl LogView {
             at_bottom: true,
             new_lines: false,
             pending_offset: None,
+            selection: None,
+            anchor: None,
         }
     }
 
@@ -588,6 +606,10 @@ impl LogView {
             self.lines.insert(at, vl);
         }
         if self.lines.len() > MAX_LOG_LINES {
+            // The oldest line goes, so the selection moves up a row with the text.
+            if let Some((a, b)) = self.selection {
+                self.selection = (a.0 > 1 && b.0 > 1).then(|| (((a.0 - 1), a.1), ((b.0 - 1), b.1)));
+            }
             if let Some(dropped) = self.lines.pop_front() {
                 if let Some(s) = self.sources.get_mut(dropped.src) {
                     s.held = s.held.saturating_sub(1);
@@ -616,6 +638,8 @@ impl LogView {
             return;
         };
         self.older = Older::Loading;
+        // Older lines go in above, so the rows the selection names would move.
+        self.selection = None;
         self.older_pending = self.sources.len();
         self.older_found = false;
         for (src, source) in self.sources.iter().enumerate() {
@@ -709,6 +733,115 @@ impl LogView {
         out
     }
 
+    fn multi(&self) -> bool {
+        self.sources.len() > 1
+    }
+
+    fn tag_width(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|s| s.short.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The coloured runs of content row `i` (row 0 is the banner), exactly as drawn.
+    fn row_runs(&self, i: usize) -> Vec<(String, Color)> {
+        let Some(vl) = (i > 0).then(|| self.shown_line(i - 1)).flatten() else {
+            return Vec::new();
+        };
+        let mut runs = Vec::new();
+        if self.multi()
+            && let Some(s) = self.sources.get(vl.src)
+        {
+            let w = self.tag_width();
+            runs.push((format!("{:<w$} ", s.short), s.color));
+        }
+        if self.timestamps && !vl.line.ts.is_empty() {
+            runs.push((format!("{} ", vl.line.ts), theme::TEXT_MUTED));
+        }
+        if vl.spans.is_empty() {
+            runs.push((vl.line.text.clone(), vl.tint));
+        } else {
+            for sp in &vl.spans {
+                runs.push((
+                    vl.line.text[sp.range.clone()].to_string(),
+                    sp.color.unwrap_or(vl.tint),
+                ));
+            }
+        }
+        runs
+    }
+
+    /// Row `i` as plain text, as drawn.
+    fn row_text(&self, i: usize) -> String {
+        self.row_runs(i).iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// The content row and character column at a point inside the scrolled lines.
+    fn cell_at(&self, p: iced::Point) -> (usize, usize) {
+        let row = (p.y / LINE).floor().max(0.0) as usize;
+        let row = row.min(self.shown_len());
+        let col = (p.x / CHAR_W).round().max(0.0) as usize;
+        (row, col)
+    }
+
+    /// The run of word characters around a column, as (start, end) character indices.
+    fn word_at(&self, row: usize, col: usize) -> (usize, usize) {
+        let chars: Vec<char> = self.row_text(row).chars().collect();
+        if col >= chars.len() {
+            return (chars.len(), chars.len());
+        }
+        let is_word = |c: char| c.is_alphanumeric() || "-_./:@".contains(c);
+        if !is_word(chars[col]) {
+            return (col, col + 1);
+        }
+        let mut a = col;
+        let mut b = col;
+        while a > 0 && is_word(chars[a - 1]) {
+            a -= 1;
+        }
+        while b + 1 < chars.len() && is_word(chars[b + 1]) {
+            b += 1;
+        }
+        (a, b + 1)
+    }
+
+    /// The selected rows and their character ranges, in order.
+    fn selection_rows(&self) -> Option<Vec<(usize, usize, usize)>> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        if start == end {
+            return None;
+        }
+        Some(
+            (start.0..=end.0)
+                .map(|row| {
+                    let len = self.row_text(row).chars().count();
+                    let from = if row == start.0 { start.1.min(len) } else { 0 };
+                    let to = if row == end.0 { end.1.min(len) } else { len };
+                    (row, from, to)
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let rows = self.selection_rows()?;
+        let text = rows
+            .iter()
+            .map(|&(row, from, to)| {
+                self.row_text(row)
+                    .chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     pub(super) fn update(
         &mut self,
         msg: LogMsg,
@@ -754,6 +887,9 @@ impl LogView {
             }
             LogMsg::Restart => self.start(next_id, rt, bus),
             LogMsg::Copy => {
+                if let Some(text) = self.selected_text() {
+                    return Task::done(Message::Copy(text));
+                }
                 let text = (0..self.shown_len())
                     .filter_map(|i| self.shown_line(i))
                     .map(|l| self.format_plain(l))
@@ -761,7 +897,42 @@ impl LogView {
                     .join("\n");
                 return Task::done(Message::Copy(text));
             }
+            LogMsg::CopySelection => {
+                if let Some(text) = self.selected_text() {
+                    return Task::done(Message::Copy(text));
+                }
+            }
+            LogMsg::SelectAll => {
+                let last = self.shown_len();
+                let len = self.row_text(last).chars().count();
+                self.selection = (last > 0).then_some(((1, 0), (last, len)));
+            }
+            LogMsg::Point(SelectEvent::Press(p, count)) => {
+                let (row, col) = self.cell_at(p);
+                match count {
+                    2 => {
+                        self.anchor = None;
+                        let (a, b) = self.word_at(row, col);
+                        self.selection = Some(((row, a), (row, b)));
+                    }
+                    3 => {
+                        self.anchor = None;
+                        let len = self.row_text(row).chars().count();
+                        self.selection = Some(((row, 0), (row, len)));
+                    }
+                    _ => {
+                        self.anchor = Some((row, col));
+                        self.selection = None;
+                    }
+                }
+            }
+            LogMsg::Point(SelectEvent::Drag(p)) => {
+                if let Some(anchor) = self.anchor {
+                    self.selection = Some((anchor, self.cell_at(p)));
+                }
+            }
             LogMsg::Clear => {
+                self.selection = None;
                 self.lines.clear();
                 self.shown = None;
                 for s in &mut self.sources {
@@ -890,7 +1061,7 @@ impl LogView {
         ));
         bar = bar.push(theme::icon_button(
             icon::COPY,
-            "Copy visible lines",
+            "Copy the selection, or every visible line",
             Some(msg(LogMsg::Copy)),
         ));
         bar = bar.push(theme::icon_button(
@@ -1013,13 +1184,13 @@ impl LogView {
         let top = ((self.offset / LINE).floor().max(0.0) as usize).min(rows_total);
         let first = top.saturating_sub(40);
         let last = (top + (view_h / LINE).ceil() as usize + 40).min(rows_total);
-        let multi = self.sources.len() > 1;
-        let tag_width = self
-            .sources
-            .iter()
-            .map(|s| s.short.len())
-            .max()
-            .unwrap_or(0);
+        // Selected ranges by content row, so each row can tint its own characters.
+        let sel: HashMap<usize, (usize, usize)> = self
+            .selection_rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(row, a, b)| (row, (a, b)))
+            .collect();
 
         let mut col = column![Space::new().height(first as f32 * LINE)];
         for i in first..last {
@@ -1038,26 +1209,37 @@ impl LogView {
                 col = col.push(container(banner).height(LINE).center_y(LINE));
                 continue;
             }
-            let Some(vl) = self.shown_line(i - 1) else {
+            if self.shown_line(i - 1).is_none() {
                 continue;
-            };
+            }
+            // Runs are split again where the selection starts and ends, so only the
+            // selected characters get a highlight.
+            let selected = sel.get(&i).copied();
             let mut spans: Vec<text::Span<'_, ()>> = Vec::new();
-            if multi {
-                if let Some(s) = self.sources.get(vl.src) {
-                    spans.push(span(format!("{:<tag_width$} ", s.short)).color(s.color));
+            let mut at = 0usize;
+            for (run, color) in self.row_runs(i) {
+                let chars: Vec<char> = run.chars().collect();
+                let mut cut = vec![0usize, chars.len()];
+                if let Some((a, b)) = selected {
+                    for edge in [a, b] {
+                        if edge > at && edge - at < chars.len() {
+                            cut.push(edge - at);
+                        }
+                    }
                 }
-            }
-            if self.timestamps && !vl.line.ts.is_empty() {
-                spans.push(span(format!("{} ", vl.line.ts)).color(theme::TEXT_MUTED));
-            }
-            if vl.spans.is_empty() {
-                spans.push(span(vl.line.text.as_str()).color(vl.tint));
-            } else {
-                for s in &vl.spans {
-                    spans.push(
-                        span(&vl.line.text[s.range.clone()]).color(s.color.unwrap_or(vl.tint)),
-                    );
+                cut.sort_unstable();
+                cut.dedup();
+                for w in cut.windows(2) {
+                    let (from, to) = (w[0], w[1]);
+                    let piece: String = chars[from..to].iter().collect();
+                    let on = selected.is_some_and(|(a, b)| at + from >= a && at + to <= b);
+                    let mut sp = span(piece).color(color);
+                    if on {
+                        sp = sp.background(SELECTION);
+                    }
+                    spans.push(sp);
                 }
+                at += chars.len();
             }
             col = col.push(
                 rich_text(spans)
@@ -1069,7 +1251,17 @@ impl LogView {
             );
         }
         col = col.push(Space::new().height((rows_total - last) as f32 * LINE));
-        scrollable(col.width(Length::Shrink))
+        let lines = select_area(col.width(Length::Shrink), move |e| {
+            Message::Log(index, LogMsg::Point(e))
+        });
+        // Room around the lines for the scrollbars, which float over the content.
+        let lines = container(lines).padding(Padding {
+            top: 2.0,
+            right: BAR_ROOM,
+            bottom: BAR_ROOM,
+            left: 2.0,
+        });
+        scrollable(lines)
             .id(self.scroll_id.clone())
             .direction(theme::thin_both())
             .style(theme::scrollbar)
@@ -1109,6 +1301,63 @@ mod tests {
         assert_eq!(&text[spans[1].range.clone()], "200");
         assert_eq!(spans[1].color, Some(theme::OK));
         assert_eq!(spans[2].color, None);
+    }
+
+    /// A view with `texts` as its lines and no pod tags or timestamps.
+    fn view_with(texts: &[&str]) -> LogView {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        let cfg = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let client = Client::try_from(cfg).unwrap();
+        let clients = kube_ops::Clients {
+            main: client.clone(),
+            logs: client,
+        };
+        let mut v = LogView::new(
+            "k".into(),
+            "ctx".into(),
+            clients,
+            "ns".into(),
+            LogTarget::Pod("pod".into()),
+            vec!["app".into()],
+            None,
+            false,
+            HashMap::new(),
+        );
+        for t in texts {
+            v.lines.push_back(ViewLine::new(
+                0,
+                LogLine {
+                    ts: String::new(),
+                    text: (*t).to_string(),
+                },
+            ));
+        }
+        v
+    }
+
+    #[test]
+    fn drag_selects_across_rows() {
+        let mut v = view_with(&["hello world", "second line"]);
+        // Press on row 1 at column 6, drag to row 2 column 6.
+        let p =
+            |row: usize, col: usize| iced::Point::new(col as f32 * CHAR_W, row as f32 * LINE + 2.0);
+        v.selection = None;
+        v.anchor = Some(v.cell_at(p(1, 6)));
+        v.selection = Some((v.anchor.unwrap(), v.cell_at(p(2, 6))));
+        assert_eq!(v.selected_text().as_deref(), Some("world\nsecond"));
+        // Backwards drags select the same text.
+        v.selection = Some((v.cell_at(p(2, 6)), v.cell_at(p(1, 6))));
+        assert_eq!(v.selected_text().as_deref(), Some("world\nsecond"));
+    }
+
+    #[test]
+    fn double_click_picks_a_word() {
+        let v = view_with(&["get /api/v1 200 ok"]);
+        assert_eq!(v.word_at(1, 6), (4, 11));
+        assert_eq!(v.row_text(1), "get /api/v1 200 ok");
+        // Row 0 is the banner, with no text of its own.
+        assert_eq!(v.row_text(0), "");
     }
 
     #[test]
