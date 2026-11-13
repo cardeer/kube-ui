@@ -5,6 +5,8 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-13
+
 ### Added
 - Log lines can be selected with the mouse: drag across them, double-click a word,
   triple-click a line, ⌘A to select them all, and ⌘C to copy. The Copy button takes the
