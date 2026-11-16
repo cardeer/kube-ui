@@ -926,10 +926,23 @@ impl LogView {
                     }
                 }
             }
+            LogMsg::Point(SelectEvent::Extend(p)) => {
+                // From the current selection's anchor, else the last plain click.
+                let head = self.cell_at(p);
+                let anchor = self.selection.map(|(a, _)| a).or(self.anchor).unwrap_or(head);
+                self.anchor = Some(anchor);
+                self.selection = Some((anchor, head));
+            }
             LogMsg::Point(SelectEvent::Drag(p)) => {
                 if let Some(anchor) = self.anchor {
                     self.selection = Some((anchor, self.cell_at(p)));
                 }
+            }
+            LogMsg::Point(SelectEvent::Scroll(v)) => {
+                return operation::scroll_by(
+                    self.scroll_id.clone(),
+                    operation::AbsoluteOffset { x: v.x, y: v.y },
+                );
             }
             LogMsg::Clear => {
                 self.selection = None;
@@ -974,6 +987,8 @@ impl LogView {
     pub(super) fn view(&self, index: usize, popup: Option<&PopupKind>) -> Element<'_, Message> {
         let msg = move |m: LogMsg| Message::Log(index, m);
         let mut bar = row![].spacing(8).align_y(iced::Center);
+        bar = bar.push(theme::muted(self.namespace.clone()));
+        bar = bar.push(theme::vline(18.0));
         if self.containers.len() > 1 {
             let id = format!("log-container-{index}");
             bar = bar.push(

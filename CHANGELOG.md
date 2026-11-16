@@ -5,6 +5,14 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Shift-click in the log lines extends the selection to that point.
+- The log toolbar shows the pod's namespace before the container.
+
+### Fixed
+- Dragging a log selection past the edge of the list scrolls it along, so a selection
+  is no longer limited to the lines in view.
+
 ## [1.1.1] - 2026-11-13
 
 ### Added
