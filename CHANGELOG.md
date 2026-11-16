@@ -5,6 +5,8 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-16
+
 ### Added
 - Shift-click in the log lines extends the selection to that point.
 - The log toolbar shows the pod's namespace before the container.
