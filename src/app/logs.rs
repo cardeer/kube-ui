@@ -280,6 +280,9 @@ pub(super) struct LogView {
     selection: Option<((usize, usize), (usize, usize))>,
     /// Where the current drag began, so a drag can run in either direction.
     anchor: Option<(usize, usize)>,
+    /// After a double or triple click: the click count and the word or line it picked,
+    /// so a drag from there grows by whole words or lines.
+    unit_drag: Option<(u8, ((usize, usize), (usize, usize)))>,
 }
 
 impl Drop for LogView {
@@ -337,6 +340,7 @@ impl LogView {
             pending_offset: None,
             selection: None,
             anchor: None,
+            unit_drag: None,
         }
     }
 
@@ -807,6 +811,46 @@ impl LogView {
         (a, b + 1)
     }
 
+    /// The word (count 2) or line (count 3) at a cell, as its start and end cells.
+    fn unit_span(&self, count: u8, (row, col): (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        if count >= 3 {
+            ((row, 0), (row, self.row_text(row).chars().count()))
+        } else {
+            let (a, b) = self.word_at(row, col);
+            ((row, a), (row, b))
+        }
+    }
+
+    /// A press on a cell: a plain click starts a drag, a double or triple click picks the
+    /// word or line there.
+    fn press(&mut self, cell: (usize, usize), count: u8) {
+        if count >= 2 {
+            let span = self.unit_span(count, cell);
+            self.anchor = None;
+            self.unit_drag = Some((count, span));
+            self.selection = Some(span);
+        } else {
+            self.anchor = Some(cell);
+            self.unit_drag = None;
+            self.selection = None;
+        }
+    }
+
+    /// The pointer dragged to a cell while held.
+    fn drag(&mut self, cell: (usize, usize)) {
+        if let Some((count, (start, end))) = self.unit_drag {
+            // Whole words or lines from the first one to the one under the pointer.
+            let (hs, he) = self.unit_span(count, cell);
+            self.selection = Some(if hs < start {
+                (end, hs)
+            } else {
+                (start, he.max(end))
+            });
+        } else if let Some(anchor) = self.anchor {
+            self.selection = Some((anchor, cell));
+        }
+    }
+
     /// The selected rows and their character ranges, in order.
     fn selection_rows(&self) -> Option<Vec<(usize, usize, usize)>> {
         let (a, b) = self.selection?;
@@ -908,35 +952,18 @@ impl LogView {
                 self.selection = (last > 0).then_some(((1, 0), (last, len)));
             }
             LogMsg::Point(SelectEvent::Press(p, count)) => {
-                let (row, col) = self.cell_at(p);
-                match count {
-                    2 => {
-                        self.anchor = None;
-                        let (a, b) = self.word_at(row, col);
-                        self.selection = Some(((row, a), (row, b)));
-                    }
-                    3 => {
-                        self.anchor = None;
-                        let len = self.row_text(row).chars().count();
-                        self.selection = Some(((row, 0), (row, len)));
-                    }
-                    _ => {
-                        self.anchor = Some((row, col));
-                        self.selection = None;
-                    }
-                }
+                self.press(self.cell_at(p), count);
             }
             LogMsg::Point(SelectEvent::Extend(p)) => {
                 // From the current selection's anchor, else the last plain click.
                 let head = self.cell_at(p);
                 let anchor = self.selection.map(|(a, _)| a).or(self.anchor).unwrap_or(head);
                 self.anchor = Some(anchor);
+                self.unit_drag = None;
                 self.selection = Some((anchor, head));
             }
             LogMsg::Point(SelectEvent::Drag(p)) => {
-                if let Some(anchor) = self.anchor {
-                    self.selection = Some((anchor, self.cell_at(p)));
-                }
+                self.drag(self.cell_at(p));
             }
             LogMsg::Point(SelectEvent::Scroll(v)) => {
                 return operation::scroll_by(
@@ -1364,6 +1391,26 @@ mod tests {
         // Backwards drags select the same text.
         v.selection = Some((v.cell_at(p(2, 6)), v.cell_at(p(1, 6))));
         assert_eq!(v.selected_text().as_deref(), Some("world\nsecond"));
+    }
+
+    #[test]
+    fn drag_after_double_click_selects_whole_words() {
+        let mut v = view_with(&["get /api/v1 200 ok", "second line here"]);
+        let p =
+            |row: usize, col: usize| iced::Point::new(col as f32 * CHAR_W, row as f32 * LINE + 2.0);
+        v.press(v.cell_at(p(1, 13)), 2);
+        assert_eq!(v.selected_text().as_deref(), Some("200"));
+        v.drag(v.cell_at(p(2, 9)));
+        assert_eq!(v.selected_text().as_deref(), Some("200 ok\nsecond line"));
+        v.drag(v.cell_at(p(1, 6)));
+        assert_eq!(v.selected_text().as_deref(), Some("/api/v1 200"));
+        // Triple click then drag: whole lines.
+        v.press(v.cell_at(p(2, 3)), 3);
+        v.drag(v.cell_at(p(1, 2)));
+        assert_eq!(
+            v.selected_text().as_deref(),
+            Some("get /api/v1 200 ok\nsecond line here")
+        );
     }
 
     #[test]

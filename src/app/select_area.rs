@@ -182,7 +182,7 @@ where
                     _ => 1,
                 };
                 state.last_press = Some((now, p, count));
-                state.pressed_at = (count == 1).then_some(p);
+                state.pressed_at = Some(p);
                 shell.publish((self.on_select)(SelectEvent::Press(rel(p), count)));
                 shell.capture_event();
             }

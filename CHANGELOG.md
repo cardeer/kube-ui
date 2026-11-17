@@ -5,6 +5,10 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- In the log lines, dragging after a double click keeps selecting whole words, and after
+  a triple click whole lines.
+
 ## [1.3.1] - 2026-11-17
 
 ### Added
