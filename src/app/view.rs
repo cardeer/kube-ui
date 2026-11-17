@@ -679,7 +679,7 @@ impl App {
 
     /// The bottom panel's height (with its top edge), or `None` when it has no tabs.
     pub(super) fn dock_height(&self) -> Option<f32> {
-        if self.logs.is_empty() && self.shells.is_empty() {
+        if self.dock_total() == 0 {
             return None;
         }
         Some(match self.settings.log_mode {
@@ -693,13 +693,14 @@ impl App {
     }
 
     fn view_dock(&self) -> Option<El<'_>> {
-        let total = self.logs.len() + self.shells.len();
+        let total = self.dock_total();
         if total == 0 {
             return None;
         }
         let n_logs = self.logs.len();
         let can_split = n_logs > 0 && !self.shells.is_empty();
-        let split = self.settings.log_split && can_split;
+        let shows_yaml = self.dock_shows_yaml();
+        let split = self.settings.log_split && can_split && !shows_yaml;
         let (shown_log, shown_shell) = self.dock_shown();
         let active = self.active_log.min(total - 1);
         let mode = self.settings.log_mode;
@@ -721,7 +722,20 @@ impl App {
                 self.shells
                     .iter()
                     .map(|s| (icon::TERMINAL_WINDOW, s.title(), s.hover(), s.live())),
-            );
+            )
+            .chain(self.yaml.as_ref().filter(|_| self.yaml_docked()).map(|y| {
+                let title = if y.editing && y.dirty {
+                    format!("{} •", y.title)
+                } else {
+                    y.title.clone()
+                };
+                let hover = if y.editing {
+                    "Editing YAML".to_string()
+                } else {
+                    "YAML".to_string()
+                };
+                (icon::FILE_CODE, title, hover, true)
+            }));
         let mut strip = row![].spacing(6).align_y(iced::Center);
         for (i, (glyph, title, hover, live)) in tabs.enumerate() {
             let selected = if split {
@@ -848,8 +862,10 @@ impl App {
         .align_y(iced::Center);
 
         let height = self.dock_height().unwrap_or(LOG_COLLAPSED_HEIGHT);
-        let body =
-            (mode != LogPanelMode::Collapsed).then(|| self.dock_body(shown_log, shown_shell));
+        let body = (mode != LogPanelMode::Collapsed).then(|| match &self.yaml {
+            Some(y) if shows_yaml => self.yaml_content(y, true),
+            _ => self.dock_body(shown_log, shown_shell),
+        });
         let mut col = column![header].spacing(6);
         if let Some(body) = body {
             col = col.push(theme::hline());
@@ -918,7 +934,7 @@ impl App {
                 )
             } else if let Some(d) = &self.pf_dialog {
                 (self.view_pf_dialog(d), Some(Message::PfCancel))
-            } else if let Some(y) = &self.yaml {
+            } else if let Some(y) = self.yaml.as_ref().filter(|_| !self.settings.yaml_docked) {
                 (self.view_yaml(y), None)
             } else if self.changelog_open {
                 (
@@ -1052,18 +1068,72 @@ impl App {
         .into()
     }
 
+    /// The floating YAML window.
     fn view_yaml<'a>(&'a self, y: &'a YamlView) -> El<'a> {
-        let title = if y.editing && y.dirty && !y.create {
-            format!("{} (edited)", y.title)
-        } else {
-            y.title.clone()
-        };
         let width = (self.window_size.width - 80.0).clamp(560.0, 1040.0);
         let height = (self.window_size.height - 80.0).clamp(360.0, 900.0);
-        let mut col = column![Self::dialog_title(title, Message::YamlClose)].spacing(6);
+        container(self.yaml_content(y, false))
+            .padding(16)
+            .width(width)
+            .height(height)
+            .style(theme::dialog)
+            .into()
+    }
+
+    /// The YAML editor's contents, for the floating window or (`docked`) a bottom panel tab.
+    /// Docked, the tab carries the title and close button, so the toolbar takes the
+    /// "float" toggle instead of a title row.
+    pub(super) fn yaml_content<'a>(&'a self, y: &'a YamlView, docked: bool) -> El<'a> {
+        let toggle: El<'a> = if docked {
+            theme::icon_button(
+                icon::ARROW_SQUARE_OUT,
+                "Open as a floating window",
+                Some(Message::YamlDock(false)),
+            )
+        } else {
+            theme::icon_button(
+                icon::ARROW_SQUARE_DOWN,
+                "Move to the bottom panel",
+                Some(Message::YamlDock(true)),
+            )
+        };
+        let mut col = column![].spacing(6);
+        let mut toggle = Some(toggle);
+        if !docked {
+            let title = if y.editing && y.dirty && !y.create {
+                format!("{} (edited)", y.title)
+            } else {
+                y.title.clone()
+            };
+            col = col.push(
+                row![
+                    text(title)
+                        .size(15.0)
+                        .font(theme::SEMIBOLD)
+                        .color(theme::TEXT),
+                    theme::fill_space(),
+                    toggle.take().unwrap_or_else(|| Space::new().into()),
+                    theme::icon_button(icon::X, "Close", Some(Message::YamlClose)),
+                ]
+                .spacing(4)
+                .align_y(iced::Center),
+            );
+        }
+        let status_row = |msg: El<'a>, toggle: Option<El<'a>>| -> El<'a> {
+            let mut r = row![msg, theme::fill_space()].align_y(iced::Center);
+            if let Some(t) = toggle {
+                r = r.push(t);
+            }
+            r.into()
+        };
         match &y.text {
-            None => col = col.push(theme::faint("Loading…")),
-            Some(Err(e)) => col = col.push(theme::colored(e.clone(), RED)),
+            None => col = col.push(status_row(theme::faint("Loading…").into(), toggle.take())),
+            Some(Err(e)) => {
+                col = col.push(status_row(
+                    theme::colored(e.clone(), RED).into(),
+                    toggle.take(),
+                ))
+            }
             Some(Ok(original)) => {
                 let mut bar = row![].spacing(8).align_y(iced::Center);
                 if y.editing {
@@ -1117,6 +1187,10 @@ impl App {
                         "Fetch the latest version (discards edits)",
                     ));
                 }
+                if let Some(t) = toggle.take() {
+                    bar = bar.push(theme::vline(18.0));
+                    bar = bar.push(t);
+                }
                 col = col.push(bar);
                 // Notices that come and go (find bar, warnings, errors) share one slot, so the
                 // editor keeps its place in the widget tree. Otherwise a notice appearing (an
@@ -1154,12 +1228,7 @@ impl App {
                 );
             }
         }
-        container(col)
-            .padding(16)
-            .width(width)
-            .height(height)
-            .style(theme::dialog)
-            .into()
+        col.height(Length::Fill).into()
     }
 
     fn yaml_editor<'a>(&'a self, y: &'a YamlView) -> El<'a> {
@@ -1201,6 +1270,12 @@ impl App {
             .height(Length::Shrink)
             .width(editor_width)
             .style(theme::editor);
+        // Shift-click and word/line drags, which the editor doesn't do itself.
+        let editor = super::editor_mouse::editor_mouse(
+            editor,
+            iced::Vector::new(code_editor::EDITOR_PAD, code_editor::EDITOR_PAD),
+            Message::YamlMouse,
+        );
         // The editor stays the base layer so it keeps its unbounded height: with a bounded
         // one it would take wheel events and the scrollable would stop scrolling.
         let editor = stack![editor].push_under(
@@ -1477,7 +1552,7 @@ impl App {
 
     /// A dock tab's right-click menu.
     fn popup_dock_tab(&self, i: usize) -> El<'_> {
-        let total = self.logs.len() + self.shells.len();
+        let total = self.dock_total();
         let on = |enabled: bool, msg: Message| enabled.then_some(msg);
         column![
             theme::menu_entry(

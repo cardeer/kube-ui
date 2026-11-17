@@ -5,6 +5,13 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- The YAML editor can move into the bottom panel as a tab beside logs and terminals, and
+  back to a floating window, with the button next to its close button (or at the end of
+  its toolbar when docked). The choice is remembered for the next YAML you open.
+- In the YAML editor, shift-click extends the selection, and dragging after a double or
+  triple click keeps selecting whole words or lines.
+
 ## [1.2.0] - 2026-11-17
 
 ### Added

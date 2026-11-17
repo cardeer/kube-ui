@@ -126,6 +126,9 @@ pub struct Settings {
     /// Show the current log tab and the current terminal tab side by side.
     #[serde(default)]
     pub log_split: bool,
+    /// Show the YAML editor as a bottom panel tab instead of a floating window.
+    #[serde(default)]
+    pub yaml_docked: bool,
     /// Window inner size from the last run (the size to restore to when it was maximized).
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
@@ -162,6 +165,7 @@ impl Default for Settings {
             log_height: default_log_height(),
             log_mode: LogPanelMode::Normal,
             log_split: false,
+            yaml_docked: false,
             window_size: None,
             window_maximized: false,
             last_seen_version: None,

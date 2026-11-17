@@ -1,6 +1,7 @@
 mod axis_lock;
 mod changelog;
 mod code_editor;
+mod editor_mouse;
 mod filter;
 mod icons;
 mod logs;
@@ -646,6 +647,10 @@ pub enum Message {
     // Bottom dock: logs and shells
     DockSelect(usize),
     DockClose(usize),
+    /// Shift-click or a word/line drag in the YAML editor.
+    YamlMouse(editor_mouse::EditorMouse),
+    /// Move the YAML editor into the bottom panel (true) or back to a floating window.
+    YamlDock(bool),
     DockCloseOthers(usize),
     DockCloseLeft(usize),
     DockCloseRight(usize),
@@ -1227,6 +1232,16 @@ impl App {
                 self.popup = None;
                 self.logs.clear();
                 self.shells.clear();
+                if self.yaml_docked() {
+                    self.yaml = None;
+                }
+            }
+            Message::YamlDock(docked) => {
+                self.settings.yaml_docked = docked;
+                self.settings.save();
+                if docked {
+                    self.focus_yaml_tab();
+                }
             }
             Message::SetLogMode(mode) => self.set_log_mode(mode),
             Message::ToggleSplit => {
@@ -1237,6 +1252,24 @@ impl App {
             Message::Shell(id, msg) => return self.shell_message(id, msg),
 
             Message::YamlAction(action) => self.yaml_action(action),
+            Message::YamlMouse(editor_mouse::EditorMouse::Drag(p)) => {
+                self.yaml_action(text_editor::Action::Drag(p))
+            }
+            Message::YamlMouse(editor_mouse::EditorMouse::Extend(p)) => {
+                // From the selection's anchor (or the caret) to where the click lands.
+                if let Some(y) = self.yaml.as_mut() {
+                    let before = y.content.cursor();
+                    let anchor = before.selection.unwrap_or(before.position);
+                    y.content.perform(text_editor::Action::Click(p));
+                    let to = y.content.cursor().position;
+                    y.content.move_to(text_editor::Cursor {
+                        position: to,
+                        selection: (to != anchor).then_some(anchor),
+                    });
+                    y.history.break_step();
+                }
+                return operation::focus(view::YAML_EDITOR);
+            }
             Message::YamlEdit => {
                 if let Some(y) = self.yaml.as_mut() {
                     y.editing = true;
@@ -1419,13 +1452,14 @@ impl App {
             if self.popup.take().is_some() {
                 return Task::none();
             }
-            if self.yaml.is_some() && self.find.open {
+            if self.yaml_visible() && self.find.open {
                 return self.find_message(code_editor::FindMsg::Close);
             }
             if self.pf_dialog.take().is_some() || self.confirm_delete.take().is_some() {
                 return Task::none();
             }
-            if self.yaml.is_some() || self.changelog_open {
+            // The floating editor stays open; a docked one is a tab like any other.
+            if (self.yaml.is_some() && !self.settings.yaml_docked) || self.changelog_open {
                 return Task::none();
             }
             if let Some(ws) = self.ws_mut() {
@@ -1449,11 +1483,13 @@ impl App {
                     self.activate_workspace(i);
                 }
             }
-            'f' if self.yaml.is_some() => return self.find_message(code_editor::FindMsg::Open),
-            'g' if self.yaml.is_some() && self.find.open => {
+            'f' if self.yaml_visible() => return self.find_message(code_editor::FindMsg::Open),
+            'g' if self.yaml_visible() && self.find.open => {
                 return self.find_message(code_editor::FindMsg::Step(m.shift()));
             }
-            's' if self.yaml.as_ref().is_some_and(|y| y.editing) => self.yaml_apply(),
+            's' if self.yaml_visible() && self.yaml.as_ref().is_some_and(|y| y.editing) => {
+                self.yaml_apply()
+            }
             // In the bottom panel, Copy and Select All act on the focused log tab.
             // (A shell tab handles its own, since its canvas takes the key first.)
             'c' if self.focused_log().is_some() => {
@@ -1558,7 +1594,7 @@ impl App {
     /// ⌘W: closes the innermost thing showing: the YAML window, "What's new", the detail
     /// drawer, then the cluster tab (never the last one).
     fn close_frontmost(&mut self) {
-        if let Some(y) = &self.yaml {
+        if let Some(y) = self.yaml.as_ref().filter(|_| !self.settings.yaml_docked) {
             if y.editing && y.dirty {
                 self.toast(
                     "This YAML has unapplied changes. Apply them or close the window with ×.",
@@ -2173,6 +2209,7 @@ impl App {
             create: true,
             history: Default::default(),
         });
+        self.focus_yaml_tab();
         operation::focus(view::YAML_EDITOR)
     }
 
@@ -2202,6 +2239,7 @@ impl App {
             create: false,
             history: Default::default(),
         });
+        self.focus_yaml_tab();
         let bus = self.bus.clone();
         self.rt.spawn(async move {
             let result = kube_ops::get_yaml(client, kind, ns, name)
@@ -2543,10 +2581,46 @@ impl App {
         if !self.dock_focused || self.dock_height().is_none() {
             return None;
         }
-        let i = self
-            .active_log
-            .min((self.logs.len() + self.shells.len()).saturating_sub(1));
+        let i = self.active_log.min(self.dock_total().saturating_sub(1));
         (i < self.logs.len()).then_some(i)
+    }
+
+    /// The YAML editor is on screen: floating, or its bottom panel tab is showing.
+    fn yaml_visible(&self) -> bool {
+        self.yaml.is_some()
+            && (!self.settings.yaml_docked
+                || (self.dock_shows_yaml() && self.settings.log_mode != LogPanelMode::Collapsed))
+    }
+
+    /// The YAML editor is open as a bottom panel tab.
+    fn yaml_docked(&self) -> bool {
+        self.settings.yaml_docked && self.yaml.is_some()
+    }
+
+    /// Bottom panel tabs: logs, then shells, then the docked YAML editor.
+    pub(super) fn dock_total(&self) -> usize {
+        self.logs.len() + self.shells.len() + usize::from(self.yaml_docked())
+    }
+
+    /// The docked YAML editor's tab index.
+    fn yaml_tab(&self) -> Option<usize> {
+        self.yaml_docked()
+            .then(|| self.logs.len() + self.shells.len())
+    }
+
+    /// The bottom panel is showing the docked YAML editor.
+    fn dock_shows_yaml(&self) -> bool {
+        self.yaml_tab()
+            .is_some_and(|i| self.active_log.min(self.dock_total() - 1) == i)
+    }
+
+    /// Selects the docked YAML editor's tab (when docked), so opening YAML shows it.
+    fn focus_yaml_tab(&mut self) {
+        if let Some(i) = self.yaml_tab() {
+            self.active_log = i;
+            self.dock_focused = true;
+            self.show_logs();
+        }
     }
 
     fn close_dock_tab(&mut self, i: usize) {
@@ -2555,8 +2629,10 @@ impl App {
             self.logs.remove(i);
         } else if i - n_logs < self.shells.len() {
             self.shells.remove(i - n_logs);
+        } else if Some(i) == self.yaml_tab() {
+            self.yaml = None;
         }
-        let total = self.logs.len() + self.shells.len();
+        let total = self.dock_total();
         if self.active_log > i || self.active_log >= total {
             self.active_log = self.active_log.saturating_sub(1);
         }
@@ -2564,13 +2640,18 @@ impl App {
 
     /// ⇧⌘W (and ⌘W while the panel has focus): closes the bottom panel's selected tab.
     fn close_active_dock_tab(&mut self) {
-        let total = self.logs.len() + self.shells.len();
+        let total = self.dock_total();
         if total == 0 {
             self.toast("No logs or terminals open.", false);
+        } else if self.dock_shows_yaml() && self.yaml.as_ref().is_some_and(|y| y.editing && y.dirty) {
+            self.toast(
+                "This YAML has unapplied changes. Apply them or close its tab with ×.",
+                false,
+            );
         } else {
             self.close_dock_tab(self.active_log.min(total - 1));
         }
-        if self.logs.is_empty() && self.shells.is_empty() {
+        if self.dock_total() == 0 {
             self.dock_focused = false;
         }
     }
@@ -2589,9 +2670,12 @@ impl App {
     fn close_dock_tabs(&mut self, focus: usize, keep: impl Fn(usize) -> bool) {
         self.popup = None;
         let n_logs = self.logs.len();
-        let total = n_logs + self.shells.len();
+        let total = self.dock_total();
         if focus >= total {
             return;
+        }
+        if self.yaml_tab().is_some_and(|i| !keep(i)) {
+            self.yaml = None;
         }
         let active = self.active_log.min(total - 1);
         let anchor = if keep(active) { active } else { focus };
