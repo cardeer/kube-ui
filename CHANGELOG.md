@@ -5,6 +5,8 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-17
+
 ### Added
 - Telepresence: the first connect asks for your administrator password in the app instead
   of failing for want of a terminal. The password is checked, handed to sudo for that one
@@ -12,7 +14,6 @@ and match the `v<version>` git tags.
 - Telepresence: an "Active intercepts" section lists each intercept with its state (and
   the reason when it isn't working), and a workload's row shows "Starting intercept…" or
   "Leaving…" while that runs.
-
 - Telepresence: while connected, the status sits on one line so the workload list keeps
   the height.
 
