@@ -5,6 +5,8 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-17
+
 ### Added
 - The YAML editor can move into the bottom panel as a tab beside logs and terminals, and
   back to a floating window, with the button next to its close button (or at the end of
