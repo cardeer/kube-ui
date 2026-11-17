@@ -5,6 +5,8 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-17
+
 ### Added
 - A Node Ports page under Network lists every NodePort the services open, one row per
   port, with its service, port, target and namespace. Clicking a row opens the service.
