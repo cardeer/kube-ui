@@ -372,6 +372,13 @@ impl App {
             (Tab::Deployments, plain(count(&ws.deployments))),
         ];
         workloads.extend(WORKLOAD_KINDS.map(|k| (Tab::Workload(k), plain(count(ws.workload(k))))));
+        // Like pods: not-ready nodes show from any page, else the total.
+        let not_ready = ws.nodes.items.iter().filter(|n| !n.ready).count();
+        let nodes_badge = if not_ready > 0 {
+            Some((format!("{not_ready} not ready"), Some(RED)))
+        } else {
+            plain(count(&ws.nodes))
+        };
         let forwards_badge =
             (active_forwards > 0).then(|| (format!("{active_forwards} live"), Some(GREEN)));
         let groups = [
@@ -382,8 +389,18 @@ impl App {
                 "Network",
                 vec![
                     (Tab::Services, plain(count(&ws.services))),
+                    (
+                        Tab::NodePorts,
+                        plain(ws.services.loaded.then(|| ws.node_ports().len())),
+                    ),
                     (Tab::Forwards, forwards_badge),
                 ],
+            ),
+            (
+                "cluster",
+                icon::TREE_STRUCTURE,
+                "Cluster",
+                vec![(Tab::Nodes, nodes_badge)],
             ),
         ];
         // No spacing: child rows carry their own 2px gap so the guide line stays unbroken.
@@ -943,13 +960,20 @@ impl App {
             Kind::Pod => "If it's managed by a controller, a replacement will be created.",
             Kind::Service => "Traffic to it stops right away.",
             Kind::CronJob => "Its jobs and their pods are deleted too.",
+            Kind::Node => {
+                "It leaves the cluster until its kubelet registers again. Drain it first."
+            }
             _ => "Its pods are deleted too. This can't be undone.",
         };
         container(
             column![
                 Self::dialog_title(format!("Delete {label}?"), Message::ConfirmDelete(false)),
                 theme::vspace(4.0),
-                theme::txt(format!("Delete {label} {ns}/{name}?")),
+                theme::txt(if ns.is_empty() {
+                    format!("Delete {label} {name}?")
+                } else {
+                    format!("Delete {label} {ns}/{name}?")
+                }),
                 theme::faint(note),
                 theme::vspace(8.0),
                 row![

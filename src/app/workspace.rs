@@ -56,6 +56,7 @@ pub(super) struct Workspace {
     pub(super) deployments: ListState<DeployRow>,
     /// One list per `WORKLOAD_KINDS` entry.
     workloads: HashMap<Kind, ListState<WorkRow>>,
+    pub(super) nodes: ListState<NodeRow>,
     pub(super) last_refresh: Option<Instant>,
     /// Keep the visible list live with a watch (vs. loading it once per refresh).
     live: bool,
@@ -103,6 +104,7 @@ impl Workspace {
             services: ListState::default(),
             deployments: ListState::default(),
             workloads: empty_workloads(),
+            nodes: ListState::default(),
             last_refresh: None,
             live: false,
             watch: None,
@@ -378,6 +380,8 @@ impl Workspace {
                     (_, Ok(ListData::Deployments(v))) => {
                         apply(&mut self.deployments, Ok(v), warning)
                     }
+                    (_, Ok(ListData::Nodes(v))) => apply(&mut self.nodes, Ok(v), warning),
+                    (Kind::Node, Err(e)) => apply(&mut self.nodes, Err(e), warning),
                     (Kind::Pod, Err(e)) => apply(&mut self.pods, Err(e), warning),
                     (Kind::Service, Err(e)) => apply(&mut self.services, Err(e), warning),
                     (Kind::Deployment, Err(e)) => apply(&mut self.deployments, Err(e), warning),
@@ -470,6 +474,7 @@ impl Workspace {
         self.services = ListState::default();
         self.deployments = ListState::default();
         self.workloads = empty_workloads();
+        self.nodes = ListState::default();
         self.last_refresh = None;
         self.watch = None;
         self.close_drawer();
@@ -537,6 +542,7 @@ impl Workspace {
             Kind::Pod => self.pods.loading = true,
             Kind::Service => self.services.loading = true,
             Kind::Deployment => self.deployments.loading = true,
+            Kind::Node => self.nodes.loading = true,
             k => {
                 if let Some(s) = self.workloads.get_mut(&k) {
                     s.loading = true;
@@ -550,6 +556,7 @@ impl Workspace {
             Kind::Pod => self.pods.loading,
             Kind::Service => self.services.loading,
             Kind::Deployment => self.deployments.loading,
+            Kind::Node => self.nodes.loading,
             k => self.workloads.get(&k).is_some_and(|s| s.loading),
         }
     }
@@ -611,6 +618,13 @@ impl Workspace {
                         )
                         .await
                     }
+                    Kind::Node => {
+                        kube_ops::watch_nodes(client, move |rows, errors| {
+                            let (r, w) = snapshot(rows, errors);
+                            send(r.map(ListData::Nodes), w)
+                        })
+                        .await
+                    }
                     k => {
                         kube_ops::watch_workloads(client, k, namespaces, move |rows, errors| {
                             let (r, w) = snapshot(rows, errors);
@@ -641,6 +655,12 @@ impl Workspace {
                     .await;
                     (r.map(ListData::Deployments), w)
                 }
+                Kind::Node => {
+                    let r = kube_ops::list_nodes(client.clone())
+                        .await
+                        .map_err(err_string);
+                    (r.map(ListData::Nodes), None)
+                }
                 k => {
                     let (r, w) = list_in(&namespaces, |ns| {
                         kube_ops::list_workloads(client.clone(), k, ns)
@@ -666,6 +686,10 @@ impl Workspace {
                 .items
                 .first()
                 .map(|r| (Kind::Service, &r.namespace, &r.name))?,
+            Tab::NodePorts => self
+                .node_ports()
+                .first()
+                .map(|(r, _)| (Kind::Service, &r.namespace, &r.name))?,
             Tab::Deployments => self
                 .deployments
                 .items
@@ -676,6 +700,14 @@ impl Workspace {
                 .items
                 .first()
                 .map(|r| (k, &r.namespace, &r.name))?,
+            Tab::Nodes => {
+                let n = self.nodes.items.first()?;
+                return Some(Selected {
+                    kind: Kind::Node,
+                    namespace: String::new(),
+                    name: n.name.clone(),
+                });
+            }
             _ => return None,
         };
         Some(Selected {
@@ -683,6 +715,23 @@ impl Workspace {
             namespace: namespace.clone(),
             name: name.clone(),
         })
+    }
+
+    /// Every NodePort the loaded services open, with its service, lowest port first.
+    pub(super) fn node_ports(&self) -> Vec<(&SvcRow, &SvcPort)> {
+        let mut out: Vec<(&SvcRow, &SvcPort)> = self
+            .services
+            .items
+            .iter()
+            .flat_map(|s| {
+                s.ports
+                    .iter()
+                    .filter(|p| p.node_port.is_some())
+                    .map(move |p| (s, p))
+            })
+            .collect();
+        out.sort_by_key(|(s, p)| (p.node_port, s.namespace.as_str(), s.name.as_str()));
+        out
     }
 
     /// Pods in a failing state (CrashLoopBackOff, ImagePullBackOff, Failed, …).
@@ -768,6 +817,7 @@ fn kind_glyph(kind: Kind) -> &'static str {
         Kind::ReplicaSet | Kind::ReplicationController => icon::COPY_SIMPLE,
         Kind::Job => icon::PLAY,
         Kind::CronJob => icon::CLOCK,
+        Kind::Node => icon::COMPUTER_TOWER,
     }
 }
 

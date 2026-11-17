@@ -43,8 +43,10 @@ impl Workspace {
             Tab::Overview => self.view_overview(ctx),
             Tab::Pods => self.view_pods(ctx),
             Tab::Services => self.view_services(ctx),
+            Tab::NodePorts => self.view_node_ports(ctx),
             Tab::Deployments => self.view_deployments(ctx),
             Tab::Workload(kind) => self.view_workloads(kind, ctx),
+            Tab::Nodes => self.view_nodes(ctx),
             _ => Space::new().into(),
         }
     }
@@ -100,7 +102,7 @@ impl Workspace {
             .kinds()
             .first()
             .copied()
-            .filter(|_| self.tab.is_list())
+            .filter(|k| self.tab.is_list() && Kind::ALL.contains(k))
         {
             bar = bar.push(theme::fill_space());
             bar = bar.push(theme::tip(
@@ -329,6 +331,176 @@ impl Workspace {
                         cells,
                         selected: self.is_selected(Kind::Service, &s.namespace, &s.name),
                         on_click: Self::select_msg(Kind::Service, &s.namespace, &s.name),
+                        on_double_click: None,
+                    }
+                },
+            }
+            .view()
+        });
+        column![bar, body].into()
+    }
+
+    fn view_node_ports<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+        let all = self.node_ports();
+        let total = self.services.loaded.then_some(all.len());
+        let mut rows: Vec<(&SvcRow, &SvcPort)> = all
+            .into_iter()
+            .filter(|(s, _)| self.matches(&s.name, &s.namespace))
+            .collect();
+        let sort = self.sorts.get(&Tab::NodePorts);
+        if let Some(sort) = sort {
+            let key = |(s, p): &(&SvcRow, &SvcPort)| match sort.col.as_str() {
+                "Node Port" => SortKey::Num(p.node_port.unwrap_or_default().into()),
+                "Port" => SortKey::Num(p.port.into()),
+                "Target" => SortKey::text(&p.target),
+                "Type" => SortKey::text(&s.kind),
+                "Namespace" => SortKey::text(&s.namespace),
+                "Age" => SortKey::age(s.created.as_ref()),
+                _ => SortKey::text(&s.name),
+            };
+            rows.sort_by(|a, b| {
+                let o = cmp_keys(&key(a), &key(b));
+                if sort.asc { o } else { o.reverse() }
+            });
+        }
+        let bar = self.filter_bar("Node Ports", rows.len(), total);
+        let show_ns = self.selected_ns.len() != 1;
+        let body = self.list_body(&self.services, || {
+            if rows.is_empty() && self.filters.get(&Tab::NodePorts).is_none_or(String::is_empty) {
+                return container(theme::txt(
+                    "No NodePort services here. A Service of type NodePort or LoadBalancer \
+                     opens a port on every node.",
+                ))
+                .padding([8, 0])
+                .into();
+            }
+            let mut cols = vec![
+                Col::fixed("Node Port", 96.0),
+                Col::fill("Service", 180.0),
+                Col::fixed("Port", 170.0),
+                Col::fixed("Target", 150.0),
+                Col::fixed("Type", 96.0),
+                Col::fixed("Age", 72.0),
+            ];
+            if show_ns {
+                cols.push(Col::fixed("Namespace", 110.0));
+            }
+            Table {
+                id: "list",
+                cols,
+                sort,
+                tab: Tab::NodePorts,
+                sortable: true,
+                widths: ctx.widths,
+                len: rows.len(),
+                scroll: self.list_scroll,
+                hovered: ctx.hovered,
+                row: move |i, w: &[f32]| {
+                    let (s, p): (&SvcRow, &SvcPort) = rows[i];
+                    let port = if p.name.is_empty() {
+                        format!("{}/{}", p.port, p.protocol)
+                    } else {
+                        format!("{}/{} ({})", p.port, p.protocol, p.name)
+                    };
+                    let mut cells: Vec<El<'a>> = vec![
+                        theme::mono(p.node_port.unwrap_or_default().to_string()).into(),
+                        table::name_cell(&s.name, w[1]),
+                        table::truncated(&port, w[2], 7.5, theme::mono_muted),
+                        table::truncated(&p.target, w[3], 7.5, theme::mono_muted),
+                        table::truncated(&s.kind, w[4], 7.6, theme::muted),
+                        theme::mono_muted(s.age()).into(),
+                    ];
+                    if show_ns {
+                        cells.push(table::truncated(
+                            &s.namespace.as_str(),
+                            w[cells.len()],
+                            7.5,
+                            theme::mono_muted,
+                        ));
+                    }
+                    Row {
+                        cells,
+                        selected: self.is_selected(Kind::Service, &s.namespace, &s.name),
+                        on_click: Self::select_msg(Kind::Service, &s.namespace, &s.name),
+                        on_double_click: None,
+                    }
+                },
+            }
+            .view()
+        });
+        column![bar, body].into()
+    }
+
+    fn view_nodes<'a>(&'a self, ctx: &ViewCtx<'a>) -> El<'a> {
+        let mut rows: Vec<&NodeRow> = self
+            .nodes
+            .items
+            .iter()
+            .filter(|n| self.matches(&n.name, ""))
+            .collect();
+        let sort = self.sorts.get(&Tab::Nodes);
+        sort_rows(&mut rows, sort, |n, col| match col {
+            "Status" => SortKey::text(&n.status),
+            "Roles" => SortKey::text(&n.roles),
+            "Version" => SortKey::text(&n.version),
+            "Internal IP" => SortKey::text(&n.internal_ip),
+            "CPU" => SortKey::Num(n.cpu_milli),
+            "Memory" => SortKey::Num(n.memory_bytes),
+            "Age" => SortKey::age(n.created.as_ref()),
+            _ => SortKey::text(&n.name),
+        });
+        let bar = self.filter_bar("Nodes", rows.len(), count(&self.nodes));
+        let body = self.list_body(&self.nodes, || {
+            Table {
+                id: "list",
+                cols: vec![
+                    Col::fill("Name", 200.0),
+                    Col::fixed("Status", 130.0),
+                    Col::fixed("Roles", 140.0),
+                    Col::fixed("Version", 135.0),
+                    Col::fixed("Internal IP", 120.0),
+                    Col::fixed("CPU", 70.0),
+                    Col::fixed("Memory", 100.0),
+                    Col::fixed("Age", 72.0),
+                ],
+                sort,
+                tab: Tab::Nodes,
+                sortable: true,
+                widths: ctx.widths,
+                len: rows.len(),
+                scroll: self.list_scroll,
+                hovered: ctx.hovered,
+                row: move |i, w: &[f32]| {
+                    let n: &NodeRow = rows[i];
+                    let color = health_color(n.health);
+                    let tint = if n.health == Health::Ok {
+                        theme::TEXT
+                    } else {
+                        color
+                    };
+                    // Allocatable only: the full "a of b" is in the drawer.
+                    let first = |s: &str| s.split(" of ").next().unwrap_or_default().to_string();
+                    Row {
+                        cells: vec![
+                            table::name_cell(&n.name, w[0]),
+                            row![
+                                theme::dot(color),
+                                table::truncated(&n.status, w[1] - 14.0, 7.6, move |s| {
+                                    theme::colored(s, tint)
+                                })
+                            ]
+                            .spacing(6)
+                            .align_y(iced::Center)
+                            .into(),
+                            table::truncated(&n.roles, w[2], 7.6, theme::muted),
+                            table::truncated(&n.version, w[3], 7.5, theme::mono_muted),
+                            theme::mono_muted(n.internal_ip.as_str()).into(),
+                            theme::mono(first(&n.cpu)).into(),
+                            theme::mono(first(&n.memory)).into(),
+                            theme::mono_muted(n.age()).into(),
+                        ],
+                        selected: self.is_selected(Kind::Node, "", &n.name),
+                        on_click: Self::select_msg(Kind::Node, "", &n.name),
                         on_double_click: None,
                     }
                 },
@@ -916,7 +1088,11 @@ impl Workspace {
         .align_y(iced::Alignment::Start);
         let subtitle = row![
             theme::icon(kind_glyph(sel.kind)),
-            theme::muted(format!("{} · {}", sel.kind.label(), sel.namespace))
+            theme::muted(if sel.namespace.is_empty() {
+                sel.kind.label().to_string()
+            } else {
+                format!("{} · {}", sel.kind.label(), sel.namespace)
+            })
         ]
         .spacing(8)
         .align_y(iced::Center);
@@ -939,6 +1115,7 @@ impl Workspace {
             (Kind::Pod, _) => self.drawer_pod(sel, ctx),
             (Kind::Service, _) => self.drawer_service(sel, ctx),
             (Kind::Deployment, _) => self.drawer_deployment(sel, ctx),
+            (Kind::Node, _) => self.drawer_node(sel, ctx),
             _ => self.drawer_workload(sel, ctx),
         };
         let content = column![
@@ -2172,6 +2349,93 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    fn drawer_node<'a>(&'a self, sel: &Selected, ctx: &ViewCtx<'a>) -> El<'a> {
+        let Some(n) = self.nodes.items.iter().find(|n| n.name == sel.name) else {
+            return theme::faint(if self.nodes.loaded {
+                "This node no longer exists."
+            } else {
+                "Loading…"
+            })
+            .into();
+        };
+        let details = match self.loaded_details().map(|d| &d.body) {
+            Some(Body::Workload(d)) => Some(d),
+            _ => None,
+        };
+        let color = health_color(n.health);
+        let summary = row![
+            theme::dot(color),
+            theme::colored(n.status.as_str(), color),
+            theme::vline(14.0),
+            theme::txt(format!("Age {}", n.age())),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+
+        let (glyph, label, hint) = if n.unschedulable {
+            (icon::PLAY_CIRCLE, "Uncordon", "Let new pods be scheduled here again")
+        } else {
+            (
+                icon::PROHIBIT,
+                "Cordon",
+                "Stop new pods being scheduled here; running pods stay",
+            )
+        };
+        let actions = row![
+            theme::tip(
+                theme::secondary_button(
+                    Some(glyph),
+                    label,
+                    Some(act(Action::Cordon(n.name.clone(), !n.unschedulable))),
+                ),
+                hint,
+            ),
+            theme::vline(18.0),
+            self.drawer_menu_button(ctx),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+
+        let mut col = column![summary, theme::vspace(8.0), actions].spacing(2);
+        col = col.push(section("Details"));
+        col = col.push(details_grid(vec![
+            ("Roles", n.roles.clone()),
+            ("Internal IP", n.internal_ip.clone()),
+            ("External IP", n.external_ip.clone()),
+            ("Hostname", n.hostname.clone()),
+            ("Pod CIDR", n.pod_cidr.clone()),
+            ("Kubelet", n.version.clone()),
+            ("Container runtime", n.runtime.clone()),
+            ("OS image", n.os_image.clone()),
+            ("Kernel", n.kernel.clone()),
+            ("Platform", format!("{}/{}", n.os, n.arch)),
+        ]));
+        col = col.push(section("Allocatable of capacity"));
+        col = col.push(details_grid(vec![
+            ("CPU", n.cpu.clone()),
+            ("Memory", n.memory.clone()),
+            ("Pods", n.pods.clone()),
+            ("Ephemeral storage", n.storage.clone()),
+        ]));
+        if let Some(det) = details {
+            col = col.push(conditions(&det.conditions));
+        }
+        if !n.taints.is_empty() {
+            col = col.push(section("Taints"));
+            col = col.push(tags(n.taints.iter().cloned()));
+        }
+        if let Some(det) = details {
+            if !det.labels.is_empty() {
+                col = col.push(section("Labels"));
+                col = col.push(tags(det.labels.iter().map(|(k, v)| format!("{k}={v}"))));
+            }
+            col = col.push(annotations(&det.annotations, ctx));
+        }
+        col.into()
+    }
+}
+
 pub(in crate::app) const DRAWER_MENU: &str = "drawer-menu";
 pub(in crate::app) const SHELL_MENU: &str = "shell-menu";
 
@@ -2192,6 +2456,7 @@ fn sub_section<'a>(title: &'a str) -> El<'a> {
     column![theme::vspace(14.0), theme::label_small(title), theme::vspace(4.0)].into()
 }
 
+/// Label and value rows. Click a value to copy it.
 fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
     column(rows.into_iter().map(|(key, value)| {
         let value = if value.is_empty() {
@@ -2199,17 +2464,25 @@ fn details_grid<'a>(rows: Vec<(&'a str, String)>) -> El<'a> {
         } else {
             value
         };
-        row![
-            theme::muted(key).width(136),
+        let label = theme::mono(value.clone()).wrapping(text::Wrapping::WordOrGlyph);
+        // Click copies the value; a long one also shows in full in the tooltip.
+        let cell: El<'a> = if value == "-" {
+            label.into()
+        } else {
+            let tip = if value.chars().count() > 48 {
+                format!("{value}\n\nClick to copy")
+            } else {
+                "Click to copy".to_string()
+            };
             theme::tip(
-                theme::mono(value.clone()).wrapping(text::Wrapping::WordOrGlyph),
-                if value.chars().count() > 48 {
-                    value
-                } else {
-                    String::new()
-                },
+                button(label)
+                    .padding(0)
+                    .style(theme::link(theme::TEXT))
+                    .on_press(Message::Copy(value)),
+                tip,
             )
-        ]
+        };
+        row![theme::muted(key).width(136), cell]
         .spacing(20)
         .into()
     }))

@@ -21,7 +21,7 @@ use k8s_openapi::{
     api::{
         apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
         batch::v1::{CronJob, Job},
-        core::v1::{ContainerState, Namespace, Pod, ReplicationController, Service},
+        core::v1::{ContainerState, Namespace, Node, Pod, ReplicationController, Service},
     },
     apimachinery::pkg::{apis::meta::v1::Time, util::intstr::IntOrString},
     jiff::Timestamp,
@@ -157,7 +157,7 @@ pub async fn watch_rows<K, R>(
     client: Client,
     namespaces: Vec<String>,
     to_row: fn(&K) -> R,
-    mut emit: impl FnMut(Vec<R>, Vec<String>),
+    emit: impl FnMut(Vec<R>, Vec<String>),
 ) where
     K: kube::Resource<Scope = NamespaceResourceScope>
         + Clone
@@ -173,8 +173,33 @@ pub async fn watch_rows<K, R>(
     } else {
         namespaces.into_iter().map(Some).collect()
     };
-    let streams = labels.iter().enumerate().map(|(i, ns)| {
-        let api: Api<K> = scoped(client.clone(), ns.as_deref());
+    let apis = labels
+        .into_iter()
+        .map(|ns| {
+            let api: Api<K> = scoped(client.clone(), ns.as_deref());
+            (ns, api)
+        })
+        .collect();
+    watch_apis(apis, to_row, emit).await
+}
+
+/// Watches every node in the cluster; see `watch_rows`.
+pub async fn watch_nodes(client: Client, emit: impl FnMut(Vec<NodeRow>, Vec<String>)) {
+    watch_apis(vec![(None, Api::<Node>::all(client))], node_row, emit).await
+}
+
+/// The loop behind `watch_rows`: one watch per (label, api), merged into one sorted list.
+async fn watch_apis<K, R>(
+    apis: Vec<(Option<String>, Api<K>)>,
+    to_row: fn(&K) -> R,
+    mut emit: impl FnMut(Vec<R>, Vec<String>),
+) where
+    K: kube::Resource + Clone + DeserializeOwned + Debug + Send + 'static,
+    <K as kube::Resource>::DynamicType: Default,
+    R: Clone,
+{
+    let (labels, apis): (Vec<_>, Vec<_>) = apis.into_iter().unzip();
+    let streams = apis.into_iter().enumerate().map(|(i, api)| {
         watcher(api, watcher::Config::default())
             .default_backoff()
             .map(move |event| (i, event))
@@ -529,6 +554,15 @@ pub async fn list_pods(client: Client, ns: Option<String>) -> Result<Vec<PodRow>
         .collect();
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     Ok(rows)
+}
+
+pub async fn list_nodes(client: Client) -> Result<Vec<NodeRow>> {
+    let mut items = Api::<Node>::all(client)
+        .list(&ListParams::default())
+        .await?
+        .items;
+    items.sort_by_key(|n| n.name_any());
+    Ok(items.iter().map(node_row).collect())
 }
 
 pub struct LogOptions {
@@ -1000,7 +1034,25 @@ pub async fn delete(client: Client, kind: Kind, ns: String, name: String) -> Res
         }
         Kind::Job => delete_one::<Job>(client, &ns, &name).await,
         Kind::CronJob => delete_one::<CronJob>(client, &ns, &name).await,
+        Kind::Node => {
+            Api::<Node>::all(client)
+                .delete(&name, &DeleteParams::background())
+                .await?;
+            Ok(())
+        }
     }
+}
+
+/// Marks a node unschedulable (`kubectl cordon`) or schedulable again (`uncordon`).
+pub async fn set_cordoned(client: Client, name: String, cordoned: bool) -> Result<()> {
+    Api::<Node>::all(client)
+        .patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(&json!({ "spec": { "unschedulable": cordoned } })),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Suspends or resumes a cron job (no new runs) or a job (its pods are stopped).
@@ -1114,6 +1166,7 @@ pub async fn create_yaml(
         }
         Kind::Job => create_one::<Job>(client, &ns, value).await?,
         Kind::CronJob => create_one::<CronJob>(client, &ns, value).await?,
+        Kind::Node => return Err(anyhow!("nodes join the cluster on their own")),
     };
     Ok((kind, ns, name))
 }
@@ -1140,6 +1193,8 @@ pub fn template(kind: Kind, ns: &str) -> String {
         .join("\n")
     };
     match kind {
+        // Not offered: nodes register themselves.
+        Kind::Node => "apiVersion: v1\nkind: Node\nmetadata:\n  name: my-node\n".to_string(),
         Kind::Pod => format!(
             "apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-pod\n  namespace: {ns}\n  labels:\n    app: my-pod\nspec:\n{}\n  restartPolicy: Always\n",
             pod_spec("  ")
@@ -1231,6 +1286,14 @@ pub async fn apply_yaml(
         }
         Kind::Job => replace_one::<Job>(client, &ns, &name, value).await,
         Kind::CronJob => replace_one::<CronJob>(client, &ns, &name, value).await,
+        Kind::Node => {
+            let obj: Node =
+                serde_json::from_value(value).context("the YAML doesn't match this kind")?;
+            Api::<Node>::all(client)
+                .replace(&name, &PostParams::default(), &obj)
+                .await?;
+            Ok(())
+        }
     }
 }
 
@@ -1249,6 +1312,8 @@ pub enum Kind {
     ReplicationController,
     Job,
     CronJob,
+    /// Cluster-scoped: its namespace is always "".
+    Node,
 }
 
 impl Kind {
@@ -1264,6 +1329,7 @@ impl Kind {
             Kind::ReplicationController => "ReplicationController",
             Kind::Job => "Job",
             Kind::CronJob => "CronJob",
+            Kind::Node => "Node",
         }
     }
 
@@ -1279,9 +1345,11 @@ impl Kind {
             Kind::ReplicationController => "Replication Controllers",
             Kind::Job => "Jobs",
             Kind::CronJob => "Cron Jobs",
+            Kind::Node => "Nodes",
         }
     }
 
+    /// Every kind that can be created from YAML (all but nodes).
     pub const ALL: [Kind; 9] = [
         Kind::Pod,
         Kind::Service,
@@ -1341,6 +1409,9 @@ pub async fn get_object(
         Kind::ReplicationController => get_value::<ReplicationController>(client, ns, name).await,
         Kind::Job => get_value::<Job>(client, ns, name).await,
         Kind::CronJob => get_value::<CronJob>(client, ns, name).await,
+        Kind::Node => Ok(serde_json::to_value(
+            Api::<Node>::all(client).get(name).await?,
+        )?),
     }
 }
 
@@ -1540,6 +1611,199 @@ impl Cell {
                 span(end.duration_since(start.0).as_secs())
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct NodeRow {
+    pub name: String,
+    pub created: Option<Time>,
+    /// "Ready", "NotReady" or "Unknown", plus ", SchedulingDisabled" when cordoned.
+    pub status: String,
+    pub health: Health,
+    pub ready: bool,
+    pub unschedulable: bool,
+    /// "control-plane, etcd", or "-".
+    pub roles: String,
+    pub version: String,
+    pub internal_ip: String,
+    pub external_ip: String,
+    pub hostname: String,
+    pub os_image: String,
+    pub os: String,
+    pub arch: String,
+    pub kernel: String,
+    pub runtime: String,
+    pub pod_cidr: String,
+    /// Allocatable / capacity, readable ("3.9 of 4", "14.6 GiB of 15.6 GiB").
+    pub cpu: String,
+    pub memory: String,
+    pub pods: String,
+    pub storage: String,
+    /// Allocatable amounts, for sorting.
+    pub cpu_milli: i64,
+    pub memory_bytes: i64,
+    /// "key=value:Effect" per taint.
+    pub taints: Vec<String>,
+}
+
+impl NodeRow {
+    pub fn age(&self) -> String {
+        age(self.created.as_ref())
+    }
+}
+
+/// A Kubernetes quantity ("3900m", "16Gi", "15950020Ki", "1.5") in base units: milli-units
+/// for CPU-style numbers when `milli`, else whole units (bytes for memory).
+pub fn parse_quantity(q: &str, milli: bool) -> Option<f64> {
+    let q = q.trim();
+    let split = q
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
+        .unwrap_or(q.len());
+    let (num, suffix) = q.split_at(split);
+    let n: f64 = num.parse().ok()?;
+    let factor = match suffix {
+        "" => 1.0,
+        "m" => 0.001,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        s if s.starts_with('e') || s.starts_with('E') => 10f64.powi(s[1..].parse().ok()?),
+        _ => return None,
+    };
+    Some(if milli { n * factor * 1000.0 } else { n * factor })
+}
+
+/// Bytes as "15.6 GiB".
+pub fn format_bytes(b: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 || v >= 100.0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// Milli-CPUs as "3.9" or "4".
+fn format_cpu(milli: f64) -> String {
+    let cores = milli / 1000.0;
+    if (cores - cores.round()).abs() < 0.005 {
+        format!("{}", cores.round() as i64)
+    } else {
+        format!("{cores:.2}").trim_end_matches('0').to_string()
+    }
+}
+
+pub fn node_row(n: &Node) -> NodeRow {
+    let meta = &n.metadata;
+    let spec = n.spec.as_ref();
+    let st = n.status.as_ref();
+    let ready = st
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
+        .map(|c| c.status.as_str());
+    let unschedulable = spec.and_then(|s| s.unschedulable).unwrap_or(false);
+    let mut status = match ready {
+        Some("True") => "Ready",
+        Some("False") => "NotReady",
+        _ => "Unknown",
+    }
+    .to_string();
+    if unschedulable {
+        status.push_str(", SchedulingDisabled");
+    }
+    let health = match (ready, unschedulable) {
+        (Some("True"), false) => Health::Ok,
+        (Some("True"), true) => Health::Idle,
+        _ => Health::Bad,
+    };
+    let mut roles: Vec<String> = meta
+        .labels
+        .iter()
+        .flatten()
+        .filter_map(|(k, _)| k.strip_prefix("node-role.kubernetes.io/"))
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    roles.sort();
+    let addr = |kind: &str| {
+        st.and_then(|s| s.addresses.as_ref())
+            .and_then(|a| a.iter().find(|a| a.type_ == kind))
+            .map(|a| a.address.clone())
+            .unwrap_or_default()
+    };
+    let info = st.and_then(|s| s.node_info.as_ref());
+    let info_field = |f: fn(&k8s_openapi::api::core::v1::NodeSystemInfo) -> &String| {
+        info.map(|i| f(i).clone()).unwrap_or_default()
+    };
+    let amount = |which: bool, key: &str, milli: bool| -> Option<f64> {
+        let map = if which {
+            st.and_then(|s| s.allocatable.as_ref())
+        } else {
+            st.and_then(|s| s.capacity.as_ref())
+        };
+        map.and_then(|m| m.get(key))
+            .and_then(|q| parse_quantity(&q.0, milli))
+    };
+    let pair = |key: &str, milli: bool, fmt: &dyn Fn(f64) -> String| {
+        match (amount(true, key, milli), amount(false, key, milli)) {
+            (Some(a), Some(c)) if (a - c).abs() < f64::EPSILON => fmt(c),
+            (Some(a), Some(c)) => format!("{} of {}", fmt(a), fmt(c)),
+            (Some(v), None) | (None, Some(v)) => fmt(v),
+            (None, None) => String::new(),
+        }
+    };
+    let taints = spec
+        .and_then(|s| s.taints.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|t| match t.value.as_deref().filter(|v| !v.is_empty()) {
+            Some(v) => format!("{}={v}:{}", t.key, t.effect),
+            None => format!("{}:{}", t.key, t.effect),
+        })
+        .collect();
+    NodeRow {
+        name: meta.name.clone().unwrap_or_default(),
+        created: meta.creation_timestamp.clone(),
+        status,
+        health,
+        ready: ready == Some("True"),
+        unschedulable,
+        roles: if roles.is_empty() {
+            "-".into()
+        } else {
+            roles.join(", ")
+        },
+        version: info_field(|i| &i.kubelet_version),
+        internal_ip: addr("InternalIP"),
+        external_ip: addr("ExternalIP"),
+        hostname: addr("Hostname"),
+        os_image: info_field(|i| &i.os_image),
+        os: info_field(|i| &i.operating_system),
+        arch: info_field(|i| &i.architecture),
+        kernel: info_field(|i| &i.kernel_version),
+        runtime: info_field(|i| &i.container_runtime_version),
+        pod_cidr: spec.and_then(|s| s.pod_cidr.clone()).unwrap_or_default(),
+        cpu: pair("cpu", true, &format_cpu),
+        memory: pair("memory", false, &format_bytes),
+        pods: pair("pods", false, &|v| format!("{v:.0}")),
+        storage: pair("ephemeral-storage", false, &format_bytes),
+        cpu_milli: amount(true, "cpu", true).unwrap_or_default() as i64,
+        memory_bytes: amount(true, "memory", false).unwrap_or_default() as i64,
+        taints,
     }
 }
 
@@ -1981,6 +2245,19 @@ mod tests {
         check::<CronJob>(Kind::CronJob);
         assert_eq!(Kind::from_label("CronJob"), Some(Kind::CronJob));
         assert_eq!(Kind::from_label("Ingress"), None);
+        assert_eq!(Kind::from_label("Node"), None);
+    }
+
+    #[test]
+    fn quantities() {
+        assert_eq!(parse_quantity("3900m", true), Some(3900.0));
+        assert_eq!(parse_quantity("4", true), Some(4000.0));
+        assert_eq!(parse_quantity("16Gi", false), Some(16.0 * 1024f64.powi(3)));
+        assert_eq!(parse_quantity("1k", false), Some(1000.0));
+        assert_eq!(parse_quantity("bogus", false), None);
+        assert_eq!(format_bytes(16.0 * 1024f64.powi(3)), "16.0 GiB");
+        assert_eq!(format_cpu(3900.0), "3.9");
+        assert_eq!(format_cpu(4000.0), "4");
     }
 }
 

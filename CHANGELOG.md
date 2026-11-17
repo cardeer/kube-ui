@@ -5,6 +5,15 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- A Node Ports page under Network lists every NodePort the services open, one row per
+  port, with its service, port, target and namespace. Clicking a row opens the service.
+- Each value in a detail panel's Details section copies when clicked.
+- A Nodes page under a new Cluster group lists every node with its status, roles, kubelet
+  version, internal IP, CPU and memory. Its panel shows addresses, system info,
+  allocatable against capacity, conditions, taints and labels, and can cordon or uncordon
+  the node, view or edit its YAML, or delete it. The sidebar flags nodes that aren't ready.
+
 ## [1.1.2] - 2026-11-16
 
 ### Added

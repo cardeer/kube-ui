@@ -43,7 +43,7 @@ use crate::{
     details::{self, Body, ContainerDetails, Details, EnvSource},
     kube_ops::{
         self, Clients, DeployRow, Health, Kind, KubeconfigInfo, LogLine, LogOptions, PfEvent,
-        PfTarget, PodRow, SvcRow, WorkRow,
+        NodeRow, PfTarget, PodRow, SvcPort, SvcRow, WorkRow,
     },
     settings::{LogPanelMode, SavedForward, SavedSort, SavedWorkspace, Settings},
 };
@@ -87,6 +87,7 @@ enum ListData {
     Deployments(Vec<DeployRow>),
     /// Any of `WORKLOAD_KINDS`; the kind is on the message.
     Workloads(Vec<WorkRow>),
+    Nodes(Vec<NodeRow>),
 }
 
 /// Workload kinds that share the generic list, drawer and row type.
@@ -257,10 +258,14 @@ pub enum Tab {
     Overview,
     Pods,
     Services,
+    /// Every NodePort the services open, one row each.
+    NodePorts,
     Deployments,
     /// One of `WORKLOAD_KINDS`.
     Workload(Kind),
     Forwards,
+    /// Cluster-wide: ignores the namespace selection.
+    Nodes,
     Settings,
 }
 
@@ -269,7 +274,12 @@ impl Tab {
     fn is_list(self) -> bool {
         matches!(
             self,
-            Tab::Pods | Tab::Services | Tab::Deployments | Tab::Workload(_)
+            Tab::Pods
+                | Tab::Services
+                | Tab::NodePorts
+                | Tab::Deployments
+                | Tab::Workload(_)
+                | Tab::Nodes
         )
     }
 
@@ -277,9 +287,10 @@ impl Tab {
     fn kinds(self) -> Vec<Kind> {
         match self {
             Tab::Pods => vec![Kind::Pod],
-            Tab::Services => vec![Kind::Service],
+            Tab::Services | Tab::NodePorts => vec![Kind::Service],
             Tab::Deployments => vec![Kind::Deployment],
             Tab::Workload(k) => vec![k],
+            Tab::Nodes => vec![Kind::Node],
             Tab::Overview => [Kind::Pod, Kind::Deployment]
                 .into_iter()
                 .chain(WORKLOAD_KINDS)
@@ -294,6 +305,7 @@ impl Tab {
             Kind::Pod => Tab::Pods,
             Kind::Service => Tab::Services,
             Kind::Deployment => Tab::Deployments,
+            Kind::Node => Tab::Nodes,
             k => Tab::Workload(k),
         }
     }
@@ -304,6 +316,7 @@ impl Tab {
             Tab::Overview => "overview",
             Tab::Pods => "pods",
             Tab::Services => "services",
+            Tab::NodePorts => "nodeports",
             Tab::Deployments => "deployments",
             Tab::Workload(Kind::DaemonSet) => "daemonsets",
             Tab::Workload(Kind::StatefulSet) => "statefulsets",
@@ -313,6 +326,7 @@ impl Tab {
             Tab::Workload(Kind::CronJob) => "cronjobs",
             Tab::Workload(_) => "workloads",
             Tab::Forwards => "forwards",
+            Tab::Nodes => "nodes",
             Tab::Settings => "settings",
         }
     }
@@ -322,8 +336,10 @@ impl Tab {
             Tab::Overview,
             Tab::Pods,
             Tab::Services,
+            Tab::NodePorts,
             Tab::Deployments,
             Tab::Forwards,
+            Tab::Nodes,
             Tab::Settings,
         ]
         .into_iter()
@@ -498,6 +514,8 @@ pub enum Action {
     Pause(String, String, bool),
     Scale(Kind, String, String, i32),
     Restart(Kind, String, String),
+    /// Cordon (true) or uncordon a node.
+    Cordon(String, bool),
     /// Switch page (from the Overview).
     Open(Tab),
     /// Switch page and select a resource on it.
@@ -2056,6 +2074,14 @@ impl App {
                     kube_ops::restart(c, kind, ns, name)
                 })
             }
+            Action::Cordon(name, cordoned) => self.run_change(
+                None,
+                format!(
+                    "{} {name}",
+                    if cordoned { "Cordoned" } else { "Uncordoned" }
+                ),
+                move |c| kube_ops::set_cordoned(c, name, cordoned),
+            ),
             Action::Open(tab) => {
                 if let Some(ws) = self.ws_mut() {
                     ws.set_tab(tab);
@@ -2154,7 +2180,11 @@ impl App {
         let Some((ws, client)) = self.ws().and_then(|w| w.client().map(|c| (w.id, c))) else {
             return;
         };
-        let title = format!("{} {ns}/{name}", kind.label());
+        let title = if ns.is_empty() {
+            format!("{} {name}", kind.label())
+        } else {
+            format!("{} {ns}/{name}", kind.label())
+        };
         self.yaml = Some(YamlView {
             title: title.clone(),
             ws,
@@ -3003,9 +3033,11 @@ fn tab_label(tab: Tab) -> &'static str {
         Tab::Overview => "Overview",
         Tab::Pods => "Pods",
         Tab::Services => "Services",
+        Tab::NodePorts => "Node Ports",
         Tab::Deployments => "Deployments",
         Tab::Workload(k) => k.plural(),
         Tab::Forwards => "Port Forwards",
+        Tab::Nodes => "Nodes",
         Tab::Settings => "Settings",
     }
 }

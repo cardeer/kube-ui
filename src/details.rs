@@ -175,7 +175,12 @@ fn conditions_ok(status: &str) -> bool {
 }
 
 async fn events(client: &Client, ns: &str, kind: &str, name: &str) -> Result<Vec<EventRow>> {
-    let api: Api<Event> = Api::namespaced(client.clone(), ns);
+    // Cluster-scoped objects (nodes) have their events in whichever namespace reported them.
+    let api: Api<Event> = if ns.is_empty() {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), ns)
+    };
     let selector = format!("involvedObject.kind={kind},involvedObject.name={name}");
     let mut items = api
         .list(&ListParams::default().fields(&selector))
@@ -676,7 +681,12 @@ async fn workload_details(
             .flatten()
             .map(|c| Condition {
                 type_: text(c, "type"),
-                ok: conditions_ok(&text(c, "status")),
+                // A node's pressure conditions are healthy when False.
+                ok: if kind == Kind::Node && text(c, "type") != "Ready" {
+                    text(c, "status") == "False"
+                } else {
+                    conditions_ok(&text(c, "status"))
+                },
                 reason: text(c, "reason"),
                 message: text(c, "message"),
             })
