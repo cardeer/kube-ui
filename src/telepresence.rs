@@ -3,7 +3,11 @@
 //! JSON output differs between releases (snake_case or camelCase keys, a `{"stdout": ...}`
 //! wrapper on some), so parsing reads loosely and ignores anything it doesn't know.
 
-use std::path::Path;
+use std::{
+    io::Write,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 use tokio::process::Command;
@@ -15,6 +19,10 @@ const BIN: &str = "telepresence";
 pub enum TpError {
     /// The `telepresence` binary isn't on PATH.
     NotInstalled,
+    /// Starting the root daemon needs the administrator password.
+    NeedPassword,
+    /// sudo rejected the password that was given.
+    WrongPassword,
     Failed(String),
 }
 
@@ -22,6 +30,8 @@ impl TpError {
     pub fn text(&self) -> String {
         match self {
             TpError::NotInstalled => "Telepresence isn't installed".into(),
+            TpError::NeedPassword => "Administrator password required".into(),
+            TpError::WrongPassword => "Incorrect password".into(),
             TpError::Failed(e) => e.clone(),
         }
     }
@@ -37,6 +47,10 @@ pub struct Status {
     pub namespace: String,
     pub server: String,
     pub manager_version: String,
+    /// The root daemon is up, so connecting won't ask for a password.
+    pub root_running: bool,
+    /// Intercept names the daemon reports (any namespace).
+    pub intercepts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -58,6 +72,12 @@ pub struct Intercept {
     pub local_port: String,
     /// e.g. "ACTIVE", or an error disposition.
     pub disposition: String,
+    /// Extra detail from the traffic manager, usually about a failure.
+    pub message: String,
+    /// Where local traffic goes, when not localhost.
+    pub host: String,
+    /// The pod whose traffic is intercepted.
+    pub pod: String,
 }
 
 /// The status and, when connected, the workloads in the connected namespace.
@@ -69,8 +89,13 @@ pub struct Snapshot {
 }
 
 async fn run(args: &[&str]) -> Result<String, TpError> {
+    run_env(args, &[]).await
+}
+
+async fn run_env(args: &[&str], env: &[(&str, String)]) -> Result<String, TpError> {
     let out = Command::new(BIN)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(std::process::Stdio::null())
         .output()
         .await
@@ -88,6 +113,21 @@ async fn run(args: &[&str]) -> Result<String, TpError> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    let lower = msg.to_lowercase();
+    if lower.contains("incorrect password") {
+        return Err(TpError::WrongPassword);
+    }
+    if [
+        "a terminal is required",
+        "no tty present",
+        "a password is required",
+        "no password was provided",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        return Err(TpError::NeedPassword);
+    }
     Err(TpError::Failed(if msg.is_empty() {
         format!("telepresence {} failed ({})", args.join(" "), out.status)
     } else {
@@ -96,8 +136,16 @@ async fn run(args: &[&str]) -> Result<String, TpError> {
 }
 
 pub async fn snapshot() -> Result<Snapshot, TpError> {
-    let status = parse_status(&run(&["status", "--output", "json"]).await?)
-        .map_err(TpError::Failed)?;
+    let status = match run(&["status", "--output", "json"]).await {
+        Ok(out) => parse_status(&out).map_err(TpError::Failed)?,
+        // After a connect that couldn't start the root daemon, status fails on its missing
+        // state file until the daemons are stopped; that's still "not connected".
+        Err(TpError::Failed(e)) if e.contains("daemon.json") => Status {
+            status: "Not connected".into(),
+            ..Default::default()
+        },
+        Err(e) => return Err(e),
+    };
     let mut snap = Snapshot {
         status,
         ..Default::default()
@@ -157,9 +205,119 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-pub async fn connect(args: Vec<String>) -> Result<String, TpError> {
+/// Connects. The first connect starts the root daemon through `sudo`; with no terminal
+/// to prompt on, sudo asks the `SUDO_ASKPASS` helper instead, which hands it `password`.
+/// Without a password, a connect that would need one fails early with `NeedPassword`.
+pub async fn connect(
+    args: Vec<String>,
+    password: Option<String>,
+    root_running: bool,
+) -> Result<String, TpError> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run(&args).await
+    let result = match password {
+        None => {
+            if !root_running && !sudo_without_password().await {
+                return Err(TpError::NeedPassword);
+            }
+            run(&args).await
+        }
+        Some(password) => {
+            // Telepresence doesn't pass sudo's messages on, so a wrong password would only
+            // surface as a daemon launch failure. Check it first.
+            if !password_ok(&password).await {
+                return Err(TpError::WrongPassword);
+            }
+            let askpass = Askpass::new(&password).map_err(|e| {
+                TpError::Failed(format!("Couldn't prepare the password helper: {e}"))
+            })?;
+            let mut env = vec![("SUDO_ASKPASS", askpass.script.display().to_string())];
+            // sudo only turns to the helper when DISPLAY is set.
+            if std::env::var_os("DISPLAY").is_none() {
+                env.push(("DISPLAY", ":0".into()));
+            }
+            run_env(&args, &env).await
+        }
+    };
+    if result.is_err() && !root_running {
+        // A failed start leaves a half-started daemon behind that breaks `status`.
+        let _ = run(&["quit", "-s"]).await;
+    }
+    result
+}
+
+/// sudo is set up to run without a password (NOPASSWD). Cached credentials don't count:
+/// they're tied to this process, not to the sudo Telepresence runs.
+async fn sudo_without_password() -> bool {
+    Command::new("sudo")
+        .args(["-n", "-k", "true"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Asks sudo whether `password` is right, without running anything.
+async fn password_ok(password: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let Ok(mut child) = Command::new("sudo")
+        .args(["-S", "-k", "-v", "-p", ""])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(format!("{password}\n").as_bytes()).await;
+    }
+    child.wait().await.is_ok_and(|s| s.success())
+}
+
+/// A private folder holding the password and a script that prints it, for `SUDO_ASKPASS`.
+/// Removed when dropped.
+struct Askpass {
+    dir: PathBuf,
+    script: PathBuf,
+}
+
+impl Askpass {
+    fn new(password: &str) -> std::io::Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kube-ui-askpass-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let this = Askpass {
+            script: dir.join("askpass"),
+            dir,
+        };
+        let write = |path: &Path, mode: u32, data: &[u8]| -> std::io::Result<()> {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(path)?
+                .write_all(data)
+        };
+        write(&this.dir.join("pass"), 0o600, password.as_bytes())?;
+        write(
+            &this.script,
+            0o700,
+            b"#!/bin/sh\ncat \"$(dirname \"$0\")/pass\"\n",
+        )?;
+        Ok(this)
+    }
+}
+
+impl Drop for Askpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 pub async fn quit() -> Result<String, TpError> {
@@ -221,6 +379,18 @@ pub fn parse_status(out: &str) -> Result<Status, String> {
     let v = unwrap(v);
     let user = field(&v, &["user_daemon", "userDaemon"]).unwrap_or(&Value::Null);
     let manager = field(&v, &["traffic_manager", "trafficManager"]).unwrap_or(&Value::Null);
+    let root = field(&v, &["root_daemon", "rootDaemon"]).unwrap_or(&Value::Null);
+    let intercepts = match field(user, &["intercepts"]) {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|i| match i {
+                Value::String(s) => s.clone(),
+                _ => string(i, &["name"]),
+            })
+            .filter(|n| !n.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
     let status = string(user, &["status"]);
     let running = field(user, &["running"])
         .and_then(Value::as_bool)
@@ -237,6 +407,10 @@ pub fn parse_status(out: &str) -> Result<Status, String> {
         namespace: string(user, &["namespace", "connected_namespace", "connectedNamespace"]),
         server: string(user, &["kubernetes_server", "kubernetesServer"]),
         manager_version: string(manager, &["version"]),
+        root_running: field(root, &["running"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        intercepts,
     })
 }
 
@@ -259,14 +433,16 @@ pub fn parse_list(out: &str) -> Result<Vec<Workload>, String> {
         .iter()
         .filter(|w| w.is_object())
         .map(|w| {
+            // An array in most releases (under either name), a single object in some.
             let mut intercepts = Vec::new();
-            match field(w, &["intercept_infos", "interceptInfos"]) {
-                Some(Value::Array(a)) => intercepts.extend(a.iter().map(parse_intercept)),
-                _ => {}
+            for key in [["intercept_infos", "interceptInfos"], ["intercept_info", "interceptInfo"]] {
+                match field(w, &key) {
+                    Some(Value::Array(a)) => intercepts.extend(a.iter().map(parse_intercept)),
+                    Some(i @ Value::Object(_)) => intercepts.push(parse_intercept(i)),
+                    _ => {}
+                }
             }
-            if let Some(i) = field(w, &["intercept_info", "interceptInfo"]) {
-                intercepts.push(parse_intercept(i));
-            }
+            intercepts.retain(|i| !i.name.is_empty());
             let agent = !string(w, &["agent_version", "agentVersion"]).is_empty()
                 || field(w, &["agent_info", "agentInfo", "agent_infos"]).is_some();
             Workload {
@@ -300,16 +476,51 @@ fn kind_name(kind: &str) -> String {
     .into()
 }
 
+/// The disposition as its name; newer releases send the enum's number.
+fn disposition_name(v: Option<&Value>) -> String {
+    const NAMES: [&str; 10] = [
+        "UNSPECIFIED",
+        "ACTIVE",
+        "WAITING",
+        "NO_CLIENT",
+        "NO_AGENT",
+        "NO_MECHANISM",
+        "NO_PORTS",
+        "AGENT_ERROR",
+        "BAD_ARGS",
+        "REMOVED",
+    ];
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| NAMES.get(n as usize))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| n.to_string()),
+        _ => String::new(),
+    }
+}
+
 fn parse_intercept(i: &Value) -> Intercept {
     let spec = field(i, &["spec"]).unwrap_or(i);
+    let mut port = string(
+        spec,
+        &["port_identifier", "portIdentifier", "service_port_identifier", "servicePortIdentifier"],
+    );
+    let number = string(spec, &["service_port", "servicePort"]);
+    if port.is_empty() {
+        port = number;
+    } else if !number.is_empty() && number != port {
+        port = format!("{port} ({number})");
+    }
     Intercept {
         name: string(spec, &["name"]),
-        port: string(
-            spec,
-            &["port_identifier", "portIdentifier", "service_port_identifier", "servicePortIdentifier"],
-        ),
+        port,
         local_port: string(spec, &["target_port", "targetPort"]),
-        disposition: string(i, &["disposition"]),
+        disposition: disposition_name(field(i, &["disposition"])),
+        pod: string(i, &["pod_name", "podName"]),
+        message: string(i, &["message"]),
+        host: string(spec, &["target_host", "targetHost"]),
     }
 }
 
@@ -322,13 +533,16 @@ mod tests {
         let s = parse_status(
             r#"{"user_daemon":{"running":true,"name":"OSS User Daemon","version":"v2.20.0",
             "status":"Connected","kubernetes_server":"https://1.2.3.4","kubernetes_context":"dev",
-            "namespace":"apps"},"traffic_manager":{"version":"v2.20.0"}}"#,
+            "namespace":"apps","intercepts":[{"name":"web","client":"me@host"}]},
+            "root_daemon":{"running":true},"traffic_manager":{"version":"v2.20.0"}}"#,
         )
         .unwrap();
         assert!(s.connected);
         assert_eq!(s.context, "dev");
         assert_eq!(s.namespace, "apps");
         assert_eq!(s.manager_version, "v2.20.0");
+        assert!(s.root_running);
+        assert_eq!(s.intercepts, vec!["web".to_string()]);
 
         let s = parse_status(r#"{"user_daemon":{"running":false,"status":"Not connected"}}"#)
             .unwrap();
@@ -356,6 +570,7 @@ mod tests {
                 port: "http".into(),
                 local_port: "8080".into(),
                 disposition: "ACTIVE".into(),
+                ..Default::default()
             }]
         );
         assert_eq!(kind_name("STATEFULSET"), "StatefulSet");
@@ -364,12 +579,49 @@ mod tests {
         assert!(parse_list("[]").unwrap().is_empty());
     }
 
+    /// The shape 2.33 prints: `intercept_info` is an array and `disposition` a number.
+    #[test]
+    fn list_2_33() {
+        let w = parse_list(
+            r#"[{"name":"admin-api-app","namespace":"ncs-dev","workload_resource_type":"DEPLOYMENT",
+              "intercept_info":[{"spec":{"name":"admin-api-app","target_host":"127.0.0.1",
+              "port_identifier":"admin-api","service_port":80,"target_port":6969},
+              "disposition":1,"pod_name":"admin-api-app-86d5f49b4b-nc6v4"}]},
+              {"name":"other","namespace":"ncs-dev","workload_resource_type":"DEPLOYMENT"}]"#,
+        )
+        .unwrap();
+        assert_eq!(w[0].kind, "Deployment");
+        assert_eq!(
+            w[0].intercepts,
+            vec![Intercept {
+                name: "admin-api-app".into(),
+                port: "admin-api (80)".into(),
+                local_port: "6969".into(),
+                disposition: "ACTIVE".into(),
+                host: "127.0.0.1".into(),
+                pod: "admin-api-app-86d5f49b4b-nc6v4".into(),
+                ..Default::default()
+            }]
+        );
+        assert!(w[1].intercepts.is_empty());
+    }
+
     #[test]
     fn version() {
         assert_eq!(
             client_version("OSS Client : v2.33.1\nRoot Daemon: not running\n"),
             "v2.33.1"
         );
+    }
+
+    #[test]
+    fn askpass_prints_password() {
+        let a = Askpass::new("p@ss 'word\"").unwrap();
+        let out = std::process::Command::new(&a.script).output().unwrap();
+        assert_eq!(out.stdout, b"p@ss 'word\"");
+        let dir = a.dir.clone();
+        drop(a);
+        assert!(!dir.exists());
     }
 
     #[test]

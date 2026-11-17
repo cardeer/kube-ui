@@ -5,6 +5,23 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Telepresence: the first connect asks for your administrator password in the app instead
+  of failing for want of a terminal. The password is checked, handed to sudo for that one
+  start, and never saved.
+- Telepresence: an "Active intercepts" section lists each intercept with its state (and
+  the reason when it isn't working), and a workload's row shows "Starting intercept…" or
+  "Leaving…" while that runs.
+
+- Telepresence: while connected, the status sits on one line so the workload list keeps
+  the height.
+
+### Fixed
+- The Telepresence page no longer shows an error after a connect that couldn't start the
+  daemon; the half-started daemon is stopped and the page reads "Not connected".
+- Telepresence 2.33's intercept details are read correctly: the port mapping shows, each
+  intercept is listed once, and Leave works.
+
 ## [1.3.0] - 2026-11-17
 
 ### Added

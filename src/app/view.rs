@@ -943,6 +943,11 @@ impl App {
                 )
             } else if let Some(d) = &self.pf_dialog {
                 (self.view_pf_dialog(d), Some(Message::PfCancel))
+            } else if let Some(d) = &self.tp.password {
+                (
+                    self.view_password_dialog(d),
+                    Some(Message::Tp(super::telepresence::TpMsg::PasswordCancel)),
+                )
             } else if let Some(d) = &self.tp.dialog {
                 (
                     self.view_intercept_dialog(d),

@@ -200,9 +200,8 @@ enum Msg {
     /// A telepresence command finished: the toast for success, and a command line to
     /// offer for a terminal if it failed.
     TpDone {
-        done: String,
+        job: telepresence::TpJob,
         result: Result<String, crate::telepresence::TpError>,
-        command: Option<String>,
     },
 }
 
@@ -1484,6 +1483,7 @@ impl App {
             if self.pf_dialog.take().is_some()
                 || self.confirm_delete.take().is_some()
                 || self.tp.dialog.take().is_some()
+                || self.tp.password.take().is_some()
             {
                 return Task::none();
             }
@@ -2002,11 +2002,7 @@ impl App {
                 }
                 Msg::Toast { text, error } => self.toast(text, error),
                 Msg::TpSnapshot(result) => self.tp_snapshot(result),
-                Msg::TpDone {
-                    done,
-                    result,
-                    command,
-                } => self.tp_done(done, result, command),
+                Msg::TpDone { job, result } => tasks.push(self.tp_done(job, result)),
                 Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
                 Msg::UpdateInstalled(result) => self.update_installed(result),
                 #[cfg(target_os = "macos")]
@@ -2914,6 +2910,7 @@ impl App {
             let (select, edit, sort) = (shot.select, shot.edit, shot.sort.clone());
             let timed_out = shot.started.elapsed() > Duration::from_secs(30);
             let tp_ready = self.tp.snapshot.is_some();
+            let tp_no_prompt = self.tp.password.is_none();
             let Some(ws) = self.ws_mut() else {
                 return Task::none();
             };
@@ -2931,6 +2928,14 @@ impl App {
                 return Task::none();
             }
             let loaded = if tab == Tab::Telepresence {
+                // `KUBE_UI_SCREENSHOT_TP_PASSWORD=1` opens the administrator password prompt.
+                if tp_ready
+                    && tp_no_prompt
+                    && std::env::var_os("KUBE_UI_SCREENSHOT_TP_PASSWORD").is_some()
+                {
+                    self.tp_dev_password();
+                    return Task::none();
+                }
                 tp_ready
             } else {
                 ws.client().is_some() && !ws.is_loading() && ws.last_refresh.is_some()
