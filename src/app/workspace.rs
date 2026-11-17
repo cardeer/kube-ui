@@ -46,7 +46,7 @@ pub(super) struct Workspace {
     /// Table filters are regular expressions (one switch for every page).
     pub(super) filter_regex: bool,
     /// Compiled filter for the current page; refreshed by `update_matcher`.
-    matcher: super::filter::Matcher,
+    pub(super) matcher: super::filter::Matcher,
     /// The current list's scroll offset.
     pub(super) list_scroll: f32,
     /// Sorted column per page; saved with the tab.
@@ -289,7 +289,7 @@ impl Workspace {
         self.matcher.update(pattern, self.filter_regex);
     }
 
-    fn matches(&self, name: &str, namespace: &str) -> bool {
+    pub(super) fn matches(&self, name: &str, namespace: &str) -> bool {
         !self.matcher.is_active() || self.matcher.matches(name) || self.matcher.matches(namespace)
     }
 

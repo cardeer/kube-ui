@@ -59,7 +59,7 @@ impl App {
         }
     }
 
-    fn popup_open(&self, kind: &PopupKind) -> bool {
+    pub(super) fn popup_open(&self, kind: &PopupKind) -> bool {
         self.popup.as_ref().is_some_and(|p| &p.kind == kind)
     }
 
@@ -429,6 +429,14 @@ impl App {
             }
             list = list.push(theme::vspace(6.0));
         }
+        // Not a resource page, so it sits on its own below the groups.
+        list = list.push(theme::nav_item(
+            icon::PLUGS_CONNECTED,
+            "Telepresence",
+            self.tp_badge(),
+            ws.tab == Tab::Telepresence,
+            Message::SetTab(Tab::Telepresence),
+        ));
         // Settings is pinned to the bottom of the rail; the groups scroll above it.
         container(column![
             scrollable(list)
@@ -458,6 +466,7 @@ impl App {
         let ctx = self.ctx();
         let page: El<'_> = match ws.tab {
             Tab::Forwards => self.view_forwards(),
+            Tab::Telepresence => self.view_telepresence(),
             Tab::Settings => self.view_settings(),
             _ => ws.view_page(&ctx),
         };
@@ -934,6 +943,11 @@ impl App {
                 )
             } else if let Some(d) = &self.pf_dialog {
                 (self.view_pf_dialog(d), Some(Message::PfCancel))
+            } else if let Some(d) = &self.tp.dialog {
+                (
+                    self.view_intercept_dialog(d),
+                    Some(Message::Tp(super::telepresence::TpMsg::Cancel)),
+                )
             } else if let Some(y) = self.yaml.as_ref().filter(|_| !self.settings.yaml_docked) {
                 (self.view_yaml(y), None)
             } else if self.changelog_open {
@@ -957,7 +971,7 @@ impl App {
         ]))
     }
 
-    fn dialog_title<'a>(title: String, close: Message) -> El<'a> {
+    pub(super) fn dialog_title<'a>(title: String, close: Message) -> El<'a> {
         row![
             text(title)
                 .size(15.0)
@@ -1319,6 +1333,7 @@ impl App {
             PopupKind::LogTail(i) => (self.popup_log_tail(*i), 100.0),
             PopupKind::LogContainer(i) => (self.popup_log_container(*i), 160.0),
             PopupKind::DockTab(i) => (self.popup_dock_tab(*i), 200.0),
+            PopupKind::TpNamespace => (self.popup_tp_namespace(&p.query), 240.0),
         };
         let a = p.anchor;
         let width = a.width.max(min_w);
@@ -1357,7 +1372,7 @@ impl App {
         Some(stack![backdrop, placed].into())
     }
 
-    fn search_input<'a>(query: &str) -> El<'a> {
+    pub(super) fn search_input<'a>(query: &str) -> El<'a> {
         theme::search_field(query, "Search…", 0.0, Message::PopupQuery)
             .id(POPUP_SEARCH)
             .on_submit(Message::PopupSubmit)

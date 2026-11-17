@@ -10,6 +10,7 @@ mod menu;
 mod select_area;
 mod shell;
 mod table;
+mod telepresence;
 mod theme;
 mod update;
 mod view;
@@ -195,6 +196,14 @@ enum Msg {
         id: u64,
         error: Option<String>,
     },
+    TpSnapshot(Result<crate::telepresence::Snapshot, crate::telepresence::TpError>),
+    /// A telepresence command finished: the toast for success, and a command line to
+    /// offer for a terminal if it failed.
+    TpDone {
+        done: String,
+        result: Result<String, crate::telepresence::TpError>,
+        command: Option<String>,
+    },
 }
 
 impl Msg {
@@ -267,6 +276,8 @@ pub enum Tab {
     Forwards,
     /// Cluster-wide: ignores the namespace selection.
     Nodes,
+    /// Telepresence status and intercepts; one connection per machine.
+    Telepresence,
     Settings,
 }
 
@@ -296,7 +307,7 @@ impl Tab {
                 .into_iter()
                 .chain(WORKLOAD_KINDS)
                 .collect(),
-            Tab::Forwards | Tab::Settings => vec![],
+            Tab::Forwards | Tab::Telepresence | Tab::Settings => vec![],
         }
     }
 
@@ -328,6 +339,7 @@ impl Tab {
             Tab::Workload(_) => "workloads",
             Tab::Forwards => "forwards",
             Tab::Nodes => "nodes",
+            Tab::Telepresence => "telepresence",
             Tab::Settings => "settings",
         }
     }
@@ -341,6 +353,7 @@ impl Tab {
             Tab::Deployments,
             Tab::Forwards,
             Tab::Nodes,
+            Tab::Telepresence,
             Tab::Settings,
         ]
         .into_iter()
@@ -548,6 +561,8 @@ pub enum PopupKind {
     LogContainer(usize),
     /// A dock tab's right-click menu (index into logs, then shells).
     DockTab(usize),
+    /// The Telepresence page's namespace picker.
+    TpNamespace,
 }
 
 struct Popup {
@@ -684,6 +699,7 @@ pub enum Message {
     PfStart,
     PfCancel,
     ConfirmDelete(bool),
+    Tp(telepresence::TpMsg),
 }
 
 pub struct App {
@@ -714,6 +730,7 @@ pub struct App {
     find: code_editor::Find,
     forwards: Vec<Forward>,
     pf_dialog: Option<PfDialog>,
+    tp: telepresence::TpState,
     /// (cluster tab, kind, namespace, name)
     confirm_delete: Option<(u64, Kind, String, String)>,
     toasts: Vec<Toast>,
@@ -797,6 +814,7 @@ impl App {
             find: code_editor::Find::default(),
             forwards: Vec::new(),
             pf_dialog: None,
+            tp: Default::default(),
             confirm_delete: None,
             toasts: Vec::new(),
             update: update::UpdateState::Idle,
@@ -1063,6 +1081,9 @@ impl App {
                 return self.handle(Message::SetNamespaces(selection));
             }
             Message::Refresh => {
+                if self.ws().is_some_and(|w| w.tab == Tab::Telepresence) {
+                    return self.tp_update(telepresence::TpMsg::Refresh);
+                }
                 if let Some(ws) = self.ws_mut() {
                     ws.refresh();
                 }
@@ -1117,6 +1138,9 @@ impl App {
                 self.popup = None;
                 if let Some(ws) = self.ws_mut() {
                     ws.set_tab(tab);
+                }
+                if tab == Tab::Telepresence {
+                    self.tp_refresh();
                 }
                 self.hovered_row = None;
             }
@@ -1359,6 +1383,7 @@ impl App {
                 }
             }
             Message::PfCancel => self.pf_dialog = None,
+            Message::Tp(msg) => return self.tp_update(msg),
             Message::ConfirmDelete(yes) => {
                 if let Some((ws, kind, ns, name)) = self.confirm_delete.take() {
                     if yes {
@@ -1400,6 +1425,7 @@ impl App {
             self.window_dirty = None;
             self.settings.save();
         }
+        self.tp_poll();
         self.dev_screenshot()
     }
 
@@ -1455,7 +1481,10 @@ impl App {
             if self.yaml_visible() && self.find.open {
                 return self.find_message(code_editor::FindMsg::Close);
             }
-            if self.pf_dialog.take().is_some() || self.confirm_delete.take().is_some() {
+            if self.pf_dialog.take().is_some()
+                || self.confirm_delete.take().is_some()
+                || self.tp.dialog.take().is_some()
+            {
                 return Task::none();
             }
             // The floating editor stays open; a docked one is a tab like any other.
@@ -1833,6 +1862,10 @@ impl App {
                     return self.handle(Message::SwitchContext(c));
                 }
             }
+            PopupKind::TpNamespace => {
+                let q = q.clone();
+                return self.tp_namespace_submit(&q);
+            }
             PopupKind::Namespace => {
                 let first = ws
                     .namespaces
@@ -1968,6 +2001,12 @@ impl App {
                     self.toast(format!("Port forward failed: {error}"), true);
                 }
                 Msg::Toast { text, error } => self.toast(text, error),
+                Msg::TpSnapshot(result) => self.tp_snapshot(result),
+                Msg::TpDone {
+                    done,
+                    result,
+                    command,
+                } => self.tp_done(done, result, command),
                 Msg::UpdateChecked { result, manual } => self.update_checked(result, manual),
                 Msg::UpdateInstalled(result) => self.update_installed(result),
                 #[cfg(target_os = "macos")]
@@ -2874,6 +2913,7 @@ impl App {
         {
             let (select, edit, sort) = (shot.select, shot.edit, shot.sort.clone());
             let timed_out = shot.started.elapsed() > Duration::from_secs(30);
+            let tp_ready = self.tp.snapshot.is_some();
             let Some(ws) = self.ws_mut() else {
                 return Task::none();
             };
@@ -2890,7 +2930,11 @@ impl App {
                 ws.set_tab(tab);
                 return Task::none();
             }
-            let loaded = ws.client().is_some() && !ws.is_loading() && ws.last_refresh.is_some();
+            let loaded = if tab == Tab::Telepresence {
+                tp_ready
+            } else {
+                ws.client().is_some() && !ws.is_loading() && ws.last_refresh.is_some()
+            };
             if !loaded && !timed_out {
                 return Task::none();
             }
@@ -3122,6 +3166,7 @@ fn tab_label(tab: Tab) -> &'static str {
         Tab::Workload(k) => k.plural(),
         Tab::Forwards => "Port Forwards",
         Tab::Nodes => "Nodes",
+        Tab::Telepresence => "Telepresence",
         Tab::Settings => "Settings",
     }
 }

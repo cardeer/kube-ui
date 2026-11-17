@@ -5,6 +5,17 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Telepresence page in the sidebar: shows whether Telepresence is connected, connects to
+  the current tab's context or disconnects, and lists the workloads in the connected
+  namespace (searchable by name or kind), where you can start or leave an intercept. A namespace picker chooses where
+  to connect, and switching it while connected reconnects there. If the CLI isn't
+  installed, the page shows how to install it.
+
+### Fixed
+- Tools installed with Homebrew (and kubeconfig auth plugins) are found when the app is
+  opened from Finder, even when Homebrew's PATH is set in `~/.zshrc`.
+
 ## [1.2.1] - 2026-11-17
 
 ### Added

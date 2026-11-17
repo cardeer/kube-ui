@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub const ARROWS_LEFT_RIGHT: &str = "\u{E0A0}";
+pub const ARROW_BEND_DOWN_RIGHT: &str = "\u{E01A}";
 pub const ARROW_CIRCLE_UP: &str = "\u{E030}";
 pub const ARROW_CLOCKWISE: &str = "\u{E036}";
 pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
@@ -47,11 +48,14 @@ pub const PAUSE: &str = "\u{E39E}";
 pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
 pub const PLAY: &str = "\u{E3D0}";
 pub const PLAY_CIRCLE: &str = "\u{E3D2}";
+pub const PLUGS: &str = "\u{EB56}";
+pub const PLUGS_CONNECTED: &str = "\u{EB5A}";
 pub const PLUS: &str = "\u{E3D4}";
 pub const PROHIBIT: &str = "\u{E3DE}";
 pub const ROCKET_LAUNCH: &str = "\u{E3FE}";
 pub const SCROLL: &str = "\u{EB7A}";
 pub const SHARE_NETWORK: &str = "\u{E408}";
+pub const SIGN_OUT: &str = "\u{E42A}";
 pub const SPARKLE: &str = "\u{E6A2}";
 pub const SPINNER: &str = "\u{E66A}";
 pub const SQUARE_SPLIT_HORIZONTAL: &str = "\u{E870}";
