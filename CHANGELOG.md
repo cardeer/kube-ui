@@ -5,9 +5,13 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-11-24
+
 ### Added
 - Each environment variable has a copy button that copies it as `KEY=value`; click a
   name to copy just the name.
+- Logs: when scrolled up, a "Bottom" button over the lines goes back to the newest line
+  and turns auto-scroll back on.
 
 ### Changed
 - Searching a log highlights the matches instead of hiding the other lines. The arrows
