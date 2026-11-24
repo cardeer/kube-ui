@@ -130,7 +130,12 @@ where
 
         // Leave room for the sideways scrollbar when there is one.
         let body_h = (size.height - HEADER_HEIGHT - if wide { 8.0 } else { 0.0 }).max(ROW_HEIGHT);
-        let first = ((self.scroll / ROW_HEIGHT).floor().max(0.0) as usize).min(self.len);
+        // The scrollable clamps its offset when it grows (e.g. a log panel below closes) without
+        // reporting a scroll event, so clamp the remembered one the same way; otherwise the
+        // rows drawn start below the ones actually in view and the top shows empty.
+        let max_scroll = (self.len as f32 * ROW_HEIGHT - body_h).max(0.0);
+        let scroll = self.scroll.min(max_scroll);
+        let first = ((scroll / ROW_HEIGHT).floor().max(0.0) as usize).min(self.len);
         let visible = (body_h / ROW_HEIGHT).ceil() as usize + 2;
         let last = (first + visible).min(self.len);
         let mut rows = column![Space::new().height(first as f32 * ROW_HEIGHT)];

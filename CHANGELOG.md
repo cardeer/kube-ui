@@ -5,6 +5,18 @@ and match the `v<version>` git tags.
 
 ## [Unreleased]
 
+### Added
+- Each environment variable has a copy button that copies it as `KEY=value`; click a
+  name to copy just the name.
+
+### Changed
+- Searching a log highlights the matches instead of hiding the other lines. The arrows
+  beside the search (or Enter) jump between matching lines, with a count such as "3 of 12".
+
+### Fixed
+- A list no longer shows empty space at the top after scrolling it down while a log panel
+  was open and then closing the panel.
+
 ## [1.3.2] - 2026-11-17
 
 ### Added

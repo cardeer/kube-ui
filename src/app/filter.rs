@@ -49,6 +49,40 @@ impl Matcher {
         !matches!(self.kind, MatchKind::All)
     }
 
+    /// Byte ranges of every match in `text` (empty when inactive or nothing matches).
+    pub(super) fn find(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        match &self.kind {
+            MatchKind::All => Vec::new(),
+            MatchKind::Text(needle) => {
+                // Lowercasing can change byte lengths, so compare char by char on the original.
+                let needle: Vec<char> = needle.chars().collect();
+                let hay: Vec<(usize, char)> = text.char_indices().collect();
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i + needle.len() <= hay.len() {
+                    let hit = needle
+                        .iter()
+                        .enumerate()
+                        .all(|(k, n)| hay[i + k].1.to_lowercase().eq(std::iter::once(*n)));
+                    if hit {
+                        let start = hay[i].0;
+                        let end = hay.get(i + needle.len()).map_or(text.len(), |h| h.0);
+                        out.push(start..end);
+                        i += needle.len().max(1);
+                    } else {
+                        i += 1;
+                    }
+                }
+                out
+            }
+            MatchKind::Regex(re) => re
+                .find_iter(text)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.range())
+                .collect(),
+        }
+    }
+
     pub(super) fn matches(&self, text: &str) -> bool {
         match &self.kind {
             MatchKind::All => true,
@@ -77,5 +111,15 @@ mod tests {
         assert!(m.matches("shown while invalid"));
         m.update("", true);
         assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn matcher_find_ranges() {
+        let mut m = Matcher::default();
+        assert!(m.find("abc").is_empty());
+        m.update("ab", false);
+        assert_eq!(m.find("xAByab"), vec![1..3, 4..6]);
+        m.update(r"\d+", true);
+        assert_eq!(m.find("a12b3"), vec![1..3, 4..5]);
     }
 }

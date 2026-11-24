@@ -15,6 +15,9 @@ use super::*;
 
 /// Selected text's background: the accent, see-through enough to keep text readable.
 const SELECTION: Color = Color::from_rgba8(0x4c, 0x8d, 0xff, 0.38);
+/// Search matches, and the one the arrows last jumped to.
+const MATCH: Color = Color::from_rgba8(0xf5, 0xa5, 0x24, 0.30);
+const MATCH_CURRENT: Color = Color::from_rgba8(0xf5, 0xa5, 0x24, 0.70);
 
 /// Distinct, readable-on-dark colors for telling pods apart.
 const PALETTE: [Color; 8] = [
@@ -67,6 +70,8 @@ pub enum LogMsg {
     SetPrevious(bool),
     Filter(String),
     ToggleRegex,
+    /// Jump to the next (`true`) or previous search match.
+    FindStep(bool),
     Restart,
     Copy,
     CopySelection,
@@ -260,8 +265,12 @@ pub(super) struct LogView {
     resolving: bool,
     error: Option<String>,
     lines: VecDeque<ViewLine>,
-    /// Indices of the lines that pass the filter and pod chips; `None` when all do.
+    /// Indices of the lines that pass the pod chips; `None` when all do.
     shown: Option<Vec<usize>>,
+    /// Shown-line indices that contain a search match, in order.
+    hits: Vec<usize>,
+    /// The shown-line index the match arrows last jumped to.
+    hit_at: Option<usize>,
     older: Older,
     older_pending: usize,
     older_found: bool,
@@ -323,6 +332,8 @@ impl LogView {
             filter: String::new(),
             regex: false,
             matcher: Matcher::default(),
+            hits: Vec::new(),
+            hit_at: None,
             sources: Vec::new(),
             resolving: false,
             error: None,
@@ -670,13 +681,14 @@ impl LogView {
     }
 
     fn visible(&self, vl: &ViewLine) -> bool {
-        self.sources.get(vl.src).is_none_or(|s| s.visible) && self.matcher.matches(&vl.line.text)
+        self.sources.get(vl.src).is_none_or(|s| s.visible)
     }
 
-    /// Recomputes which lines pass the filter and the pod chips.
+    /// Recomputes which lines pass the pod chips, and which of those match the search.
+    /// The search only highlights; it never hides lines.
     fn refilter(&mut self) {
         let all_sources = self.sources.iter().all(|s| s.visible);
-        self.shown = if all_sources && !self.matcher.is_active() {
+        self.shown = if all_sources {
             None
         } else {
             Some(
@@ -688,6 +700,53 @@ impl LogView {
                     .collect(),
             )
         };
+        self.hits = if self.matcher.is_active() {
+            (0..self.shown_len())
+                .filter(|&i| {
+                    self.shown_line(i)
+                        .is_some_and(|l| self.matcher.matches(&l.line.text))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.hit_at.is_some_and(|h| h >= self.shown_len()) {
+            self.hit_at = None;
+        }
+    }
+
+    /// Scrolls so the match after (or before) the last one jumped to sits mid-view.
+    fn find_step(&mut self, forward: bool) -> Task<Message> {
+        if self.hits.is_empty() {
+            return Task::none();
+        }
+        let next = match (self.hit_at, forward) {
+            (Some(at), true) => self.hits.iter().find(|&&h| h > at).or(self.hits.first()),
+            (Some(at), false) => self.hits.iter().rev().find(|&&h| h < at).or(self.hits.last()),
+            // First jump: the match nearest the top of the view, going the asked way.
+            (None, true) => {
+                let top = (self.offset / LINE).floor().max(0.0) as usize;
+                self.hits.iter().find(|&&h| h + 1 >= top).or(self.hits.first())
+            }
+            (None, false) => self.hits.last(),
+        };
+        let Some(&next) = next else {
+            return Task::none();
+        };
+        self.hit_at = Some(next);
+        // Jumping away from the end would be undone by the next line otherwise.
+        self.follow = false;
+        let view_h = if self.view_h > 0.0 { self.view_h } else { 300.0 };
+        // Row `next + 1`: row 0 is the banner.
+        let y = ((next + 1) as f32 * LINE - view_h / 2.0).clamp(0.0, self.end_offset());
+        self.offset = y;
+        operation::scroll_to(
+            self.scroll_id.clone(),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )
     }
 
     /// Scrolls to the last line, leaving the sideways position where the user put it.
@@ -922,13 +981,16 @@ impl LogView {
             LogMsg::Filter(f) => {
                 self.filter = f;
                 self.matcher.update(&self.filter, self.regex);
+                self.hit_at = None;
                 self.refilter();
             }
             LogMsg::ToggleRegex => {
                 self.regex = !self.regex;
                 self.matcher.update(&self.filter, self.regex);
+                self.hit_at = None;
                 self.refilter();
             }
+            LogMsg::FindStep(forward) => return self.find_step(forward),
             LogMsg::Restart => self.start(next_id, rt, bus),
             LogMsg::Copy => {
                 if let Some(text) = self.selected_text() {
@@ -1072,13 +1134,36 @@ impl LogView {
             }
         }
         let hint = if self.regex {
-            "Filter (regex)"
+            "Search (regex)"
         } else {
-            "Filter lines"
+            "Search"
         };
-        bar = bar.push(theme::search_field(&self.filter, hint, 200.0, move |f| {
-            msg(LogMsg::Filter(f))
-        }));
+        bar = bar.push(
+            theme::search_field(&self.filter, hint, 200.0, move |f| msg(LogMsg::Filter(f)))
+                .on_submit(msg(LogMsg::FindStep(true))),
+        );
+        if self.matcher.is_active() {
+            let count = match (self.hits.len(), self.hit_at) {
+                (0, _) => "No matches".to_string(),
+                (n, Some(at)) => match self.hits.iter().position(|&h| h == at) {
+                    Some(k) => format!("{} of {n}", k + 1),
+                    None => format!("{n} lines"),
+                },
+                (n, None) => format!("{n} lines"),
+            };
+            bar = bar.push(theme::faint(count));
+            let any = !self.hits.is_empty();
+            bar = bar.push(theme::icon_button(
+                icon::CARET_UP,
+                "Previous match",
+                any.then(|| msg(LogMsg::FindStep(false))),
+            ));
+            bar = bar.push(theme::icon_button(
+                icon::CARET_DOWN,
+                "Next match (Enter)",
+                any.then(|| msg(LogMsg::FindStep(true))),
+            ));
+        }
         bar = bar.push(theme::toggle_button(
             ".*",
             self.regex,
@@ -1257,16 +1342,31 @@ impl LogView {
             // Runs are split again where the selection starts and ends, so only the
             // selected characters get a highlight.
             let selected = sel.get(&i).copied();
+            let runs = self.row_runs(i);
+            // Search matches as character ranges over the whole row, as drawn.
+            let found: Vec<(usize, usize)> = if self.matcher.is_active() {
+                let row: String = runs.iter().map(|(t, _)| t.as_str()).collect();
+                self.matcher
+                    .find(&row)
+                    .into_iter()
+                    .map(|r| (row[..r.start].chars().count(), row[..r.end].chars().count()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let current = self.hit_at == Some(i - 1);
             let mut spans: Vec<text::Span<'_, ()>> = Vec::new();
             let mut at = 0usize;
-            for (run, color) in self.row_runs(i) {
+            for (run, color) in runs {
                 let chars: Vec<char> = run.chars().collect();
                 let mut cut = vec![0usize, chars.len()];
-                if let Some((a, b)) = selected {
-                    for edge in [a, b] {
-                        if edge > at && edge - at < chars.len() {
-                            cut.push(edge - at);
-                        }
+                let edges = selected
+                    .into_iter()
+                    .chain(found.iter().copied())
+                    .flat_map(|(a, b)| [a, b]);
+                for edge in edges {
+                    if edge > at && edge - at < chars.len() {
+                        cut.push(edge - at);
                     }
                 }
                 cut.sort_unstable();
@@ -1275,9 +1375,14 @@ impl LogView {
                     let (from, to) = (w[0], w[1]);
                     let piece: String = chars[from..to].iter().collect();
                     let on = selected.is_some_and(|(a, b)| at + from >= a && at + to <= b);
+                    let hit = found
+                        .iter()
+                        .any(|&(a, b)| at + from >= a && at + to <= b);
                     let mut sp = span(piece).color(color);
                     if on {
                         sp = sp.background(SELECTION);
+                    } else if hit {
+                        sp = sp.background(if current { MATCH_CURRENT } else { MATCH });
                     }
                     spans.push(sp);
                 }

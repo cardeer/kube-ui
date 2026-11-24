@@ -2639,14 +2639,21 @@ fn env_item<'a>(
     secret: Option<(El<'a>, bool)>,
     index: usize,
 ) -> El<'a> {
-    let mut key = column![
-        theme::mono(name.to_string())
-            .font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..theme::MONO
-            })
-            .wrapping(text::Wrapping::WordOrGlyph)
-    ]
+    // Click the name to copy it.
+    let mut key = column![theme::tip(
+        button(
+            theme::mono(name.to_string())
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..theme::MONO
+                })
+                .wrapping(text::Wrapping::WordOrGlyph)
+        )
+        .padding(0)
+        .style(theme::link(theme::TEXT))
+        .on_press(Message::Copy(name.to_string())),
+        "Click to copy name",
+    )]
     .spacing(2);
     if let Some(s) = source {
         key = key.push(theme::small(s).color(theme::TEXT_FAINT));
@@ -2655,6 +2662,15 @@ fn env_item<'a>(
     if let Some((toggle, _)) = secret {
         key = key.push(toggle);
     }
+    // Only a known value gets a copy button; it copies `NAME=value`.
+    let copy: El<'a> = match &value {
+        Some(v) => theme::icon_button(
+            icon::COPY,
+            "Copy as KEY=value",
+            Some(Message::Copy(format!("{name}={v}"))),
+        ),
+        None => Space::new().width(24).into(),
+    };
     let value: El<'a> = match value {
         Some(v) => value_label(&v, theme::SYNTAX_STRING),
         None if is_secret => theme::faint("••••••••").into(),
@@ -2668,9 +2684,11 @@ fn env_item<'a>(
     container(
         row![
             key.width(Length::FillPortion(2)),
-            container(value).width(Length::FillPortion(3))
+            container(value).width(Length::FillPortion(3)),
+            copy
         ]
-        .spacing(12),
+        .spacing(12)
+        .align_y(iced::Alignment::Start),
     )
     .padding([5, 8])
     .width(Length::Fill)
