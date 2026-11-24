@@ -4,7 +4,8 @@
 use iced::{
     Element, Length, Padding, Task,
     widget::{
-        self, Space, button, column, container, operation, rich_text, row, scrollable, span, text,
+        self, Space, button, column, container, operation, rich_text, row, scrollable, span,
+        stack, text,
     },
 };
 
@@ -72,6 +73,8 @@ pub enum LogMsg {
     ToggleRegex,
     /// Jump to the next (`true`) or previous search match.
     FindStep(bool),
+    /// Scroll to the newest line and resume auto-scroll.
+    GoToBottom,
     Restart,
     Copy,
     CopySelection,
@@ -740,6 +743,8 @@ impl LogView {
         // Row `next + 1`: row 0 is the banner.
         let y = ((next + 1) as f32 * LINE - view_h / 2.0).clamp(0.0, self.end_offset());
         self.offset = y;
+        // A scroll by operation reports no scroll event, so track where it leaves us.
+        self.at_bottom = y >= self.end_offset() - LINE * 1.5;
         operation::scroll_to(
             self.scroll_id.clone(),
             operation::AbsoluteOffset {
@@ -991,6 +996,12 @@ impl LogView {
                 self.refilter();
             }
             LogMsg::FindStep(forward) => return self.find_step(forward),
+            LogMsg::GoToBottom => {
+                self.follow = true;
+                self.at_bottom = true;
+                self.offset = self.end_offset();
+                return self.snap_to_bottom();
+            }
             LogMsg::Restart => self.start(next_id, rt, bus),
             LogMsg::Copy => {
                 if let Some(text) = self.selected_text() {
@@ -1289,7 +1300,31 @@ impl LogView {
             col = col.push(theme::colored(st.clone(), color));
         }
         col = col.push(theme::hline());
-        col = col.push(self.lines_view(index));
+        // Away from the end, a button floats over the lines' bottom-right corner to go back.
+        let mut lines = stack![self.lines_view(index)];
+        if !self.at_bottom && self.shown_len() > 0 {
+            lines = lines.push(
+                container(theme::tip(
+                    theme::small_button(
+                        Some(icon::ARROW_DOWN),
+                        "Bottom",
+                        Some(Message::Log(index, LogMsg::GoToBottom)),
+                    ),
+                    "Go to the newest line and resume auto-scroll",
+                ))
+                .padding(Padding {
+                    top: 0.0,
+                    right: BAR_ROOM + 12.0,
+                    bottom: BAR_ROOM + 12.0,
+                    left: 0.0,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill),
+            );
+        }
+        col = col.push(lines.width(Length::Fill).height(Length::Fill));
         col.height(Length::Fill).into()
     }
 
